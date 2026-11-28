@@ -402,30 +402,43 @@ bool read_config_json(const fs::path& root, const std::string& dir, json* sc, st
 
 }  // namespace
 
-std::string drafter_dir_kind(const std::string& dir) {
+std::string drafter_dir_kind(const std::string& dir, const PathAllowFn& allow_path) {
   try {
+    const fs::path root = to_path(dir);
+    if (allow_path && (!allow_path(dir) || !allow_path(from_path(root / "config.json")))) return "";
     json sc;
     std::string err;
-    return read_config_json(to_path(dir), dir, &sc, &err) ? drafter_config_kind(sc) : "";
+    return read_config_json(root, dir, &sc, &err) ? drafter_config_kind(sc) : "";
   } catch (const std::exception&) {  // a config.json that is no JSON
     return "";
   }
 }
 
-bool is_drafter_dir(const std::string& path) {
+bool is_drafter_dir(const std::string& path, const PathAllowFn& allow_path) {
+  const fs::path root = to_path(path);
+  const fs::path cfg = root / "config.json";
+  if (allow_path && (!allow_path(path) || !allow_path(from_path(cfg)))) return false;
   std::error_code ec;
-  return fs::is_directory(to_path(path), ec) && fs::is_regular_file(to_path(path) / "config.json", ec);
+  return fs::is_directory(root, ec) && fs::is_regular_file(cfg, ec);
 }
 
 bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::MappedFile>>* maps,
-                      ModelFile::Contents* out, std::string* err) {
+                      ModelFile::Contents* out, std::string* err, const PathAllowFn& allow_path) {
   const fs::path root = to_path(dir);
+  if (allow_path && !allow_path(dir))
+    return *err = dir + ": path is not allowed by remote path policy", false;
+  if (allow_path && !allow_path(from_path(root / "config.json")))
+    return *err = from_path(root / "config.json") + ": path is not allowed by remote path policy", false;
   std::vector<fs::path> shards;
   std::error_code ec;
   for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
     if (it->path().extension() == ".safetensors") shards.push_back(it->path());
   std::sort(shards.begin(), shards.end());
   if (shards.empty()) return *err = dir + ": no *.safetensors beside its config.json", false;
+  for (const fs::path& shard : shards) {
+    if (allow_path && !allow_path(from_path(shard)))
+      return *err = from_path(shard) + ": path is not allowed by remote path policy", false;
+  }
   try {
     json sc;
     if (!read_config_json(root, dir, &sc, err)) return false;

@@ -38,16 +38,43 @@ struct Config {
   int verbose = 0;
 };
 
+struct ListenConfig {
+  std::string host;
+  int port = 0;
+  bool lan = false;
+  std::vector<std::string> accepted_hosts;
+};
+
+struct LanManage {
+  bool from_cli = false;
+  std::atomic<bool> saved{false};
+  static bool requested_for(bool from_cli_v, bool saved_v, bool api_key_set) {
+    return from_cli_v || (!api_key_set && saved_v);
+  }
+  static bool effective_for(bool from_cli_v, bool saved_v, const ListenConfig& l, bool api_key_set) {
+    return l.lan && !api_key_set && requested_for(from_cli_v, saved_v, api_key_set);
+  }
+  bool requested(bool api_key_set) const {
+    return requested_for(from_cli, saved.load(std::memory_order_acquire), api_key_set);
+  }
+  bool effective(const ListenConfig& l, bool api_key_set) const {
+    return effective_for(from_cli, saved.load(std::memory_order_acquire), l, api_key_set);
+  }
+};
+
 struct Server {
   ModelHost* host;
   Config cfg;
   EngineOptions base;  // the command line's engine options: what a model named in the dashboard starts from
   double started_at = 0;  // unix seconds
   ojson device_probe;     // the GPU found at start when no model was named (telemetry's device until one loads)
+  uint64_t device_reserve_floor = 0;  // backend-reported reserve floor from start-up probe (for idle telemetry)
   std::atomic<uint64_t> probe_mem_used{0};  // refreshed by /v1/device/* so idle VRAM bars update after closing apps
   RequestLog* requests = nullptr;  // the last finished requests, for GET /v1/requests
   SystemLog* logs = nullptr;       // the last lines on standard error, for GET /v1/logs
-  std::vector<std::string> models_dirs{};  // --models-dir, then FLYX_MODELS_DIR: model files beside the cache (0079)
+  std::vector<std::string> models_dirs{};  // canonicalized --models-dir + FLYX_MODELS_DIR roots
+  ListenConfig listener{};         // immutable listener bind identity constructed at startup
+  LanManage lan_manage{};          // opt-in (--no-auth or saved setting) for keyless LAN management
 };
 
 // How long a request waits for its job to start before it answers.  A job refused at the start (its prompt longer than
@@ -117,7 +144,9 @@ void add_anthropic_messages_routes(httplib::Server& http, Server* s);
 void add_openai_responses_routes(httplib::Server& http, Server* s);
 void add_telemetry_routes(httplib::Server& http, Server* s);
 void add_manage_routes(httplib::Server& http, Server* s);  // manage.cpp: the dashboard's model panel
-void add_network_routes(httplib::Server& http, Server* s, const std::string& host, int port, bool host_from_cli);
+ListenConfig make_listen_config(const std::string& bound_host, int port,
+                                std::string_view requested_host = {});  // network.cpp
+void add_network_routes(httplib::Server& http, Server* s, bool host_from_cli);
 void add_request_log_routes(httplib::Server& http, Server* s);  // request_log.cpp: GET /v1/requests
 void add_system_log_routes(httplib::Server& http, Server* s);   // system_log.cpp: GET /v1/logs
 

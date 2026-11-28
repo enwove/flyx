@@ -9,6 +9,7 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -21,12 +22,15 @@
 
 namespace flyx {
 
+// Authorization predicate evaluated BEFORE opening or inspecting a derived path (true if allowed).
+using PathAllowFn = std::function<bool(std::string_view)>;
+
 class ModelFile {
  public:
   // Maps the file and reads it with the reader its first bytes name.  A file
   // that holds a drafter alone ("kind": "drafter", or a GGUF file whose
   // general.architecture is "dflash") is no model: it goes beside one (add).
-  bool open(const std::string& path, std::string* err);
+  bool open(const std::string& path, std::string* err, const PathAllowFn& allow_path = {});
   // Another file of the same model holding a part this one lacks (a
   // companion: unsloth ships the Qwen3.8-27B GGUF's MTP layer as a GGUF of its
   // own, a DFlash2 drafter file, 0038, its authors'
@@ -36,7 +40,7 @@ class ModelFile {
   // companion_name(i, their name); its blobs are not read.  models/<arch>
   // decides what it takes from each, by name: nothing of one stands in for
   // this file's tensors or another companion's.
-  bool add(const std::string& path, std::string* err);
+  bool add(const std::string& path, std::string* err, const PathAllowFn& allow_path = {});
   static constexpr const char* kCompanion = "companion/";
   static std::string companion_name(int i, const std::string& name) {
     return kCompanion + std::to_string(i) + "/" + name;
@@ -89,7 +93,7 @@ struct GgufPeek {
   std::vector<std::string> base_models;
 };
 std::string gguf_header_path(const std::string& path);  // shard 1 for a split GGUF
-GgufPeek gguf_peek(const std::string& path);
+GgufPeek gguf_peek(const std::string& path, const PathAllowFn& allow_path = {});
 // Where a model file says it comes from, read from its header alone: the Hub repository it is (a .flyx file's
 // "source": "repo", as flyx_convert --repo writes it; a GGUF never says which repository holds it) and the
 // repositories it names as its bases (a GGUF's GgufPeek::base_models, general.source.repo_url included; a .flyx file's
@@ -98,7 +102,7 @@ struct ModelOrigin {
   std::string repo;
   std::vector<std::string> base_models;
 };
-ModelOrigin model_origin(const std::string& path);
+ModelOrigin model_origin(const std::string& path, const PathAllowFn& allow_path = {});
 
 // The block drafter a config.json's architectures name, by one table (core/modelfile/drafter_dir.cpp): "dflash2",
 // "dflash", "dspark", "dspine"; "" for none.
@@ -106,6 +110,6 @@ std::string drafter_kind_of(const std::vector<std::string>& architectures);
 // The block drafter a drafter directory (its config.json) or a .flyx file (its header's "draft") holds, read without
 // mapping it: "dflash2", "dflash", "dspark", "dspine"; "" when it holds none (a GGUF drafter's kind is its
 // header's: gguf_peek).
-std::string drafter_source_kind(const std::string& path);
+std::string drafter_source_kind(const std::string& path, const PathAllowFn& allow_path = {});
 
 }  // namespace flyx

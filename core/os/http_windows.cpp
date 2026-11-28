@@ -97,7 +97,7 @@ HttpClient::~HttpClient() {
 }
 
 bool HttpClient::get(const HttpGet& req, const HttpBody& body, int* status, std::string* err, std::string* final_url,
-                     std::string* link_header) {
+                     std::string* link_header, std::string* retry_after) {
   if (!handle_)  // the session keeps its connections alive between requests
     handle_ = WinHttpOpen(to_wide(http_user_agent()).c_str(), WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -165,6 +165,21 @@ bool HttpClient::get(const HttpGet& req, const HttpBody& body, int* status, std:
           *link_header += to_utf8(val);
         }
         index = next_index;
+      }
+    }
+    if (retry_after) {
+      retry_after->clear();
+      DWORD bytes = 0;
+      WinHttpQueryHeaders(request.h, WINHTTP_QUERY_RETRY_AFTER, WINHTTP_HEADER_NAME_BY_INDEX, nullptr, &bytes,
+                          WINHTTP_NO_HEADER_INDEX);
+      if (GetLastError() == ERROR_INSUFFICIENT_BUFFER && bytes > 0) {
+        std::wstring val(bytes / sizeof(wchar_t), L'\0');
+        if (WinHttpQueryHeaders(request.h, WINHTTP_QUERY_RETRY_AFTER, WINHTTP_HEADER_NAME_BY_INDEX, val.data(), &bytes,
+                                WINHTTP_NO_HEADER_INDEX)) {
+          val.resize(bytes / sizeof(wchar_t));
+          while (!val.empty() && val.back() == L'\0') val.pop_back();
+          *retry_after = to_utf8(val);
+        }
       }
     }
     std::vector<char> buf(1 << 20);

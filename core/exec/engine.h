@@ -102,6 +102,10 @@ struct EngineOptions {
   // Host memory the process takes besides, which kv_ram's auto leaves aside.  (The server's store of parked
   // conversations, is not: it takes what the sessions' K/V leave, Scheduler.)
   uint64_t host_reserved = 0;
+  // Opt-in memory reserves in bytes (-1: automatic plan::device_reserve / plan::host_keep defaults; 0: let flyx use
+  // all free VRAM / available RAM on a dedicated machine or headless VM).
+  int64_t vram_reserve = -1;
+  int64_t ram_reserve = -1;
   // Drafts verified per round: -1 = chosen each round by the speculation
   // controller from the measured cost of each width and the acceptance seen
   // so far; >= 0 pins the width (tests, benchmarks; the drafter is still
@@ -140,6 +144,9 @@ struct EngineOptions {
   // drop DFlash2 keeping MTP, drop drafters keeping prompt lookup). Never changes target output tokens.
   // Benchmarks set this to false so measurements never silently alter configuration.
   bool elastic_load = true;
+  // Optional authorization predicate evaluated BEFORE opening or inspecting derived files (split GGUF shards,
+  // PEFT adapter files, drafter directory configs/safetensors). Empty: unrestricted.
+  PathAllowFn allow_path;
 };
 
 // Fills the options the caller left unset from the environment: FLYX_BACKEND,

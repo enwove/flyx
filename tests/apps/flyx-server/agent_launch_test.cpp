@@ -84,6 +84,7 @@ int main() {
     }
     const std::string claude = agent_powershell("claude", t), codex = agent_powershell("codex", tc);
     check(claude.find("claude --settings $file") != std::string::npos, "claude runs with a settings file" + tag);
+    check(claude.find("API_TIMEOUT_MS = '600000'") != std::string::npos, "claude sets generous API_TIMEOUT_MS" + tag);
     check(claude.find(key) == std::string::npos && codex.find(key) == std::string::npos, "no key in a command" + tag);
     check(codex.find('"') == std::string::npos, "no double quote reaches codex's arguments" + tag);
 #ifdef _WIN32
@@ -99,6 +100,7 @@ int main() {
         check(env["ANTHROPIC_AUTH_TOKEN"] == (keyed ? key : "flyx"), "claude token" + tag);
         check(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "18000", "claude context" + tag);
         check(env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "9000", "claude output limit: half the context" + tag);
+        check(env["API_TIMEOUT_MS"] == "600000", "claude API timeout" + tag);
       }
       check(part(out, 1).empty(), "an omitted mode uses Claude Code's settings" + tag);
       check(part(out, 2).empty(), "FLYX_KEY is gone after claude" + tag);

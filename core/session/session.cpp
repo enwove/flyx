@@ -28,10 +28,15 @@ bool Session::init(std::string* err) {
     lease_.release();
     return refused("not enough host memory for another session's K/V (--kv-ram)");
   }
-  if (e_->api()->seq_new_in(e_->bmodel(), &e_->kv_layout(), &seq_) != 0) {  // where its K/V go
+  if (const int rc = e_->api()->seq_new_in(e_->bmodel(), &e_->kv_layout(), &seq_); rc != 0) {  // where its K/V go
+    const std::string seq_err = e_->api()->last_error();
     e_->release_host_kv();
     lease_.release();
-    return refused(std::string("seq_new: ") + e_->api()->last_error());
+    if (rc == FLYX_ERR_OOM) {
+      return refused("seq_new: " + seq_err + ". " +
+                     plan::oom_fix_advice(plan::closable(e_->budget().held), std::string_view(e_->drafter()) != "none"));
+    }
+    return refused("seq_new: " + seq_err);
   }
   init_error_.clear();
   return true;

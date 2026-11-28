@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iterator>
 
+#include "apps/common/defaults.h"
 #include "core/os/path.h"
 
 namespace flyx::apps {
@@ -39,6 +40,21 @@ bool parse_seed(const std::string& text, uint64_t* out) {
   return true;
 }
 
+bool gb_to_bytes(double gb, int64_t* bytes_out) {
+  if (!std::isfinite(gb) || gb < 0.0 || gb > kMaxGb) return false;
+  *bytes_out = int64_t(gb * 1e9);
+  return true;
+}
+
+bool parse_gb_or_auto(std::string_view text, int64_t* bytes_out) {
+  if (text == "auto") {
+    *bytes_out = -1;
+    return true;
+  }
+  double gb = 0.0;
+  return parse_number(std::string(text), 0.0, kMaxGb, &gb) && gb_to_bytes(gb, bytes_out);
+}
+
 int whole_flag(const char* flag, const std::string& text, int lo, int hi) {
   long long v = 0;
   if (!parse_whole(text, lo, hi, &v)) {
@@ -64,6 +80,15 @@ uint64_t seed_flag(const char* flag, const std::string& text) {
     std::exit(2);
   }
   return v;
+}
+
+int64_t gb_or_auto_flag(const char* flag, const std::string& text) {
+  int64_t bytes = -1;
+  if (!parse_gb_or_auto(text, &bytes)) {
+    std::fprintf(stderr, "error: %s %s: takes GB (0 to %g) or \"auto\"\n", flag, text.c_str(), kMaxGb);
+    std::exit(2);
+  }
+  return bytes;
 }
 
 bool read_text_file(const std::string& path, std::string* out) {

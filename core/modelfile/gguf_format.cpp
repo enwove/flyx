@@ -692,7 +692,7 @@ bool read_gguf(const uint8_t* data, size_t size, const std::string& path, ModelF
 }
 
 bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::string& path, ModelFile::Contents* out,
-               std::string* err, bool need_tokenizer) {
+               std::string* err, bool need_tokenizer, const PathAllowFn& allow_path) {
   try {
     if (!maps || maps->empty() || !(*maps)[0]) invalid("missing GGUF mapping");
     ShardHeader initial = parse_shard_header((*maps)[0]->data(), (*maps)[0]->size(), true, need_tokenizer);
@@ -726,6 +726,9 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
     for (int i = 0; i < split_count; ++i) {
       if (i == initial_no) continue;
       const std::string p = shard_path(sp, i);
+      if (allow_path && !allow_path(p))
+        invalid("split GGUF shard " + std::to_string(i + 1) + " of " + std::to_string(split_count) +
+                " is not allowed by remote path policy (" + p + ")");
       auto m = std::make_unique<os::MappedFile>();
       std::string open_err;
       if (!m->open(p, &open_err))
@@ -846,9 +849,11 @@ std::string hub_repo_of_url(const std::string& url) {
 
 }  // namespace
 
-GgufPeek gguf_peek(const std::string& path) {
+GgufPeek gguf_peek(const std::string& path, const PathAllowFn& allow_path) {
   GgufPeek out;
-  modelfile::HeaderReader r(gguf_header_path(path));
+  const std::string header = gguf_header_path(path);
+  if (allow_path && !allow_path(header)) return out;
+  modelfile::HeaderReader r(header);
   char magic[4];
   uint32_t version = 0;
   if (!r.read(magic, 4) || std::memcmp(magic, "GGUF", 4) != 0 || !r.get(&version) || version < 1 || version > 3)

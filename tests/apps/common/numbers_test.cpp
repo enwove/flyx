@@ -54,5 +54,16 @@ int main() {
             !parse_seed("12ab", &seed) && !parse_seed("1.0", &seed),
         "text that is not a seed");
 
+  int64_t bytes = -99;
+  check(parse_gb_or_auto("auto", &bytes) && bytes == -1, "parse_gb_or_auto accepts \"auto\"");
+  check(parse_gb_or_auto("0", &bytes) && bytes == 0, "parse_gb_or_auto accepts \"0\"");
+  check(parse_gb_or_auto("1.5", &bytes) && bytes == 1'500'000'000LL, "parse_gb_or_auto parses fractional GB");
+  check(!parse_gb_or_auto("-1", &bytes) && !parse_gb_or_auto("9999999999", &bytes) &&
+            !parse_gb_or_auto("abc", &bytes) && !parse_gb_or_auto("", &bytes),
+        "parse_gb_or_auto rejects negative, out-of-range, and non-numeric values");
+  check(gb_to_bytes(2.0, &bytes) && bytes == 2'000'000'000LL, "gb_to_bytes converts finite positive GB");
+  check(gb_to_bytes(0.0, &bytes) && bytes == 0, "gb_to_bytes converts 0.0");
+  check(!gb_to_bytes(-0.5, &bytes) && !gb_to_bytes(1e12, &bytes), "gb_to_bytes rejects negative and out-of-range GB");
+
   return flyx::test::finish("numbers_test");
 }

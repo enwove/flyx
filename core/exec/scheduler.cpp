@@ -159,7 +159,7 @@ Scheduler::Scheduler(const std::string& model, const EngineOptions& eo, const Sc
       log::info("flyx: removed %s of snapshots in %s that ended flyx processes left behind",
                 gb(store_.stale_freed()).c_str(), opt_.disk_cache_dir.c_str());
   }
-  if (!file_.open(model, &load_error_) || !tok_.load(file_, &load_error_)) return;
+  if (!file_.open(model, &load_error_, eo_.allow_path) || !tok_.load(file_, &load_error_)) return;
   std::string chat_err;  // as Engine::load: only a template given at start-up must work
   EngineOptions env = eo_;
   apply_environment(&env);
@@ -246,6 +246,7 @@ void Scheduler::publish_model() {
   m.max_ctx = max_ctx();
   m.max_sessions = max_sessions_;
   m.ledger_budget = engine_->ledger().budget();
+  m.device_reserve = engine_->budget().device_reserve;
   m.load_s = load_s_;
   m.load_adjustments = engine_->load_adjustments();
   m.ctx_limit = engine_->budget().ctx_limit;

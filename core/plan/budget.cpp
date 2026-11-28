@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 
+#include "core/interfaces/memory_policy.h"
 #include "core/os/os.h"
 
 namespace flyx::plan {
@@ -24,14 +25,37 @@ uint64_t device_reserve(uint64_t total_vram, bool gpu_paged) {
   return gpu_paged ? std::max(base, kPagedReserve) : base;
 }
 
+uint64_t effective_device_reserve(uint64_t total_vram, bool gpu_paged, int64_t override_bytes, uint64_t min_floor) {
+  const uint64_t wanted = override_bytes >= 0 ? uint64_t(override_bytes) : device_reserve(total_vram, gpu_paged);
+  return std::max(wanted, min_floor);
+}
+
+// What holds the GPU besides the model (weights + workspace): where the system reports this process's share
+// (Windows DXGI/NVML, mi.process >= model), subtract mi.process from used so flyx's own CUDA context and driver
+// modules (~0.3-0.7 GB) are separated from other apps; elsewhere the runtime stays folded into `others`.
+GpuHeld held_of(const flyx_memory_info& mi) {
+  GpuHeld h;
+  h.total = mi.total;
+  const uint64_t model = mi.weights + mi.workspace;
+  if (mi.process > 0 && mi.process >= model && mi.total >= mi.free + mi.process) {
+    h.runtime_known = true;
+    h.runtime = mi.process - model;
+    h.others = mi.total - mi.free - mi.process;
+  } else if (mi.total > mi.free + model) {
+    h.others = mi.total - mi.free - model;
+  }
+  return h;
+}
+
 namespace {
 
-// The host memory K/V may take: as asked, or what the machine can spare (its available memory less host_keep(), and
-// less what the process takes besides).
+// The host memory K/V may take: as asked, or what the machine can spare (its available memory less host_keep() or
+// tiers.ram_reserve, and less what the process takes besides).
 uint64_t host_budget(const KvTiers& tiers) {
   if (tiers.ram >= 0) return uint64_t(tiers.ram);
   const os::SystemMemory m = os::system_memory();
-  const uint64_t keep = host_keep(m.total) + tiers.reserved;
+  const uint64_t base_keep = tiers.ram_reserve >= 0 ? uint64_t(tiers.ram_reserve) : host_keep(m.total);
+  const uint64_t keep = base_keep + tiers.reserved;
   return m.available > keep ? m.available - keep : 0;
 }
 
@@ -140,22 +164,6 @@ bool device_bytes(const flyx_backend_api* api, flyx_bmodel* bm, int ctx, const K
   return true;
 }
 
-// What holds the GPU besides the model (budget.h).  A process's share the system counts below the model's own (its
-// memory partly paged out) tells nothing: then as where it counts none.
-GpuHeld held_of(const flyx_memory_info& mi) {
-  GpuHeld h;
-  h.total = mi.total;
-  const uint64_t model = mi.weights + mi.workspace;
-  if (mi.process >= model && mi.total >= mi.free + mi.process) {
-    h.runtime_known = true;
-    h.runtime = mi.process - model;
-    h.others = mi.total - mi.free - mi.process;
-  } else if (mi.total > mi.free + model) {
-    h.others = mi.total - mi.free - model;
-  }
-  return h;
-}
-
 // "3.88" for 3.88e9 bytes (matching gb()'s decimal GB without the unit, for "3.88 / 17.09 GB").
 std::string gb_num(uint64_t bytes) {
   char buf[32];
@@ -214,8 +222,10 @@ bool init_device_budget(const flyx_backend_api* api, flyx_bmodel* bm, const KvTi
     return false;
   };
   if (reported) {
-    reserve = device_reserve(mi->total, tiers.gpu_paged);
+    const uint64_t floor = std::max(tiers.min_vram_reserve, mi->reserve_floor);
+    reserve = effective_device_reserve(mi->total, tiers.gpu_paged, tiers.vram_reserve, floor);
     *reserve_out = reserve;
+    out->device_reserve = reserve;
     const uint64_t have = mi->free + mi->weights + mi->workspace;
     // Zero is the ledger's sentinel for a backend that does not report a budget.
     if (have <= reserve) return fail_vram();
@@ -422,7 +432,17 @@ std::string held_note(const GpuHeld& h) {
          (h.runtime ? ", flyx's own runtime " + gb(h.runtime) : "");
 }
 
-bool closable(const GpuHeld& h) { return h.others >= (h.runtime_known ? 256ull << 20 : 1ull << 30); }
+bool closable(const GpuHeld& h) {
+  return h.others >= (h.runtime_known ? interfaces::kClosableOthersKnownBytes : interfaces::kClosableOthersUnknownBytes);
+}
+
+std::string oom_fix_advice(bool has_others, bool has_drafter) {
+  if (has_others) {
+    return std::string("Close other apps") + (has_drafter ? ", disable speculative decoding" : "") +
+           ", or use a smaller quantization.";
+  }
+  return has_drafter ? "Disable speculative decoding or use a smaller quantization." : "Use a smaller quantization.";
+}
 
 std::string ctx_limit_note(const Budget& b) {
   if (b.ctx_limit == CtxLimit::kHost)

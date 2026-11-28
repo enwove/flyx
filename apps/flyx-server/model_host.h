@@ -10,6 +10,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -63,8 +64,21 @@ class ModelHost {
   static bool remembered(Want* w, const EngineOptions& base);
   static std::string remembered_hub_endpoint();
   static bool save_hub_endpoint(const std::string& endpoint, std::string* err = nullptr);
+  struct NetworkSettingsSnapshot {
+    bool lan_access = false;
+    bool remote_manage = false;
+    bool live_remote_manage = false;
+  };
   static bool lan_access();
-  static bool save_lan_access(bool enabled, std::string* err);
+  static bool remote_manage();
+  static NetworkSettingsSnapshot read_network_settings(
+      const std::function<bool()>& read_live_remote_manage = {});
+  // Atomically update lan_access and/or remote_manage in serve.json under settings_mutex(), invoking
+  // on_remote_manage_committed before releasing the lock and sampling live_remote_manage under the same lock.
+  static bool save_network_settings(std::optional<bool> lan_access, std::optional<bool> remote_manage,
+                                    const std::function<void(bool)>& on_remote_manage_committed,
+                                    NetworkSettingsSnapshot* out_snapshot, std::string* err,
+                                    const std::function<bool()>& read_live_remote_manage = {});
 
  private:
   struct BusyGuard {

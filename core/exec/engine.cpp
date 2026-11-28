@@ -416,9 +416,10 @@ bool Engine::lower_and_time(std::string* err) {
     lower_ms_ += os::now_ms() - t0;
     if (!plans_.oom) return false;
     if (!give_back()) {  // out of GPU memory with nothing left to give back: what would make room (as the budget's)
-      *err += std::string(". Close other apps") +
-              (model_->drafters() > 0 ? ", disable speculative decoding" : "") +
-              ", or use a smaller quantization.";
+      flyx_memory_info mi{};
+      const bool has_others =
+          api_->memory && api_->memory(bm_, &mi) == 0 && mi.total > 0 && plan::closable(plan::held_of(mi));
+      *err += ". " + plan::oom_fix_advice(has_others, model_->drafters() > 0);
       return false;
     }
   }
@@ -471,33 +472,53 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
   // The model file's pages the load read are cached, not used: on Windows they count as available only once the
   // process lets go of them, and the host memory K/V may take is measured next.
   os::release_working_set();
+  auto current_floor = [&]() -> uint64_t {
+    uint64_t f = device_.reserve_floor;
+    if (api_ && api_->memory && bm_) {
+      flyx_memory_info mi{};
+      if (api_->memory(bm_, &mi) == 0) f = std::max(f, mi.reserve_floor);
+    }
+    return f;
+  };
+  device_.reserve_floor = current_floor();
   tiers->gpu = opt_.kv_gpu;
   tiers->ram = opt_.kv_ram;
   tiers->copy_gpu = opt_.kv_copy_gpu;
   tiers->reserved = opt_.host_reserved;
+  tiers->vram_reserve = opt_.vram_reserve;
+  tiers->min_vram_reserve = device_.reserve_floor;
+  tiers->ram_reserve = opt_.ram_reserve;
   tiers->gpu_paged = os::gpu_memory_paged();
   // --ctx max: the longest the GPU and host memory hold, or with no host memory for K/V the longest the GPU holds.
   const int min_ctx = opt_.ctx_max ? 1024 : opt_.ctx_given ? 0 : kMinFittedCtx;
   // Not even one session fits (in any layout account() takes, its K/V in host memory or its context shrunk
   // included): one step of what the backend keeps for speed, and the budget again.  Only when nothing is left to give
   // is it an error.
-  while (!plan::account(api_, bm_, model_->drafters() > 0, 2 * bf16 > all, &opt_.max_ctx, min_ctx, *tiers, &ledger_,
-                        &budget_, err, opt_.ctx_max)) {
-    const std::string why = *err;
-    if (!give_back()) {
-      *err = why;
-      if (given_back_) *err += " (" + gb(given_back_) + " the backend kept for speed already given back)";
-      return false;
+  for (;;) {
+    while (!plan::account(api_, bm_, model_->drafters() > 0, 2 * bf16 > all, &opt_.max_ctx, min_ctx, *tiers, &ledger_,
+                          &budget_, err, opt_.ctx_max)) {
+      const std::string why = *err;
+      if (!give_back()) {
+        *err = why;
+        if (given_back_) *err += " (" + gb(given_back_) + " the backend kept for speed already given back)";
+        return false;
+      }
+      if (!lower_and_time(err)) {
+        budget_.oom = plans_.oom;
+        return false;
+      }
+      const uint64_t f = current_floor();
+      if (f > tiers->min_vram_reserve) device_.reserve_floor = tiers->min_vram_reserve = f;
     }
-    if (!lower_and_time(err)) {
-      budget_.oom = plans_.oom;
-      return false;
-    }
+    if (session_limit > 1) plan::fit_second_session(api_, bm_, *tiers, ledger_, &budget_);
+    const uint64_t f = current_floor();
+    if (f <= tiers->min_vram_reserve) break;
+    // Backend's reserve floor grew lazily (e.g., CUDA VMM fell back to paged allocation); replan with the new floor.
+    device_.reserve_floor = tiers->min_vram_reserve = f;
   }
   if (given_back_)
     log::info("flyx: %s of GPU memory the backend kept only for speed given back so that a session fits (the same "
               "output, a little slower; -v says what)", gb(given_back_).c_str());
-  if (session_limit > 1) plan::fit_second_session(api_, bm_, *tiers, ledger_, &budget_);
   return true;
 }
 
@@ -568,19 +589,19 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   if (!set_kv_method(opt_, &tiers, err)) return false;
   // The load's steps, for its report (verbose): file, tokenizer and chat, backend, model, open, plans, rounds, memory.
   double t[7] = {os::now_ms()};
-  if (!file_.open(path, err)) return false;
+  if (!file_.open(path, err, opt_.allow_path)) return false;
   for (const std::string& f : opt_.drafter_files)
-    if (!file_.add(f, err)) return false;
+    if (!file_.add(f, err, opt_.allow_path)) return false;
   if (!opt_.lora_file.empty()) {
     const int before = file_.companions();
-    if (!file_.add(opt_.lora_file, err)) return false;
+    if (!file_.add(opt_.lora_file, err, opt_.allow_path)) return false;
     if (file_.header()["companions"][size_t(before)].value("kind", "") != "lora")
       return *err = opt_.lora_file + ": not a LoRA adapter (a directory of adapter_config.json and "
                                      "adapter_model.safetensors)",
              false;
   }
   if (opt_.vision && !opt_.mmproj_file.empty())
-    if (!file_.add(opt_.mmproj_file, err)) return false;
+    if (!file_.add(opt_.mmproj_file, err, opt_.allow_path)) return false;
   ReadAhead ahead(file_);  // until the load returns
   t[1] = os::now_ms();
   if (!tok_.load(file_, err)) return false;
@@ -650,6 +671,14 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   const bool orig_has_vision = model_->vision() != nullptr;
   const std::string orig_drafters_str = model_drafters_str(*model_);
   const bool gpu_paged = os::gpu_memory_paged();
+  const uint64_t vram_floor = device_.reserve_floor;
+  if (opt_.vram_reserve >= 0 && uint64_t(opt_.vram_reserve) < vram_floor) {
+    log::info("flyx: --vram-reserve %s clamped to backend floor %s",
+              gb(uint64_t(opt_.vram_reserve)).c_str(), gb(vram_floor).c_str());
+  }
+  auto device_reserve = [&](uint64_t total_vram) {
+    return plan::effective_device_reserve(total_vram, gpu_paged, opt_.vram_reserve, vram_floor);
+  };
 
   auto upsert_adj = [&](const std::string& kind, const std::string& from, const std::string& to,
                         const std::string& detail) {
@@ -724,8 +753,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
         if (api_->estimate_load(&target.desc(), &oo, device_.mem_free, device_.mem_total, &base) == 0 &&
             base.target_kv_bytes_per_position) {
           uint64_t room = device_.mem_free;
-          for (uint64_t held : {base.weights_bytes, base.min_runtime_bytes,
-                                plan::device_reserve(device_.mem_total, gpu_paged)})
+          for (uint64_t held : {base.weights_bytes, base.min_runtime_bytes, device_reserve(device_.mem_total)})
             room -= std::min(room, held);
           auto_from = int(std::min<uint64_t>(INT32_MAX, room / base.target_kv_bytes_per_position));
         }
@@ -870,7 +898,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     uint64_t free_vram = 0, total_vram = 0;
     query_vram(&free_vram, &total_vram);
     if (total_vram > 0 && free_vram > 0) {
-      const uint64_t reserve = plan::device_reserve(total_vram, gpu_paged);
+      const uint64_t reserve = device_reserve(total_vram);
       for (;;) {
         flyx_load_estimate est{};
         if (!query_estimate(free_vram, total_vram, &est)) break;

@@ -113,22 +113,46 @@ size_t on_data(char* data, size_t size, size_t count, void* user) {
   return n;
 }
 
+struct HeaderSink {
+  std::string* link = nullptr;
+  std::string* retry_after = nullptr;
+};
+
+bool header_starts_with(std::string_view line, std::string_view prefix) {
+  if (line.size() < prefix.size()) return false;
+  for (size_t i = 0; i < prefix.size(); ++i) {
+    const unsigned char a = static_cast<unsigned char>(line[i]);
+    const unsigned char b = static_cast<unsigned char>(prefix[i]);
+    const unsigned char la = (a >= 'A' && a <= 'Z') ? static_cast<unsigned char>(a - 'A' + 'a') : a;
+    const unsigned char lb = (b >= 'A' && b <= 'Z') ? static_cast<unsigned char>(b - 'A' + 'a') : b;
+    if (la != lb) return false;
+  }
+  return true;
+}
+
+std::string_view header_value(std::string_view line, size_t prefix_len) {
+  size_t s = prefix_len;
+  while (s < line.size() && (line[s] == ' ' || line[s] == '\t')) ++s;
+  size_t e = line.size();
+  while (e > s && (line[e - 1] == '\r' || line[e - 1] == '\n' || line[e - 1] == ' ' || line[e - 1] == '\t')) --e;
+  return line.substr(s, e - s);
+}
+
 size_t on_header(char* data, size_t size, size_t count, void* user) {
-  auto* link = static_cast<std::string*>(user);
+  auto* sink = static_cast<HeaderSink*>(user);
   const size_t n = size * count;
   const std::string_view line(data, n);
   if (line.starts_with("HTTP/")) {
-    link->clear();  // new response after a redirect
+    if (sink->link) sink->link->clear();  // new response after a redirect
+    if (sink->retry_after) sink->retry_after->clear();
     return n;
   }
-  if (line.size() >= 5 && (line[0] == 'L' || line[0] == 'l') && (line[1] == 'I' || line[1] == 'i') &&
-      (line[2] == 'N' || line[2] == 'n') && (line[3] == 'K' || line[3] == 'k') && line[4] == ':') {
-    size_t s = 5;
-    while (s < line.size() && (line[s] == ' ' || line[s] == '\t')) ++s;
-    size_t e = line.size();
-    while (e > s && (line[e - 1] == '\r' || line[e - 1] == '\n' || line[e - 1] == ' ')) --e;
-    if (!link->empty()) *link += ", ";
-    link->append(line.substr(s, e - s));
+  if (sink->link && header_starts_with(line, "link:")) {
+    const std::string_view val = header_value(line, 5);
+    if (!sink->link->empty()) *sink->link += ", ";
+    sink->link->append(val);
+  } else if (sink->retry_after && header_starts_with(line, "retry-after:")) {
+    *sink->retry_after = std::string(header_value(line, 12));
   }
   return n;
 }
@@ -140,7 +164,7 @@ HttpClient::~HttpClient() {
 }
 
 bool HttpClient::get(const HttpGet& req, const HttpBody& body, int* status, std::string* err, std::string* final_url,
-                     std::string* link_header) {
+                     std::string* link_header, std::string* retry_after) {
   const Curl& c = curl();
   if (!c.missing.empty()) return *err = c.missing, false;
   if (!handle_ && !(handle_ = c.easy_init())) return *err = "libcurl: no handle", false;
@@ -150,6 +174,7 @@ bool HttpClient::get(const HttpGet& req, const HttpBody& body, int* status, std:
   for (const std::string& line : req.headers) headers = c.slist_append(headers, line.c_str());
   char error[kErrorSize] = {0};
   Sink sink{&body, &c, h};
+  HeaderSink header_sink{link_header, retry_after};
   const std::string range = req.ranged ? std::to_string(req.first) + "-" + std::to_string(req.last) : "";
   c.easy_setopt(h, kOptUrl, req.url.c_str());
   c.easy_setopt(h, kOptUserAgent, http_user_agent());
@@ -164,10 +189,11 @@ bool HttpClient::get(const HttpGet& req, const HttpBody& body, int* status, std:
   c.easy_setopt(h, kOptErrorBuffer, error);
   c.easy_setopt(h, kOptWriteFunction, &on_data);
   c.easy_setopt(h, kOptWriteData, &sink);
-  if (link_header) {
-    link_header->clear();
+  if (link_header || retry_after) {
+    if (link_header) link_header->clear();
+    if (retry_after) retry_after->clear();
     c.easy_setopt(h, kOptHeaderFunction, &on_header);
-    c.easy_setopt(h, kOptHeaderData, link_header);
+    c.easy_setopt(h, kOptHeaderData, &header_sink);
   }
   if (headers) c.easy_setopt(h, kOptHttpHeader, headers);
   if (req.ranged) c.easy_setopt(h, kOptRange, range.c_str());

@@ -96,13 +96,15 @@ FOUND_PAGE2 = {"query": "", "family": True, "architectures": ["qwen35", "qwen3",
 DRAFTER_KINDS = {"./another.gguf": "mtp", "./new-mtp.gguf": "mtp", "./drafts/Speedy": "dspark"}
 
 
-def repository(repo, helper_cached=False):
+def repository(repo_spec, helper_cached=False):
     """GET /v1/hub/files: REPO as this build runs it, a dflash GGUF drafter repo, a safetensors drafter repo, or unsupported."""
+    repo, _, rev = repo_spec.partition("@")
+    rev_sfx = f"@{rev}" if rev and rev != "main" else ""
     if repo == "acme/Model-DFlash2-GGUF":
-        return {"repo": repo, "from_cache": False, "drafter": None, "drafter_repo": True, "base_models": ["acme/Tiny-27B"],
-                "runs": True, "known_drafters": [], "build_architectures": ["qwen35", "qwen3"],
-                "mtp": None, "mmproj": None, "ggufs": [],
-                "companions": [{"name": repo + ":helper.gguf", "path": "helper.gguf",
+        return {"repo": repo, "revision": rev or "main", "from_cache": False, "drafter": None, "drafter_repo": True,
+                "base_models": ["acme/Tiny-27B"], "runs": True, "known_drafters": [],
+                "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [],
+                "companions": [{"name": repo + ":helper.gguf" + rev_sfx, "path": "helper.gguf",
                                 "file": "helper.gguf", "kind": "dspark" if helper_cached else "drafter",
                                 "drafter_kind": "dspark" if helper_cached else "",
                                 "size": int(0.5 * GB), "cached": helper_cached, "disk": None, "default": True}],
@@ -110,36 +112,40 @@ def repository(repo, helper_cached=False):
                          "pipeline": "text-generation", "gated": False, "architecture": "dflash",
                          "context": 1048576, "parameters": 495000000}}
     if repo == "acme/Model-DFlash2":
-        return {"repo": repo, "from_cache": False, "drafter": {"size": int(0.9 * GB), "kind": "dflash2"}, "drafter_repo": False,
-                "base_models": ["acme/Tiny-27B"], "runs": None, "known_drafters": [],
+        return {"repo": repo, "revision": rev or "main", "from_cache": False, "drafter": {"size": int(0.9 * GB), "kind": "dflash2"},
+                "drafter_repo": False, "base_models": ["acme/Tiny-27B"], "runs": None, "known_drafters": [],
                 "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [], "companions": [],
                 "info": {"downloads": 500, "likes": 25, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
                          "pipeline": None, "gated": False, "architecture": None, "context": None, "parameters": None}}
     if repo == "acme/Speedy-Drafter":  # a DSpark drafter whose name does not say so: the server says its kind
-        return {"repo": repo, "from_cache": False, "drafter": {"size": int(0.8 * GB), "kind": "dspark"},
+        return {"repo": repo, "revision": rev or "main", "from_cache": False, "drafter": {"size": int(0.8 * GB), "kind": "dspark"},
                 "drafter_repo": False, "base_models": ["acme/Tiny-27B"], "runs": None, "known_drafters": [],
                 "build_architectures": ["qwen35", "qwen3"], "mtp": None, "mmproj": None, "ggufs": [], "companions": [],
                 "info": {"downloads": 50, "likes": 2, "updated": "2026-11-24T02:15:52.000Z", "license": "mit",
                          "pipeline": None, "gated": False, "architecture": None, "context": None, "parameters": None}}
     runs = repo == REPO
-    quants = [("IQ3_XXS", 11.8, True), ("Q4_K_M", 17.6, True), ("Q5_K_M", 19.4, False), ("Q6_K", 22.3, False), ("BF16", 54.7, False)]
-    return {"repo": repo, "from_cache": False, "drafter": None, "base_models": ["acme/Tiny-27B"], "runs": runs,
-            "known_drafters": [{"repo": "acme/Tiny-27B-DFlash2", "kind": "dflash2", "base": "acme/Tiny-27B", "exact": False,
-                                "relation": "quantized", "tok_s": None}]
-            if runs else [], "build_architectures": ["qwen35", "qwen3"],
+    old_rev = runs and rev == "oldrev123"
+    quants = ([("Q2_K", 9.8, True), ("Q4_K_M", 17.6, True)] if old_rev
+              else [("IQ3_XXS", 11.8, True), ("Q4_K_M", 17.6, True), ("Q5_K_M", 19.4, False), ("Q6_K", 22.3, False), ("BF16", 54.7, False)])
+    drafters = ([{"repo": "acme/OldRev-DFlash2", "kind": "dflash2", "base": "acme/Tiny-27B", "exact": True,
+                  "relation": None, "tok_s": None}] if old_rev
+                else [{"repo": "acme/Tiny-27B-DFlash2", "kind": "dflash2", "base": "acme/Tiny-27B", "exact": False,
+                       "relation": "quantized", "tok_s": None}] if runs else [])
+    return {"repo": repo, "revision": rev or "main", "from_cache": False, "drafter": None, "base_models": ["acme/Tiny-27B"], "runs": runs,
+            "known_drafters": drafters, "build_architectures": ["qwen35", "qwen3"],
             "mtp": {"path": "MTP/mtp.gguf", "size": int(0.6 * GB), "cached": True} if runs else None,
             "mmproj": {"path": "mmproj-BF16.gguf", "size": int(0.9 * GB), "cached": True} if runs else None,
             "companions": [
-                {"name": repo + ":mtp.gguf", "path": "MTP/mtp.gguf", "file": "mtp.gguf", "kind": "mtp",
+                {"name": repo + ":mtp.gguf" + rev_sfx, "path": "MTP/mtp.gguf", "file": "mtp.gguf", "kind": "mtp",
                  "size": int(0.6 * GB), "cached": True, "disk": None, "default": True},
-                {"name": repo + ":mmproj-BF16.gguf", "path": "mmproj-BF16.gguf", "file": "mmproj-BF16.gguf", "kind": "mmproj",
+                {"name": repo + ":mmproj-BF16.gguf" + rev_sfx, "path": "mmproj-BF16.gguf", "file": "mmproj-BF16.gguf", "kind": "mmproj",
                  "size": int(0.9 * GB), "cached": True, "disk": None, "default": True},
-                {"name": repo + ":mmproj-F16.gguf", "path": "mmproj-F16.gguf", "file": "mmproj-F16.gguf", "kind": "mmproj",
+                {"name": repo + ":mmproj-F16.gguf" + rev_sfx, "path": "mmproj-F16.gguf", "file": "mmproj-F16.gguf", "kind": "mmproj",
                  "size": int(0.9 * GB), "cached": False, "disk": None, "default": False},
             ] if runs else [],
             "info": {"downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "license": "apache-2.0", "pipeline": None,
                      "gated": False, "architecture": "qwen35" if runs else "gemma4", "context": 262144, "parameters": 27320697856},
-            "ggufs": [{"name": repo + ":" + q, "quant": q, "size": int(s * GB), "split": False, "parts": 1, "complete": True, "cached": c and runs}
+            "ggufs": [{"name": repo + ":" + q + rev_sfx, "quant": q, "size": int(s * GB), "split": False, "parts": 1, "complete": True, "cached": c and runs}
                       for q, s, c in quants]}
 
 
@@ -176,13 +182,18 @@ HUB_LORA = {"repo": "acme/Tiny-27B-coder-lora", "revision": "main", "adapters": 
 class Server:
     """The stubbed server of one page: what it was asked to load, to delete and to show a folder dialog for."""
 
-    def __init__(self, page, tm, dialog=(200, LISTING), gpu_apps=None):
+    def __init__(self, page, tm, dialog=(200, LISTING), gpu_apps=None, catalog=None, folders=None):
         self.tm, self.dialog, self.posted, self.deleted, self.dialogs = tm, dialog, [], [], []
         self.gpu_apps = copy.deepcopy(gpu_apps) if gpu_apps is not None else None
+        self.catalog = catalog if catalog is not None else CATALOG
+        self.folders = folders if folders is not None else FOLDERS
         self.closed = []
         self.hub_endpoint = "https://huggingface.co"
         self.hub_source = "default"
         self.hub_fail = False
+        self.files_fail = None
+        self.files_asked = []
+        self.dir_asked = []
         self.hub_configs = []
         self.lora_asked = []
         page.route("**/dashboard/**", lambda r: serve(r, ROOT / "apps/flyx-server/dashboard"))
@@ -229,7 +240,7 @@ class Server:
         if "/v1/telemetry" in url:
             return route.fulfill(json=self.tm)
         if "/v1/hub/cached" in url:
-            return route.fulfill(json=CATALOG)
+            return route.fulfill(json=self.catalog)
         if "/v1/hub/loras" in url:
             self.lora_asked.append({k: v[0] for k, v in query.items()})
             base = query.get("base", [""])[0]
@@ -269,6 +280,10 @@ class Server:
             res["endpoint"] = self.hub_endpoint
             if q_text:
                 res["query"], res["family"], res["next_cursor"] = q_text, False, None
+                if q_text == "no-such-model-xyz":
+                    res["models"] = []
+                elif q_text == "inkling":
+                    res["models"] = [m for m in res["models"] if "Inkling" in m["id"]]
             elif arch:
                 res["arch"], res["next_cursor"] = arch, None
                 res["models"] = [m for m in res["models"] if m.get("architecture") == arch]
@@ -277,12 +292,17 @@ class Server:
             name = query.get("name", [""])[0]
             return route.fulfill(json={"name": name, "kind": DRAFTER_KINDS.get(name)})
         if "/v1/hub/files" in url:
+            self.files_asked.append(query["repo"][0])
+            if self.files_fail:
+                status, msg = self.files_fail
+                return route.fulfill(status=status, json={"error": {"message": msg}})
             res = repository(query["repo"][0], getattr(self, "helper_cached", False))
             res["endpoint"] = self.hub_endpoint
             return route.fulfill(json=res)
         if "/v1/hub/dir" in url:
             path = query.get("path", [""])[0]
-            return route.fulfill(json=FOLDERS[path]) if path in FOLDERS else route.fulfill(
+            self.dir_asked.append(path)
+            return route.fulfill(json=self.folders[path]) if path in self.folders else route.fulfill(
                 status=404, json={"error": {"message": path + ": no such folder or file on this machine"}})
         route.fulfill(json={})
 
@@ -341,6 +361,16 @@ def check_settings(page, server, want):
             expect(page.locator('[data-k="kv_gpu"] .was')).to_contain_text("0")
         confirm(page, "#mf-reload", "Reload")
         assert server.posted[-1]["kv_gpu"] == (int(value) if value else None) and server.posted[-1]["model"] == want["model"], server.posted[-1]
+    page.locator("#mf-vramres").fill("0")
+    page.locator("#mf-ramres").fill("0")
+    expect(cmd).to_contain_text("--vram-reserve 0")
+    expect(cmd).to_contain_text("--ram-reserve 0")
+    confirm(page, "#mf-reload", "Reload")
+    assert server.posted[-1]["vram_reserve"] == 0 and server.posted[-1]["ram_reserve"] == 0, server.posted[-1]
+    page.locator("#mf-vramres").fill("")
+    page.locator("#mf-ramres").fill("")
+    expect(cmd).not_to_contain_text("--vram-reserve")
+    expect(cmd).not_to_contain_text("--ram-reserve")
     page.locator("#mf-reset").click()
     expect(page.locator("#mf-name")).to_have_value("")
     expect(page.locator("#mf-reload")).to_have_count(0)
@@ -615,22 +645,33 @@ def check_hub(page, server, want):
     expect(page.locator("#hf-prev")).to_be_disabled()
     expect(page.locator("#hf-page")).to_have_text("Page 1")
     expect(page.locator("#hf-next")).to_be_enabled()
-    # Pagination advances to Page 2 and returns to Page 1 cleanly.
+    # Select a quantization first, then verify pagination reconciles detail & clears stale #mf-load target.
+    expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
+    expect(page.locator("#mf-load")).to_be_enabled()
     page.locator("#hf-next").click()
     expect(page.locator("#hf-page")).to_have_text("Page 2")
     expect(page.locator("#hf-list .prow")).to_have_count(1)
     expect(page.locator('#hf-list .prow[data-repo="acme/Page2-Model-GGUF"]')).to_have_count(1)
+    expect(page.locator("#hf-name")).to_have_text("Page2-Model-GGUF")
+    expect(page.locator("#mf-load")).to_be_disabled()
     expect(page.locator("#hf-prev")).to_be_enabled()
     expect(page.locator("#hf-next")).to_be_disabled()
     page.locator("#hf-prev").click()
     expect(page.locator("#hf-page")).to_have_text("Page 1")
     expect(page.locator("#hf-list .prow")).to_have_count(3)
-    # Architecture filter pills narrow the list and reset back to All.
+    expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")
+    # Architecture filter pills narrow the list, reconcile detail & clear stale #mf-load target, and reset back to All.
+    page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
+    expect(page.locator("#mf-load")).to_be_enabled()
     page.locator('#hf-archs button[data-arch="inkling2_loop"]').click()
     expect(page.locator("#hf-list .prow")).to_have_count(1)
     expect(page.locator('#hf-list .prow[data-repo="acme/Inkling-2-Mini-GGUF"]')).to_have_count(1)
+    expect(page.locator("#hf-name")).to_have_text("Inkling-2-Mini-GGUF")
+    expect(page.locator("#mf-load")).to_be_disabled()
     page.locator('#hf-archs button[data-arch=""]').click()
     expect(page.locator("#hf-list .prow")).to_have_count(3)
+    page.locator('#hf-list .prow[data-repo="acme/Tiny-27B-GGUF"]').click()
     expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")  # the first repository found is shown
     expect(page.locator("#hf-detail .dchips")).to_contain_text("+ Vision")
     expect(page.locator("#hf-detail .dchips")).to_contain_text("+ MTP")
@@ -805,6 +846,76 @@ def check_hub(page, server, want):
     verified.click()
     expect(page.locator("#mf-cmd")).to_contain_text(re.compile(r"--drafter-file '?acme/Tiny-27B-DFlash2"))
     page.locator("#mf-reset").click()
+    # A 404 JSON or 502 error from /v1/hub/files surfaces the real error with a Retry button (not "update FLYX"),
+    # clears any stale selected target, and Retry preserves the originally requested quantization.
+    view(page, "library")
+    server.files_fail = (404, "acme/Missing: repository not found")
+    page.locator("#hf-q").fill("acme/Missing")
+    page.keyboard.press("Enter")
+    expect(page.locator("#mf-hubmsg.banner.bad")).to_contain_text("acme/Missing: repository not found")
+    expect(page.locator("#mf-hubmsg")).not_to_contain_text("update FLYX")
+    expect(page.locator("#mf-load")).to_be_disabled()
+    server.files_fail = (502, "cannot reach the Hub (timed out)")
+    page.locator("#hf-retry").click()
+    expect(page.locator("#mf-hubmsg.banner.bad")).to_contain_text("cannot reach the Hub (timed out)")
+    # Searching org/repo:Q5_K_M when /v1/hub/files fails once still selects Q5_K_M when Retry succeeds.
+    page.locator("#hf-q").fill(REPO + ":Q5_K_M")
+    page.keyboard.press("Enter")
+    expect(page.locator("#mf-hubmsg.banner.bad")).to_contain_text("cannot reach the Hub")
+    expect(page.locator("#mf-load")).to_be_disabled()
+    server.files_fail = None
+    page.locator("#hf-retry").click()
+    expect(page.locator("#mf-files .mrow")).to_have_count(5)
+    expect(page.locator("#mf-files .mrow.sel")).to_have_attribute("data-name", REPO + ":Q5_K_M")
+    # An ordinary text search that returns 0 results clears the previously shown repository detail and target.
+    page.locator("#hf-q").fill("no-such-model-xyz")
+    page.keyboard.press("Enter")
+    expect(page.locator("#hf-list .prow")).to_have_count(0)
+    expect(page.locator("#hf-detail")).to_have_count(0)
+    expect(page.locator(".hub-detail")).to_contain_text("Pick a repository on the left")
+    expect(page.locator("#mf-load")).to_be_disabled()
+    # A subsequent non-empty text search selects from the fresh results rather than staying empty.
+    page.locator("#hf-q").fill("inkling")
+    page.keyboard.press("Enter")
+    expect(page.locator("#hf-list .prow")).to_have_count(1)
+    expect(page.locator("#hf-name")).to_have_text("Inkling-2-Mini-GGUF")
+    # Search failure clears stale repository detail and disables Load.
+    server.hub_fail = True
+    page.locator("#hf-q").fill("broken-search")
+    page.keyboard.press("Enter")
+    expect(page.locator("#hf-detail")).to_have_count(0)
+    expect(page.locator("#mf-load")).to_be_disabled()
+    server.hub_fail = False
+    page.locator("#hf-q").fill("")
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
+    expect(page.locator("#hf-detail")).to_have_count(1)
+    # A zero-result architecture filter clears stale repository detail and disables Load.
+    page.locator('#hf-archs [data-arch="qwen3"]').click()
+    expect(page.locator("#hf-list .prow")).to_have_count(0)
+    expect(page.locator("#hf-detail")).to_have_count(0)
+    expect(page.locator("#mf-load")).to_be_disabled()
+    page.locator('#hf-archs [data-arch=""]').click()
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
+    # Pinned @revision is preserved across direct lookup, Retry after failure, and Hub endpoint change.
+    server.files_fail = (502, "cannot reach the Hub (timed out)")
+    page.locator("#hf-q").fill(REPO + ":Q5_K_M@v2")
+    page.keyboard.press("Enter")
+    expect(page.locator("#mf-hubmsg.banner.bad")).to_contain_text("cannot reach the Hub")
+    assert server.files_asked[-1] == REPO + "@v2", server.files_asked
+    server.files_fail = None
+    page.locator("#hf-retry").click()
+    expect(page.locator("#mf-files .mrow.sel")).to_have_attribute("data-name", REPO + ":Q5_K_M@v2")
+    assert server.files_asked[-1] == REPO + "@v2", server.files_asked
+    page.locator("#hf-ep-toggle").click()
+    page.locator('#hf-epbar .chip[data-ep="https://hf-mirror.com"]').click()
+    expect(page.locator("#hf-ep-toggle")).to_contain_text("hf-mirror.com")
+    expect(page.locator("#mf-files .mrow.sel")).to_have_attribute("data-name", REPO + ":Q5_K_M@v2")
+    assert server.files_asked[-1] == REPO + "@v2", server.files_asked
+    page.locator("#hf-ep-reset").click()
+    expect(page.locator("#hf-ep-toggle")).to_contain_text("huggingface.co")
+    page.locator("#hf-ep-toggle").click()
+    page.locator("#hf-q").fill("")
+    expect(page.locator("#hf-list .prow")).to_have_count(3)
 
 
 def check_local(page, server):
@@ -1045,9 +1156,11 @@ def check_nothing_served(page, server, remembered):
         page.locator("#mf-load").click()
     expect(page.locator("#mv-current")).to_be_visible()
     body = server.posted[-1]
-    # kv "auto": the engine's default, not the server's --kv (null would keep that)
+    # kv "auto": the engine's default, not the server's --kv (null would keep that);
+    # vram_reserve/ram_reserve stay null so CLI --vram-reserve / --ram-reserve are preserved on first load.
     assert (body["model"], body["ctx"], body["kv"], body["kv_ram"], body["kv_gpu"], body["speculative"], body["drafter"], body["drafters"]) == \
         (REPO + ":Q5_K_M", None, "auto", "auto", None, True, "", []), body
+    assert body["vram_reserve"] is None and body["ram_reserve"] is None, body
     expect(page.locator("#mf-settings")).to_have_count(0)
     expect(page.locator("#ld-reload")).to_be_hidden()
     expect(page.locator("#ld-unload")).to_be_hidden()
@@ -1283,6 +1396,150 @@ def check_lora(open_page, want):
         FOLDERS[FOLDER]["models"].remove(adapter)
 
 
+def check_local_posix(open_page, want):
+    """POSIX Local tab: case-sensitive folders (/Models vs /models), literal backslashes, root '/', --models-dir == cacheDir merging, and revision-pinned Hub jumps."""
+    posix_cache = "/home/user/.cache/huggingface/hub"
+    posix_catalog = {
+        "cache": posix_cache,
+        "cache_from": "default",
+        "win_paths": False,
+        "dirs": [posix_cache, "/Models", "/models", "/models\\", "/"],
+        "models": [
+            {"name": REPO + ":Q4_K_M", "kind": "gguf", "source": "hub", "repo": REPO, "quant": "Q4_K_M",
+             "file": "Tiny-27B-Q4_K_M.gguf", "path": posix_cache + "/models--acme--Tiny-27B-GGUF/snapshots/abc/Tiny-27B-Q4_K_M.gguf",
+             "size": int(17.6 * GB), "modified": 1.7e9, "revision": "abc", "current": True, "mtp": None, "mmproj": None},
+            {"name": REPO + ":Q4_K_M@oldrev123", "kind": "gguf", "source": "hub", "repo": REPO, "quant": "Q4_K_M",
+             "file": "Tiny-27B-Q4_K_M.gguf", "path": posix_cache + "/models--acme--Tiny-27B-GGUF/snapshots/oldrev123/Tiny-27B-Q4_K_M.gguf",
+             "size": int(17.6 * GB), "modified": 1.6e9, "revision": "oldrev123", "current": False, "mtp": None, "mmproj": None},
+            {"name": posix_cache + "/loose.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q8_0",
+             "file": "loose.gguf", "path": posix_cache + "/loose.gguf", "root": posix_cache,
+             "size": int(2.1 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
+            {"name": "/Models/Upper-7B.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
+             "file": "Upper-7B.gguf", "path": "/Models/Upper-7B.gguf", "root": "/Models",
+             "size": int(4.1 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
+            {"name": "/models/lower-7B.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
+             "file": "lower-7B.gguf", "path": "/models/lower-7B.gguf", "root": "/models",
+             "size": int(4.2 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
+            {"name": "/models\\/a\\b.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
+             "file": "a\\b.gguf", "path": "/models\\/a\\b.gguf", "root": "/models\\",
+             "size": int(4.3 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
+            {"name": "/root-model.gguf", "kind": "gguf", "source": "dir", "repo": None, "quant": "Q4_K_M",
+             "file": "root-model.gguf", "path": "/root-model.gguf", "root": "/",
+             "size": int(3.0 * GB), "modified": 1.7e9, "revision": None, "current": True, "mtp": None},
+        ],
+    }
+    posix_folders = {
+        posix_cache: {"path": posix_cache, "parent": "/home/user/.cache/huggingface", "kind": "dir", "dirs": [],
+                      "models": [posix_catalog["models"][2]]},
+        "/Models": {"path": "/Models", "parent": "/", "kind": "dir", "dirs": [],
+                    "models": [posix_catalog["models"][3]]},
+        "/models": {"path": "/models", "parent": "/", "kind": "dir", "dirs": [],
+                    "models": [posix_catalog["models"][4]]},
+        "/models\\": {"path": "/models\\", "parent": "/", "kind": "dir", "dirs": [],
+                      "models": [posix_catalog["models"][5]]},
+        "/": {"path": "/", "parent": None, "kind": "dir", "dirs": [],
+              "models": [posix_catalog["models"][6]]},
+    }
+    served = dict(want, model="/models/lower-7B.gguf")
+    page, srv = open_page(telemetry(served), catalog=posix_catalog, folders=posix_folders)
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
+    # All 5 POSIX folders stay distinct: cache, /Models, /models, /models\ (literal backslash), and root '/'.
+    folders = page.locator("#lc-list .prow.folder")
+    expect(folders).to_have_count(5)
+    expect(page.locator('#lc-list .prow.folder[data-place="dir:' + posix_cache + '"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.folder[data-place="dir:/Models"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.folder[data-place="dir:/models"] .pn')).to_contain_text("models")
+    bs_folder = page.locator(r'#lc-list .prow.folder[data-place="dir:/models\\"]')
+    expect(bs_folder).to_have_count(1)
+    expect(bs_folder.locator(".pn")).to_have_text("models\\")
+    expect(page.locator('#lc-list .prow.folder[data-place="dir:/"]')).to_have_count(1)
+    # Every model is visible, including /models\/a\b.gguf and both Hub cache revisions.
+    expect(page.locator("#lc-list .prow.model")).to_have_count(7)
+    expect(page.locator('#lc-list .prow.model[data-model="' + REPO + ':Q4_K_M"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.model[data-model="' + REPO + ':Q4_K_M@oldrev123"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.model[data-model="' + posix_cache + '/loose.gguf"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.model[data-model="/Models/Upper-7B.gguf"]')).to_have_count(1)
+    expect(page.locator('#lc-list .prow.model[data-model="/models/lower-7B.gguf"]')).to_have_count(1)
+    bs_model = page.locator(r'#lc-list .prow.model[data-model="/models\\/a\\b.gguf"]')
+    expect(bs_model).to_have_count(1)
+    expect(bs_model.locator(".pn-t")).to_have_text("a\\b.gguf")
+    expect(page.locator('#lc-list .prow.model[data-model="/root-model.gguf"]')).to_have_count(1)
+    # Clicking /models\ folder and pressing #mf-up navigates to '/' without stripping the literal backslash.
+    bs_folder.click()
+    expect(page.locator("#mf-path")).to_have_value("/models\\")
+    expect(page.locator("#mf-cached")).to_contain_text("a\\b.gguf")
+    page.locator("#mf-up").click()
+    expect(page.locator("#mf-path")).to_have_value("/")
+    expect(page.locator("#mf-cached")).to_contain_text("root-model.gguf")
+    # Clicking the root-level model shows folder '/' cleanly without mangling it to empty string.
+    page.locator('#lc-list .prow.model[data-model="/root-model.gguf"]').click()
+    expect(page.locator("#lc-path")).to_contain_text("/root-model.gguf")
+    # Clicking the cache folder lists both the Hub repo group and the loose local file in cacheDir.
+    page.locator('#lc-list .prow.folder[data-place="dir:' + posix_cache + '"]').click()
+    expect(page.locator("#mf-cached")).to_contain_text("Tiny-27B-GGUF")
+    expect(page.locator("#mf-cached")).to_contain_text("loose.gguf")
+    # Searching a named drafter repo in Hub, switching to Local, and clicking "All its quantizations" on an older
+    # cached revision clears the stale search query, preserves @oldrev123 across the 350ms search debounce, and uses
+    # its distinct quantizations and verified drafters instead of main's.
+    page.locator('#src-seg [data-src="hub"]').click()
+    page.locator("#hf-q").fill("acme/Model-DFlash2")
+    page.keyboard.press("Enter")
+    expect(page.locator("#hf-name")).to_have_text("Model-DFlash2")
+    page.locator('#src-seg [data-src="local"]').click()
+    page.locator('#lc-list .prow.model[data-model="' + REPO + ':Q4_K_M@oldrev123"]').click()
+    page.locator("#lc-quants").click()
+    expect(page.locator('#src-seg [data-src="hub"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#hf-q")).to_have_value("")
+    expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")
+    expect(page.locator('#mf-files .mrow[data-name="' + REPO + ':Q2_K@oldrev123"]')).to_have_count(1)
+    expect(page.locator("#hf-drafters")).to_contain_text("acme/OldRev-DFlash2")
+    expect(page.locator("#hf-drafters")).not_to_contain_text("acme/Tiny-27B-DFlash2")
+    page.wait_for_timeout(600)  # survive past the 350ms Hub search debounce without reverting to main or list[0]
+    expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")
+    expect(page.locator('#mf-files .mrow[data-name="' + REPO + ':Q2_K@oldrev123"]')).to_have_count(1)
+    expect(page.locator("#hf-drafters")).to_contain_text("acme/OldRev-DFlash2")
+    expect(page.locator("#hf-drafters")).not_to_contain_text("acme/Tiny-27B-DFlash2")
+    assert srv.files_asked[-1] == REPO + "@oldrev123", srv.files_asked
+    # Selecting the pinned-revision quantization populates verifiedOf keyed by repo@revision in Settings -> Speculation.
+    page.locator('#mf-files .mrow[data-name="' + REPO + ':Q2_K@oldrev123"]').click()
+    view(page, "current")
+    page.locator('#lset-tabs [data-stab="spec"]').click()
+    page.locator("#sd-made").click()
+    expect(page.locator('[data-verified="acme/OldRev-DFlash2"]')).to_have_count(1)
+    # Item 5: when /v1/hub/search fails (502) in the background after jumping from Local -> "All its quantizations"
+    # on a cached older revision, the pinned revision detail, its quantizations, and its Load target remain usable.
+    srv.hub_fail = True
+    view(page, "library")
+    page.locator('#src-seg [data-src="local"]').click()
+    page.locator('#lc-list .prow.model[data-model="' + REPO + ':Q4_K_M@oldrev123"]').click()
+    page.locator("#lc-quants").click()
+    expect(page.locator('#src-seg [data-src="hub"]')).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#hf-msg")).to_contain_text("cannot reach the Hub")
+    page.wait_for_timeout(600)  # past the 350ms search debounce while /v1/hub/search fails with 502
+    expect(page.locator("#hf-name")).to_have_text("Tiny-27B-GGUF")
+    expect(page.locator('#mf-files .mrow[data-name="' + REPO + ':Q2_K@oldrev123"]')).to_have_count(1)
+    page.locator('#mf-files .mrow[data-name="' + REPO + ':Q2_K@oldrev123"]').click()
+    expect(page.locator("#mf-load")).to_be_enabled()
+    # Explicitly typing a new query unpins the cached revision so a failed search clears stale detail.
+    page.locator("#hf-q").fill("nonexistent")
+    page.wait_for_timeout(600)
+    expect(page.locator("#hf-name")).to_have_count(0)
+    page.close()
+
+    # POSIX served model and LoRA with literal backslashes: Serving card LoRA label stays "a\b" and initial Local
+    # directory fetch requests "/models" (never "/models/a").
+    served_bs = dict(want, model="/models/a\\b.gguf", lora="/loras/a\\b")
+    page2, srv2 = open_page(telemetry(served_bs), catalog=posix_catalog, folders=posix_folders)
+    lora_fact = page2.locator("#ld-facts div", has=page2.locator("dt", has_text="LoRA")).locator("dd")
+    expect(lora_fact).to_have_text("a\\b")
+    view(page2, "library")
+    page2.locator('#src-seg [data-src="local"]').click()
+    expect(page2.locator("#lc-list .prow.folder")).to_have_count(5)
+    assert "/models" in srv2.dir_asked and "/models/a" not in srv2.dir_asked, srv2.dir_asked
+    page2.close()
+
+
 def check(browser):
     want = {"model": "./models/Local [27B] & O'Brien.gguf", "ctx": 8192, "kv": "fp8", "kv_gpu": 0, "kv_ram": 4}
     errors = []
@@ -1306,6 +1563,7 @@ def check(browser):
     check_vram_apps(open_page, want)
     check_switch_companions(open_page, want)
     check_lora(open_page, want)
+    check_local_posix(open_page, want)
     plain = dict(want, model="models/local.gguf")
     page, server = open_page(telemetry(plain))
     check_hub(page, server, plain)

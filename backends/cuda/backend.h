@@ -476,6 +476,8 @@ void* device_alias(size_t bytes, DevicePieces* out);
 // granularity is larger or there is no VMM (one allocation instead).
 bool vmm_supported();
 size_t pieces_floor();
+// Minimum VRAM reserve floor the backend requires for its device allocations (Windows WDDM: pieces_floor(); 0 elsewhere).
+uint64_t device_reserve_floor();
 
 }  // namespace flyx::cuda
 

@@ -41,7 +41,7 @@ export function contextLimit(model) {
 export const level = (f) => f > 0.95 ? "hot" : f > 0.85 ? "warn" : "";
 // "NVIDIA GeForce RTX 5070 Ti" -> "RTX 5070 Ti".
 export const shortDevice = (d) => d ? d.replace(/^NVIDIA (GeForce )?/, "") : "";
-export const baseName = (p) => String(p).split(/[\\/]/).pop();
+export const baseName = (p, winPaths = true) => String(p).split(winPaths === false ? "/" : /[\\/]/).pop();
 // A literal argument in a POSIX shell snippet.
 export const shQuote = (s) => "'" + s.replace(/'/g, "'\\''") + "'";
 // PowerShell treats curly apostrophes as quotes too.

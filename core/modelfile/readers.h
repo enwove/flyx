@@ -66,30 +66,29 @@ bool is_gguf(const uint8_t* data, size_t size);
 bool read_gguf(const uint8_t* data, size_t size, const std::string& path, ModelFile::Contents* out,
                std::string* err, bool need_tokenizer = true);
 bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::string& path,
-               ModelFile::Contents* out, std::string* err, bool need_tokenizer = true);
+               ModelFile::Contents* out, std::string* err, bool need_tokenizer = true,
+               const PathAllowFn& allow_path = {});
 
 // A block drafter as published (drafter_dir.cpp): a directory with its config.json and *.safetensors,
 // read as python/convert would write it into a drafter file.  The shards stay mapped in `maps`.
-std::string drafter_dir_kind(const std::string& path);
-std::string flyx_draft_kind(const std::string& path);
-bool is_drafter_dir(const std::string& path);
+bool is_drafter_dir(const std::string& path, const PathAllowFn& allow_path = {});
 // Its config.json's block drafter (its architecture, or speculators' type: "dflash2", "dflash", "dspark",
 // "dspine"); "" for none.
-std::string drafter_dir_kind(const std::string& dir);
+std::string drafter_dir_kind(const std::string& dir, const PathAllowFn& allow_path = {});
 // A .flyx file's "draft" section's kind, from its header alone ("dflash2", "dflash", "dspark", "dspine"); "" when it
 // holds none.
 std::string flyx_draft_kind(const std::string& path);
 // A .flyx file's header alone, read from its first bytes (the file not mapped); false when it is none.
 bool peek_flyx_header(const std::string& path, nlohmann::json* h);
 bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::MappedFile>>* maps,
-                      ModelFile::Contents* out, std::string* err);
+                      ModelFile::Contents* out, std::string* err, const PathAllowFn& allow_path = {});
 
 // A LoRA adapter as Hugging Face PEFT saves it (peft_dir.cpp): a directory with adapter_config.json and
 // adapter_model.safetensors, read as a "lora" companion whose tensors carry a .flyx file's adapter names
 // (target.L{l}.{attn,mlp,gdn}.<linear>.lora_{a,b}) in the file's dtype and Hugging Face row order.
-bool is_peft_dir(const std::string& path);
+bool is_peft_dir(const std::string& path, const PathAllowFn& allow_path = {});
 bool read_peft_dir(const std::string& dir, std::vector<std::unique_ptr<os::MappedFile>>* maps,
-                   ModelFile::Contents* out, std::string* err);
+                   ModelFile::Contents* out, std::string* err, const PathAllowFn& allow_path = {});
 // The most an adapter_config.json, and a safetensors file's header (its JSON), may hold: 16 MiB each, where PEFT
 // writes a few hundred bytes and a few KiB.  read_peft_dir refuses past them before it reads or parses either, a
 // fetch of an adapter from the Hub before it downloads either file, the Hub's read of a header

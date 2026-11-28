@@ -20,7 +20,7 @@ std::string dump_json(const ojson& body) {
   return body.dump(-1, ' ', false, ojson::error_handler_t::replace);
 }
 std::string new_id(const char* prefix) { return std::string(prefix) + "test"; }
-bool require_manage(const Server&, const httplib::Request&, httplib::Response&, const char*) { return true; }
+bool require_access(const Server&, const httplib::Request&, httplib::Response&, Access, const char*) { return true; }
 int query_int(const httplib::Request&, const char*, int dflt, int, int) { return dflt; }
 
 }  // namespace flyx::server

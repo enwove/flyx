@@ -11,6 +11,7 @@
 #include <initializer_list>
 
 #include "apps/common/defaults.h"
+#include "apps/common/numbers.h"
 #include "apps/flyx-server/drafter_speeds.h"
 #include "core/interfaces/options.h"
 #include "core/os/env.h"
@@ -34,6 +35,8 @@ ojson want_json(const ModelHost::Want& w) {
           {"kv", w.eo.kv == FLYX_KV_FP8 ? ojson("fp8") : w.eo.kv == FLYX_KV_16 ? ojson("16") : ojson(nullptr)},
           {"kv_ram", w.eo.kv_ram < 0 ? ojson("auto") : ojson(double(w.eo.kv_ram) / 1e9)},
           {"kv_gpu", w.eo.kv_gpu < 0 ? ojson(nullptr) : ojson(w.eo.kv_gpu)},
+          {"vram_reserve", w.eo.vram_reserve < 0 ? ojson("auto") : ojson(double(w.eo.vram_reserve) / 1e9)},
+          {"ram_reserve", w.eo.ram_reserve < 0 ? ojson("auto") : ojson(double(w.eo.ram_reserve) / 1e9)},
           {"width", w.eo.width < 0 ? ojson(nullptr) : ojson(w.eo.width)},
           {"draft_trees", w.eo.draft_trees_given ? ojson(w.eo.draft_trees) : ojson(nullptr)},  // null: the drafter's default
           {"lookup", w.eo.lookup},
@@ -237,21 +240,25 @@ bool want_from_json(const ojson& j, const EngineOptions& base, ModelHost::Want* 
       out.eo.kv = kv == "fp8" ? FLYX_KV_FP8 : kv == "16" ? FLYX_KV_16 : FLYX_KV_DEFAULT;
     }
   }
-  // Host memory for the K/V past the GPU's part: GB, or "auto"; absent: the server's own setting.
-  if (j.contains("kv_ram") && !j["kv_ram"].is_null()) {
-    if (j["kv_ram"].is_string() && j["kv_ram"].get<std::string>() == "auto") {
-      out.eo.kv_ram = -1;
-    } else {
-      if (!j["kv_ram"].is_number() || j["kv_ram"].get<double>() < 0 || j["kv_ram"].get<double>() > apps::kMaxKvRamGb)
-        return *err = "\"kv_ram\": GB of host memory, or \"auto\"", false;
-      out.eo.kv_ram = int64_t(j["kv_ram"].get<double>() * 1e9);
+  auto parse_gb_field = [&](const char* key, const char* desc, int64_t* dst) {
+    if (!j.contains(key) || j[key].is_null()) return true;
+    if (j[key].is_string() && j[key].get<std::string>() == "auto") {
+      *dst = -1;
+      return true;
     }
-  }
+    if (!j[key].is_number() || !apps::gb_to_bytes(j[key].get<double>(), dst))
+      return *err = std::string("\"") + key + "\": " + desc + ", or \"auto\"", false;
+    return true;
+  };
+  // Host memory for the K/V past the GPU's part: GB, or "auto"; absent: the server's own setting.
+  if (!parse_gb_field("kv_ram", "GB of host memory", &out.eo.kv_ram)) return false;
   if (j.contains("kv_gpu") && !j["kv_gpu"].is_null()) {
     if (!j["kv_gpu"].is_number_integer() || j["kv_gpu"].get<int64_t>() < 0 || j["kv_gpu"].get<int64_t>() > INT32_MAX)
       return *err = "\"kv_gpu\": positions, a whole number", false;
     out.eo.kv_gpu = j["kv_gpu"].get<int>();
   }
+  if (!parse_gb_field("vram_reserve", "GB to keep free", &out.eo.vram_reserve)) return false;
+  if (!parse_gb_field("ram_reserve", "GB to keep free", &out.eo.ram_reserve)) return false;
   if (j.contains("name") && !j["name"].is_null()) {
     if (!j["name"].is_string()) return *err = "\"name\": model id string", false;
     out.name = j["name"].get<std::string>();
@@ -391,21 +398,46 @@ bool ModelHost::save_hub_endpoint(const std::string& endpoint, std::string* err)
   return write_settings_locked(root, err);
 }
 
-bool ModelHost::lan_access() {
-  const ojson root = read_settings();
-  return root.is_object() && root.contains("lan_access") && root["lan_access"] == true;
+bool ModelHost::lan_access() { return read_network_settings().lan_access; }
+
+bool ModelHost::remote_manage() { return read_network_settings().remote_manage; }
+
+namespace {
+ModelHost::NetworkSettingsSnapshot snapshot_of(const ojson& root,
+                                               const std::function<bool()>& read_live_remote_manage) {
+  ModelHost::NetworkSettingsSnapshot snap;
+  if (root.is_object()) {
+    snap.lan_access = root.contains("lan_access") && root["lan_access"] == true;
+    snap.remote_manage = root.contains("remote_manage") && root["remote_manage"] == true;
+  }
+  snap.live_remote_manage = read_live_remote_manage ? read_live_remote_manage() : snap.remote_manage;
+  return snap;
+}
+}  // namespace
+
+ModelHost::NetworkSettingsSnapshot ModelHost::read_network_settings(
+    const std::function<bool()>& read_live_remote_manage) {
+  std::lock_guard<std::mutex> lock(settings_mutex());
+  return snapshot_of(read_settings_locked(), read_live_remote_manage);
 }
 
-bool ModelHost::save_lan_access(bool enabled, std::string* err) {
+bool ModelHost::save_network_settings(std::optional<bool> lan_access, std::optional<bool> remote_manage,
+                                      const std::function<void(bool)>& on_remote_manage_committed,
+                                      NetworkSettingsSnapshot* out_snapshot, std::string* err,
+                                      const std::function<bool()>& read_live_remote_manage) {
   if (settings_path().empty()) {
-    *err = "no configuration directory available to save LAN access";
+    *err = "no configuration directory available to save network settings";
     return false;
   }
   std::lock_guard<std::mutex> lock(settings_mutex());
   ojson root = read_settings_locked();
   if (!root.is_object()) root = ojson::object();
-  root["lan_access"] = enabled;
-  return write_settings_locked(root, err);
+  if (lan_access.has_value()) root["lan_access"] = *lan_access;
+  if (remote_manage.has_value()) root["remote_manage"] = *remote_manage;
+  if (!write_settings_locked(root, err)) return false;
+  if (remote_manage.has_value() && on_remote_manage_committed) on_remote_manage_committed(*remote_manage);
+  if (out_snapshot) *out_snapshot = snapshot_of(root, read_live_remote_manage);
+  return true;
 }
 
 ModelHost::~ModelHost() {
@@ -558,7 +590,7 @@ bool ModelHost::work(const Want& w, std::string* err) {
     progress_ = p;
   });
   if (!apps::fetch_model(w.model, w.drafters, apps::wants_mtp(w.eo), logged, &stop_, &f, err, w.eo.mmproj_file,
-                         w.eo.vision, apps::wants_dspark(w.eo, w.drafters), w.eo.lora_file)) {
+                         w.eo.vision, apps::wants_dspark(w.eo, w.drafters), w.eo.lora_file, w.eo.allow_path)) {
     std::fprintf(stderr, "flyx-server: %s: %s\n", w.model.c_str(), err->c_str());
     std::lock_guard<std::mutex> lock(mu_);
     error_ = *err, state_ = served_.sched ? "ready" : "failed";
@@ -591,6 +623,7 @@ bool ModelHost::work(const Want& w, std::string* err) {
     std::lock_guard<std::mutex> lock(mu_);
     served_ = {sched, name}, fetched_ = std::move(f);
     state_ = "ready", last_ = w;
+    last_.eo.allow_path = {};
   }
   save_settings(w);
   return true;

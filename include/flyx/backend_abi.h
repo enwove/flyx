@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 52u
+#define FLYX_BACKEND_ABI_VERSION 53u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -901,6 +901,9 @@ typedef struct {
    * whose file says NVFP4 inputs with bf16 ones where it does not. */
   int32_t fp4_inputs;
   uint64_t mem_total, mem_free;
+  /* Minimum free device bytes the backend's allocator enforces (ABI 53; e.g. Windows WDDM pieces/paged floor, 0 when
+   * unconstrained).  The planner clamps any smaller --vram-reserve to this floor. */
+  uint64_t reserve_floor;
 } flyx_device_info;
 
 /* Why the clocks are below their maximum (flyx_device_stats.clock_limits). */
@@ -995,6 +998,8 @@ typedef struct {
   /* What this process holds of the device as the system counts it, all of it: its models, their sequences and the
    * runtime's own (ABI 37).  0 where the system does not tell a process's share. */
   uint64_t process;
+  /* Minimum free device bytes the backend's allocator keeps free (ABI 53; 0 when unconstrained). */
+  uint64_t reserve_floor;
 } flyx_memory_info;
 
 typedef struct flyx_bmodel flyx_bmodel;

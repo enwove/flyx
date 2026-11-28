@@ -7,8 +7,10 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/exec/engine.h"
@@ -52,6 +54,9 @@ struct Fetched {
   std::vector<KnownDrafter> suggested;         // the verified drafters for it (known_drafters) not named
 };
 
+// Authorization predicate evaluated BEFORE any target-following inspection, stat, open, or recursion (true if allowed).
+using PathAllowFn = flyx::PathAllowFn;
+
 // Fetches what is missing. want_mtp: take the repository's MTP file for a GGUF without the layer.
 // want_vision: take the repository's mmproj GGUF when no explicit mmproj path was given.
 // want_dspark: with no DSpark drafter among `drafters`, take the one published beside the model: its repository's
@@ -61,24 +66,24 @@ struct Fetched {
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
                  const std::string& mmproj = "", bool want_vision = true, bool want_dspark = false,
-                 const std::string& lora = "");
+                 const std::string& lora = "", const PathAllowFn& allow_path = {});
 
 // A LoRA adapter as Hugging Face PEFT saves it: a directory as it is, else a Hub repository's adapter_config.json
 // and adapter_model.safetensors fetched into the cache, "org/name" at its top, "org/name:FOLDER" in a folder of it
 // (a repository of several: the folder's path or its last part), "@REV" for a revision.  `path`: the directory.
 bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop,
-                std::string* path, std::string* err);
+                std::string* path, std::string* err, const PathAllowFn& allow_path = {});
 // fetch_lora's part after the repository is described: the adapter `folder` names in `repo` (spec's FOLDER; spec
 // for messages), its config refused past what a load reads (modelfile::kPeftConfigMaxBytes) before either file is
 // fetched.
 bool fetch_lora_in(const hub::Repo& repo, const std::string& spec, const std::string& folder,
                    const hub::ProgressFn& progress, const std::atomic<bool>* stop, std::string* path,
-                   std::string* err);
+                   std::string* err, const PathAllowFn& allow_path = {});
 
 // The drafter a file or directory holds, as its own fields say ("mtp", "dflash2", "dflash", "dspark", "dspine"; "" when
 // they say none): a GGUF's header (general.architecture "dflash", or MTP layers), a drafter directory's config.json,
 // a .flyx file's "draft".  The file is not mapped; no name is read for it.
-std::string drafter_kind(const std::string& path);
+std::string drafter_kind(const std::string& path, const PathAllowFn& allow_path = {});
 // The same of a Hub repository, from what the Hub says (its config's architecture, its GGUFs' architecture).
 std::string drafter_kind(const hub::Repo& r);
 
@@ -93,7 +98,7 @@ bool wants_dspark(const EngineOptions& eo, const std::vector<std::string>& draft
 // says it is one (general.architecture dflash with dflash.has_markov_context), the model's name being its file's
 // without the quantization ("Inkling-2-Mini" for Inkling-2-Mini-UD-IQ3_XXS.gguf); of several, the first by name.
 // "" for none.
-std::string dspark_beside(const std::string& model_path);
+std::string dspark_beside(const std::string& model_path, const PathAllowFn& allow_path = {});
 
 // The verified drafters this build runs (a kind it does not know left out) for a model: those made for the repository
 // it is (`repo`, "" when unknown), then, inferred, those made for the base models it names (`base_models`), each in the
@@ -101,7 +106,7 @@ std::string dspark_beside(const std::string& model_path);
 // once a process), and an inferred drafter's relation is how the Hub says `repo` was made from its base; else the list
 // is the Hugging Face cache's copy, read without the network, and no relation is known.
 std::vector<KnownDrafter> known_drafters(const std::string& repo, const std::vector<std::string>& base_models,
-                                         bool hub);
+                                         bool hub, const PathAllowFn& allow_path = {});
 // The same from drafters.json's text, with `relation` for the inferred ones: none when the text is not version 1 of the
 // list throughout (an entry that is no {base, repo, kind} of strings, a kind of auto, all or none, a repository twice).
 std::vector<KnownDrafter> known_drafters_in(const std::string& list, const std::string& repo,
@@ -133,7 +138,8 @@ struct GgufClassification {
   int mtp_layers = -1;       // <arch>.nextn_predict_layers when valid, -1 if unreadable/invalid
 };
 GgufClassification classify_gguf(const std::string& path, const std::string& rel_name = "", uint64_t size = 0,
-                                 std::filesystem::file_time_type modified = std::filesystem::file_time_type::min());
+                                 std::filesystem::file_time_type modified = std::filesystem::file_time_type::min(),
+                                 const PathAllowFn& allow_path = {});
 
 // One Hub GGUF group with its local header identity, when available. The selector works with hub::select.
 struct HubGguf {
@@ -143,7 +149,7 @@ struct HubGguf {
   bool cached = false;
   std::filesystem::file_time_type modified = std::filesystem::file_time_type::min();
 };
-std::vector<HubGguf> hub_ggufs(const hub::Repo& repo);
+std::vector<HubGguf> hub_ggufs(const hub::Repo& repo, const PathAllowFn& allow_path = {});
 // The companion of `kind` ("mmproj", "mtp", "dflash2" or "dspark") a repository offers first: the Hub's preferred
 // projector or MTP file (hub::mmproj_file, hub::mtp_file), the default DSpark drafter (hub::companion_files), else
 // the first complete one listed.
@@ -151,7 +157,7 @@ const HubGguf* preferred_companion(const std::vector<HubGguf>& ggufs, const std:
 
 // A GGUF's header (flyx::gguf_peek: its architecture, MTP layers, the repositories it comes from), read once while
 // the file keeps its size and time; valid false when it is no GGUF.
-flyx::GgufPeek gguf_header(const std::string& path);
+flyx::GgufPeek gguf_header(const std::string& path, const PathAllowFn& allow_path = {});
 
 // Model, drafter, and vision projector files in directories of the user's own (flyx serve --models-dir,
 // FLYX_MODELS_DIR): *.gguf (classified via classify_gguf; complete split GGUFs grouped as one entry pointing to
@@ -159,6 +165,7 @@ flyx::GgufPeek gguf_header(const std::string& path);
 // adapter_model.safetensors), at most 6 directories down, hidden directories and node_modules left out.
 struct LocalModel {
   std::string path;          // absolute
+  std::string root;          // canonical scan root that found this entry
   std::string file;          // its name
   std::string kind;          // "gguf", "flyx", "drafter", "mmproj", or "lora" (a PEFT adapter: path its folder)
   std::string drafter_kind;  // "dflash2", "dspark" or "mtp" when kind == "drafter", else ""
@@ -168,8 +175,32 @@ struct LocalModel {
   int mtp_layers = -1;       // cached <arch>.nextn_predict_layers for kind == "gguf"
   std::filesystem::file_time_type modified = std::filesystem::file_time_type::min();
 };
+// Expands a leading "~" ("~", "~/...", and "~\..." on Windows) to the user's home directory; other paths stay unchanged.
+std::string expand_user_path(const std::string& path);
+// Canonicalizes a configured --models-dir / FLYX_MODELS_DIR root (expands "~", resolves absolute, normalizes
+// native separators, strips trailing native separators except filesystem roots without collapsing ".." across symlinks).
+std::string canonical_model_dir(std::string_view raw);
+// Injectable filesystem operations for deterministic tests verifying scan_model_dirs checks allow_path first
+// and bounds streamed directory iteration.
+struct ScanFs {
+  std::function<bool(const std::filesystem::path&, std::error_code&)> is_directory;
+  std::function<bool(const std::filesystem::path&, std::error_code&)> is_regular_file;
+  std::function<uint64_t(const std::filesystem::path&, std::error_code&)> file_size;
+  std::function<std::filesystem::file_time_type(const std::filesystem::path&, std::error_code&)> last_write_time;
+  std::function<std::filesystem::path(const std::filesystem::path&, std::error_code&)> weakly_canonical;
+  // Streams directory entries one by one; stops immediately when `visit` returns false.
+  std::function<void(const std::filesystem::path&, const std::function<bool(const std::filesystem::path&)>& visit,
+                     std::error_code&)>
+      for_each_dir_entry;
+  std::function<GgufClassification(const std::string&, const std::string&, uint64_t,
+                                   std::filesystem::file_time_type)>
+      classify_gguf;
+};
 // `deepest`: how many directories down a file may be (1: only in the directory named).
-std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, int deepest = 6);
+// `max_entries`: upper bound on entries inspected per root; enumeration stops immediately at the cap.
+std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, int deepest = 6,
+                                        const PathAllowFn& allow_path = {}, const ScanFs* fs_ops = nullptr,
+                                        int max_entries = 200000);
 // FLYX_MODELS_DIR's directories: separated by ';' on Windows, ':' elsewhere (as PATH is).
 std::vector<std::string> models_dirs_from_env();
 // Unix seconds for the model listing; last_write_time's error value is reported as 0.

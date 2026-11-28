@@ -1,6 +1,6 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// The request log and GET /v1/requests?limit=N (default and at most 50, newest first): for this
-// machine, or with --api-key for the key's holder (may_manage), as the model panel: it shows other people's prompts.
+// The request log and GET /v1/requests?limit=N (default and at most 50, newest first): gated by Access::kManage,
+// as the model panel: it shows other people's prompts.
 #include "apps/flyx-server/request_log.h"
 
 #include <algorithm>
@@ -437,7 +437,7 @@ void Recording::finish() {
 
 void add_request_log_routes(httplib::Server& http, Server* s) {
   http.Get("/v1/requests", [s, instance = new_id("log-")](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "the request log")) return;
+    if (!require_access(*s, q, r, Access::kManage, "the request log")) return;
     const size_t limit = size_t(query_int(q, "limit", int(RequestLog::kKept), 0, int(RequestLog::kKept)));
     const bool on = s->requests && s->requests->enabled();
     r.set_header("Cache-Control", "no-store");

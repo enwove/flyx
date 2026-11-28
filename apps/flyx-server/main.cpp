@@ -117,6 +117,8 @@ void pause_owned_console() {
                "                       requests without thinking, 0 with\n"
                "  --frequency-penalty F  default frequency penalty (-2..2, default 0)\n"
                "  --api-key KEY        require this key (Authorization: Bearer KEY or x-api-key; default: FLYX_API_KEY)\n"
+               "  --no-auth            allow LAN management (loading models, logs, requests, settings) without an API\n"
+               "                       key on a trusted network; overrides FLYX_API_KEY (cannot combine with --api-key)\n"
                "  --cors ORIGIN        let the pages of ORIGIN call the API from a browser (repeatable): https://host[:port],\n"
                "                       an extension's origin, null (a page opened from a file); '*': any page; none: not\n"
                "                       even this machine's own pages (localhost), which may by default\n"
@@ -184,22 +186,20 @@ struct ServeArgs {
   std::vector<std::string> models_dirs;
   std::string dashboard_dir;  // --dashboard-dir: the page's files read from here first
   int port = flyx::apps::kDefaultPort, threads = flyx::apps::kDefaultHttpThreads;
-  bool port_given = false;
+  bool port_given = false, no_auth = false;
   bool monitor_wanted = true, browser_wanted = true, request_log = true, system_log = true;
   EngineOptions eo;
   SchedulerOptions so;
   Config cfg;
 };
 
-// argv[1] is the model unless it is an option, the rest the options (argv[0]: "serve", or the name the executable was
-// called by).  A bad option prints the usage and exits.
+// One optional positional MODEL (before or after options) and the options (argv[0]: "serve", or the name the
+// executable was called by).  A bad option prints the usage and exits.
 ServeArgs parse_args(int argc, char** argv) {
   ServeArgs a;
-  int first = 1;
-  if (argc >= 2 && argv[1][0] != '-') a.model = argv[1], first = 2;
   a.eo.ctx_max = true;  // default: model's trained context, or the longest GPU and host memory hold
   apps::SamplingOverrides sampling_overrides;
-  for (int i = first; i < argc; ++i) {
+  for (int i = 1; i < argc; ++i) {
     const std::string f = argv[i];
     auto next = [&]() -> std::string {
       if (i + 1 >= argc) bad_usage(f + " needs a value");
@@ -221,6 +221,7 @@ ServeArgs parse_args(int argc, char** argv) {
     else if (f == "--keep-billing-header") a.cfg.keep_billing_header = true;
     else if (apps::sampling_flag(f, next, &sampling_overrides)) continue;
     else if (f == "--api-key") a.cfg.api_key = next();
+    else if (f == "--no-auth") a.no_auth = true;
     else if (f == "--cors") {
       const std::string v = next();
       if (v == "*") a.cfg.cors_any = true;
@@ -239,12 +240,16 @@ ServeArgs parse_args(int argc, char** argv) {
     else if (f == "--no-system-log") a.system_log = false;
     else if (f == "--dashboard-dir") a.dashboard_dir = next();
     else if (f == "-v") a.cfg.verbose = a.so.verbose = a.eo.verbose = 1;
-    else if (!apps::engine_flag(f, next, &a.eo))
-      bad_usage(!f.empty() && f[0] == '-' ? "unknown option " + f : "unexpected argument '" + f + "' (one model at most)");
+    else if (!apps::engine_flag(f, next, &a.eo)) {
+      if (!f.empty() && f[0] == '-') bad_usage("unknown option " + f);
+      if (!a.model.empty()) bad_usage("unexpected argument '" + f + "' (one model at most)");
+      a.model = f;
+    }
   }
   sampling_overrides.apply(&a.cfg.think_defaults);
   sampling_overrides.apply(&a.cfg.plain_defaults);
-  if (a.cfg.api_key.empty()) a.cfg.api_key = apps::api_key_from_env();
+  if (a.no_auth && !a.cfg.api_key.empty()) bad_usage("--no-auth cannot be combined with --api-key");
+  if (!a.no_auth && a.cfg.api_key.empty()) a.cfg.api_key = apps::api_key_from_env();
   for (const std::string& d : apps::models_dirs_from_env()) a.models_dirs.push_back(d);
   return a;
 }
@@ -488,10 +493,17 @@ int run(int argc, char** argv) {
   start_from.mmproj_file.clear();    // likewise: a model named on the page names its own vision projector
   start_from.lora_file.clear();     // and the command line's LoRA adapter is its model's, not another's
   Server srv{&models, cfg, start_from, os::unix_seconds(), {}};
+  srv.listener = make_listen_config(bound_host, port, args.host ? std::string_view(*args.host) : std::string_view{});
   RequestLog requests(args.request_log);
   srv.requests = &requests;
   srv.logs = args.system_log ? &system_log : nullptr;
-  srv.models_dirs = args.models_dirs;
+  for (const std::string& d : args.models_dirs) {
+    const std::string canon = apps::canonical_model_dir(d);
+    if (!canon.empty() && std::find(srv.models_dirs.begin(), srv.models_dirs.end(), canon) == srv.models_dirs.end())
+      srv.models_dirs.push_back(canon);
+  }
+  srv.lan_manage.from_cli = args.no_auth;
+  srv.lan_manage.saved.store(ModelHost::remote_manage(), std::memory_order_release);
   // The model named here loads now, before the server listens; without one, the last one served loads once it
   // listens (the page shows it coming), or the server waits for the page to name one.
   ModelHost::Want later;
@@ -526,6 +538,7 @@ int run(int argc, char** argv) {
       srv.device_probe = {{"name", info.name}, {"mem_total", info.mem_total ? ojson(info.mem_total) : ojson(nullptr)},
                           {"mem_used", info.mem_total ? ojson(info.mem_total - info.mem_free) : ojson(nullptr)},
                           {"backend", backend}};
+      srv.device_reserve_floor = info.reserve_floor;
       if (info.mem_total) srv.probe_mem_used.store(info.mem_total - info.mem_free, std::memory_order_relaxed);
       if (!remembered)
         std::fprintf(stderr, "flyx-server: %s (%s), %.1f GB free\n", info.name, backend.c_str(), info.mem_free / 1e9);
@@ -546,7 +559,7 @@ int run(int argc, char** argv) {
   add_openai_responses_routes(http, &srv);
   add_telemetry_routes(http, &srv);
   add_manage_routes(http, &srv);
-  add_network_routes(http, &srv, bound_host, port, args.host.has_value());
+  add_network_routes(http, &srv, args.host.has_value());
   add_request_log_routes(http, &srv);
   add_system_log_routes(http, &srv);
 
@@ -554,6 +567,11 @@ int run(int argc, char** argv) {
   std::signal(SIGTERM, on_signal);
   std::fprintf(stderr, "flyx-server: listening on http://%s:%d, the dashboard at %s\n", host.c_str(), port,
                view.page.c_str());
+  if (srv.lan_manage.effective(srv.listener, !cfg.api_key.empty()))
+    std::fprintf(stderr,
+                 "flyx-server: warning: LAN management without an API key is enabled (%s): anyone on this network can "
+                 "load or delete cached models, browse folders, and view logs or requests\n",
+                 args.no_auth ? "--no-auth" : "saved setting");
   if (cfg.cors_any && cfg.api_key.empty())
     std::fprintf(stderr, "flyx-server: --cors '*' without --api-key: any web page opened in a browser that reaches this "
                          "server can use the model\n");

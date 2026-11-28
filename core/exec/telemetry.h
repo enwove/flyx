@@ -50,6 +50,7 @@ struct ModelInfo {
   int width = 0;                  // widest round
   int max_ctx = 0, max_sessions = 0;
   uint64_t ledger_budget = 0;     // device bytes the engine may use (0 = unknown)
+  uint64_t device_reserve = 0;    // effective device VRAM reserve held back outside the ledger
   double load_s = 0;
   std::vector<LoadAdjustment> load_adjustments;
   // Where memory cut the context under the one wanted (Engine::budget): which memory, the context wanted, whether

@@ -29,6 +29,7 @@ struct Budget {
   Lease weights, workspace;
   uint64_t session_bytes = 0;  // one session's device memory at the engine's context
   uint64_t sessions_room = 0;  // of the budget after the weights and the workspace: what the sessions share
+  uint64_t device_reserve = 0;  // effective device VRAM reserve held back outside the ledger
   GpuHeld held;
   CtxLimit ctx_limit = CtxLimit::kNone;
   uint64_t ctx_need_more = 0;  // extra bytes on ctx_limit's side needed to reach the wanted context (0: unknown/none)
@@ -48,12 +49,16 @@ struct Budget {
 // The tiers a session's K/V caches may use (EngineOptions::kv_gpu, kv_ram): positions on the GPU at most (-1: as
 // many as fit), bytes of host memory (-1: what the machine can spare, less `reserved`; 0: none).  copy_gpu
 // (EngineOptions::kv_copy_gpu): the layers whose low-bit copy stays on the GPU at most, the others' in host memory
-// (-1: as many as fit).
+// (-1: as many as fit).  vram_reserve / ram_reserve: opt-in byte reserves overriding device_reserve() / host_keep()
+// (-1: automatic defaults).
 struct KvTiers {
   int gpu = -1;
   int64_t ram = -1;
   int copy_gpu = -1;
   uint64_t reserved = 0;
+  int64_t vram_reserve = -1;
+  uint64_t min_vram_reserve = 0;  // floor enforced even when vram_reserve >= 0 (backend reserve_floor)
+  int64_t ram_reserve = -1;
   int method = FLYX_KV_READ_ALL, method_arg = 0;  // how rounds read the K/V (flyx_seq_layout)
   bool gpu_paged = false;  // Windows pages the GPU's memory unseen (os::gpu_memory_paged, WSL2): reserve 832 MiB
   bool allow_auto_exact = true;  // a locked AUTO switch must survive placement and retries
@@ -67,6 +72,13 @@ uint64_t host_keep(uint64_t total_ram);
 // Device VRAM held back for the CUDA context, fragmentation, and desktop stability: max(384 MiB, total / 40), at least
 // 832 MiB where Windows pages the GPU's memory out of the backend's sight (WSL2).
 uint64_t device_reserve(uint64_t total_vram, bool gpu_paged);
+
+// Effective device VRAM reserve after applying an opt-in override (>= 0) and platform floor (min_floor).
+uint64_t effective_device_reserve(uint64_t total_vram, bool gpu_paged, int64_t override_bytes,
+                                  uint64_t min_floor = 0);
+
+// What holds the GPU besides the model (weights + workspace) from a backend memory reading.
+GpuHeld held_of(const flyx_memory_info& mi);
 
 // Sets the ledger's budget (what the device has now plus what the model already
 // took, less a reserve for the CUDA context, fragmentation and other programs;
@@ -95,6 +107,8 @@ std::string held_note(const GpuHeld& h);
 // Whether closing other programs is worth naming: they hold a quarter of a gigabyte or more, a gigabyte where the
 // process's own runtime (a few hundred megabytes) cannot be told from them.
 bool closable(const GpuHeld& h);
+// Actionable suffix appended to VRAM OOM diagnostics.
+std::string oom_fix_advice(bool has_others, bool has_drafter);
 // Why the context is no longer (b.ctx_limit) and what would give more, for the load's log; "" when nothing cut it.
 std::string ctx_limit_note(const Budget& b);
 

@@ -25,11 +25,12 @@ std::string base_name(const std::string& path);
 std::string format_gb(uint64_t n);
 
 std::string hf_home();
-std::vector<std::string> auth_headers();
+std::vector<std::string> auth_headers(const ResolvedSetting& ep);
 std::filesystem::path repo_dir(const std::string& repo);
 std::string read_text(const std::filesystem::path& p);
 bool has_size(const std::filesystem::path& path, uint64_t size);
-bool from_cache(const std::string& repo, const std::string& revision, Repo* out);
+bool from_cache(const std::string& repo, const std::string& revision, Repo* out, const PathAllowFn& allow_path = {},
+                const CacheFs* fs_ops = nullptr);
 void write_ref(const Repo& r);
 bool place(const std::filesystem::path& blob, const std::filesystem::path& dst, std::string* err);
 

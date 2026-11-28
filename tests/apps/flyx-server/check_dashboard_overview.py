@@ -90,11 +90,14 @@ def check(page, shots):
     # Idle: both speeds are the last request's (prefill: 300 tokens computed in 100 ms).
     fig = page.locator("#ov-throughput .fig")
     expect(fig).to_have_text("119.0decode tok/s, last request3,000prefill tok/s, last request")
+    expect(page.locator("#r-decode")).to_have_text("119.0tok/s")
+    expect(page.locator("#r-prefill")).to_have_text("3,000tok/s")
     tm["now"]["state"] = {"phase": "prefill", "queued": 0, "running": 1, "label": "messages", "session": 1,
                           "prompt_tokens": 9000, "reused_tokens": 1000, "prefilled": 5000, "generated": 0,
                           "prefill_tok_s": 5123.4, "decode_tok_s": None, "elapsed_s": 0.8, "max_new_tokens": 0}
     tm["now"]["memory"]["sessions"] = [{"id": 1, "tokens": 5000}]
     expect(fig).to_have_text("119.0decode tok/s, last request5,123prefill tok/s, now")
+    expect(page.locator("#r-prefill")).to_have_text("5,123tok/s")
     expect(page.locator("#sessions .n")).to_have_text("5,000 / 32.8k")
     expect(page.locator("#live .lrow", has_text="Context").locator(".v")).to_have_text("5,000 / 32.8k")
     spec = page.locator("#ov-spec .fig")
@@ -105,6 +108,8 @@ def check(page, shots):
     tm["now"]["memory"]["sessions"] = [{"id": 1, "tokens": 9040}]
     tm["now"]["rates"]["decode_tok_s"] = 150.2
     expect(fig).to_have_text("150.2decode tok/s, now4,000prefill tok/s, this request")
+    expect(page.locator("#r-decode")).to_have_text("150.2tok/s")
+    expect(page.locator("#r-prefill")).to_have_text("4,000tok/s")
     expect(page.locator("#sessions .n")).to_have_text("9,040 / 32.8k")
     expect(page.locator("#live .lrow", has_text="Context").locator(".v")).to_have_text("9,040 / 32.8k")
     # Older server without windowed rates falls back to this request's cumulative figures.

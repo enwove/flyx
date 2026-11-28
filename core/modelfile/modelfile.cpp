@@ -8,7 +8,9 @@ namespace flyx {
 namespace {
 
 bool read(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::string& path, ModelFile::Contents* c,
-          std::string* err, bool need_tokenizer) {
+          std::string* err, bool need_tokenizer, const PathAllowFn& allow_path) {
+  if (allow_path && !allow_path(path))
+    return *err = path + ": path is not allowed by remote path policy", false;
   maps->clear();
   maps->push_back(std::make_unique<os::MappedFile>());
   os::MappedFile* first = maps->back().get();
@@ -17,23 +19,27 @@ bool read(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::string&
   if (modelfile::is_flyx(first->data(), first->size()))
     return modelfile::read_flyx(first->data(), first->size(), path, c, err);
   if (modelfile::is_gguf(first->data(), first->size()))
-    return modelfile::read_gguf(maps, path, c, err, need_tokenizer);
+    return modelfile::read_gguf(maps, path, c, err, need_tokenizer, allow_path);
   *err = path + ": not a model file this build reads (.flyx or .gguf)";
   return false;
 }
 
 }  // namespace
 
-std::string drafter_source_kind(const std::string& path) {
-  return modelfile::is_drafter_dir(path) ? modelfile::drafter_dir_kind(path) : modelfile::flyx_draft_kind(path);
+std::string drafter_source_kind(const std::string& path, const PathAllowFn& allow_path) {
+  if (allow_path && !allow_path(path)) return "";
+  return modelfile::is_drafter_dir(path, allow_path) ? modelfile::drafter_dir_kind(path, allow_path)
+                                                     : modelfile::flyx_draft_kind(path);
 }
 
-bool ModelFile::open(const std::string& path, std::string* err) {
+bool ModelFile::open(const std::string& path, std::string* err, const PathAllowFn& allow_path) {
   companions_.clear();
   maps_.clear();
-  if (modelfile::is_drafter_dir(path))
+  if (allow_path && !allow_path(path))
+    return *err = path + ": path is not allowed by remote path policy", false;
+  if (modelfile::is_drafter_dir(path, allow_path))
     return *err = path + " holds a drafter alone, not a model: give it beside the model (--drafter-file)", false;
-  if (!read(&maps_, path, &c_, err, /*need_tokenizer=*/true)) return false;
+  if (!read(&maps_, path, &c_, err, /*need_tokenizer=*/true, allow_path)) return false;
   // The header is the file's word: a key of another type than expected is read as absent, never thrown on.
   const auto kind = c_.header.find("kind");
   if (kind != c_.header.end() && kind->is_string() && kind->get_ref<const std::string&>() == "drafter")
@@ -42,14 +48,16 @@ bool ModelFile::open(const std::string& path, std::string* err) {
   return true;
 }
 
-bool ModelFile::add(const std::string& path, std::string* err) {
+bool ModelFile::add(const std::string& path, std::string* err, const PathAllowFn& allow_path) {
+  if (allow_path && !allow_path(path))
+    return *err = path + ": path is not allowed by remote path policy", false;
   auto more = std::make_unique<Companion>();
-  if (modelfile::is_peft_dir(path)) {  // before is_drafter_dir: some adapter directories carry a config.json too
-    if (!modelfile::read_peft_dir(path, &more->maps, &more->c, err)) return false;
-  } else if (modelfile::is_drafter_dir(path)) {
-    if (!modelfile::read_drafter_dir(path, &more->maps, &more->c, err)) return false;
+  if (modelfile::is_peft_dir(path, allow_path)) {  // before is_drafter_dir: some adapter directories carry a config.json too
+    if (!modelfile::read_peft_dir(path, &more->maps, &more->c, err, allow_path)) return false;
+  } else if (modelfile::is_drafter_dir(path, allow_path)) {
+    if (!modelfile::read_drafter_dir(path, &more->maps, &more->c, err, allow_path)) return false;
   } else {
-    if (!read(&more->maps, path, &more->c, err, /*need_tokenizer=*/false)) return false;
+    if (!read(&more->maps, path, &more->c, err, /*need_tokenizer=*/false, allow_path)) return false;
   }
   c_.header["companions"].push_back(more->c.header);
   companions_.push_back(std::move(more));
@@ -111,9 +119,10 @@ std::vector<int32_t> ModelFile::eos_ids() const {
   return out;
 }
 
-ModelOrigin model_origin(const std::string& path) {
+ModelOrigin model_origin(const std::string& path, const PathAllowFn& allow_path) {
   ModelOrigin out;
-  if (const GgufPeek p = gguf_peek(path); p.valid) return out.base_models = p.base_models, out;
+  if (allow_path && !allow_path(path)) return out;
+  if (const GgufPeek p = gguf_peek(path, allow_path); p.valid) return out.base_models = p.base_models, out;
   nlohmann::json h;
   if (!modelfile::peek_flyx_header(path, &h) || !h.contains("source") || !h["source"].is_object()) return out;
   const nlohmann::json& src = h["source"];

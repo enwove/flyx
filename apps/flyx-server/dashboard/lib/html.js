@@ -19,4 +19,4 @@ export function memo(draw) {
   }
   return Memo;
 }
-export { useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from "preact/hooks";
+export { useState, useReducer, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from "preact/hooks";

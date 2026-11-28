@@ -245,27 +245,39 @@ bool peft_header_ok(const std::string& header, int rank, std::string* why, std::
   }
 }
 
-bool is_peft_dir(const std::string& path) {
+bool is_peft_dir(const std::string& path, const PathAllowFn& allow_path) {
+  const fs::path root = to_path(path);
+  const fs::path cfg = root / kConfig;
+  if (allow_path && (!allow_path(path) || !allow_path(from_path(cfg)))) return false;
   std::error_code ec;
-  return fs::is_directory(to_path(path), ec) && fs::is_regular_file(to_path(path) / kConfig, ec);
+  return fs::is_directory(root, ec) && fs::is_regular_file(cfg, ec);
 }
 
 bool read_peft_dir(const std::string& dir, std::vector<std::unique_ptr<os::MappedFile>>* maps,
-                   ModelFile::Contents* out, std::string* err) {
+                   ModelFile::Contents* out, std::string* err, const PathAllowFn& allow_path) {
   const fs::path root = to_path(dir);
+  const fs::path weights = root / kWeights;
+  const fs::path cfg_path = root / kConfig;
+  const fs::path bin_path = root / "adapter_model.bin";
+  if (allow_path && !allow_path(dir))
+    return *err = dir + ": path is not allowed by remote path policy", false;
+  if (allow_path && !allow_path(from_path(weights)))
+    return *err = from_path(weights) + ": path is not allowed by remote path policy", false;
   std::error_code ec;
-  if (!fs::is_regular_file(root / kWeights, ec)) {
-    if (fs::is_regular_file(root / "adapter_model.bin", ec))
+  if (!fs::is_regular_file(weights, ec)) {
+    if ((!allow_path || allow_path(from_path(bin_path))) && fs::is_regular_file(bin_path, ec))
       return *err = dir + ": adapter_model.bin (a pickle) is not read; save the adapter as safetensors", false;
     return *err = dir + ": no " + kWeights + " beside its " + kConfig, false;
   }
+  if (allow_path && !allow_path(from_path(cfg_path)))
+    return *err = from_path(cfg_path) + ": path is not allowed by remote path policy", false;
   try {
-    const json cfg = read_json(root / kConfig, kConfig);
+    const json cfg = read_json(cfg_path, kConfig);
     json lora = lora_config(cfg);
     const int64_t rank = lora["rank"].get<int64_t>();
 
     auto map = std::make_unique<os::MappedFile>();
-    const std::string file = from_path(root / kWeights);
+    const std::string file = from_path(weights);
     if (!map->open(file, err)) return false;
     const uint8_t* p = map->data();
     const size_t size = map->size();

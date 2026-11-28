@@ -122,7 +122,7 @@ export function Requests({ active, openId, select }) {
   const tm = live.last || {}, recent = tm.recent || [];
   const notes = { off: "Prompts and answers are not kept: the server runs with --no-request-log. Figures come from telemetry.",
                   absent: "This server keeps no request log (GET /v1/requests). Figures come from telemetry.",
-                  denied: "The request log is readable from the server's machine, or with its API key." };
+                  denied: "The request log is readable from this machine, with --api-key, or with --no-auth on a trusted LAN." };
   const empty = (msg) => html`<tr><td colspan="7" class="empty">${t(msg)}</td></tr>`;
   let rows;
   if (log.requests) {

@@ -5,7 +5,7 @@ import { t } from "../lib/i18n.js";
 import { fmt, gib, ktok, secs, level, shortDevice, short } from "../lib/format.js";
 import { Icon, Meter, MemBar, Val } from "../lib/ui.js";
 import { Spark } from "../lib/charts.js";
-import { live, phaseOf, phaseNames, ttftSeconds, memoryOf } from "../lib/telemetry.js";
+import { live, phaseOf, phaseNames, ttftSeconds, speeds, memoryOf } from "../lib/telemetry.js";
 
 export const PAGES = [
   ["overview", "Overview", "overview"], ["model", "Model", "model"], ["requests", "Requests", "requests"],
@@ -18,7 +18,7 @@ function figures(tm) {
   const model = tm.model || {}, state = tm.state || {}, d = tm.device, recent = tm.recent || [];
   const phase = phaseOf(tm), busy = phase === "decode" || phase === "prefill", decoding = phase === "decode";
   const lastReq = recent[0] || {};
-  const decode = decoding ? tm.rates.decode_tok_s : lastReq.decode_tok_s;
+  const sp = speeds(tm, phase, recent);
   const tpr = decoding ? (Number.isFinite(tm.rates && tm.rates.tokens_per_round) && tm.rates.tokens_per_round > 0
                           ? tm.rates.tokens_per_round : state.tokens_per_round)
                        : lastReq.tokens_per_round;
@@ -35,23 +35,36 @@ function figures(tm) {
   // part (both of all the processors).
   const sys = tm.system || {}, { vram, ram } = memoryOf(tm);
   const cpu = { all: tm._sys_cpu === undefined ? null : tm._sys_cpu, own: tm._cpu === undefined || !sys.cpus ? null : tm._cpu / sys.cpus };
-  return { model, state, d, recent, phase, busy, decoding, lastReq, decode, tpr, ttft, used, vram, ram, cpu,
+  return { model, state, d, recent, phase, busy, lastReq, decode: sp.decode, prefill: sp.prefill,
+           decodeWhen: sp.decodeWhen, prefillWhen: sp.prefillWhen, tpr, ttft, used, vram, ram, cpu,
            ops: (tm.rates && tm.rates.output_per_second) || [] };
 }
 
 function LiveCard({ f, tm, onOpenMem }) {
-  const { model, state, d, recent, decoding, lastReq, decode, tpr, ttft, used, vram, ram, cpu } = f;
+  const { model, state, d, recent, lastReq, decode, prefill, decodeWhen, prefillWhen, tpr, ttft, used, vram, ram, cpu } = f;
   const fresh = (lastReq.prompt_tokens || 0) - (lastReq.reused_tokens || 0);
   const pct = (v) => fmt(v, v < 10 ? 1 : 0) + "%";
   const vramAct = !!(vram && onOpenMem), ramAct = !!(ram && onOpenMem);
   const keyFor = (kind) => (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onOpenMem(kind); } };
+  const decodeSub = decodeWhen ? t(decodeWhen) : "";
+  const prefillSub = prefillWhen ? t(prefillWhen) : "";
   return html`
     <div class="live" id="live" aria-live="off">
       <div class="live-head"><span class="caps">${t("Live")}</span></div>
       <div class="live-body">
         <div class="lhero">
-          <div class="lk">${t("Decode")}<span class="lsub">${decoding ? t("now") : recent.length ? t("last request") : ""}</span></div>
-          <div class="lbig" id="r-decode"><${Val} v=${fmt(decode, 1)} unit="tok/s"/></div>
+          <div class="lspeeds">
+            <div>
+              <div class="lk">${t("Decode")}</div>
+              <div class="lbig" id="r-decode"><${Val} v=${fmt(decode, 1)} unit="tok/s"/></div>
+              <div class="lsub">${decodeSub}</div>
+            </div>
+            <div>
+              <div class="lk">${t("Prefill")}</div>
+              <div class="lbig" id="r-prefill"><${Val} v=${fmt(prefill, 0)} unit="tok/s"/></div>
+              <div class="lsub">${prefillSub}</div>
+            </div>
+          </div>
           <${Spark} cls="spark" values=${f.ops.slice(-60)} label=${t("tokens out each second, the last minute")}/>
         </div>
         <div class="lpair">
@@ -97,12 +110,15 @@ const RailMem = ({ m }) => html`<span class="rb mb">
   ${m && m.others > 0 ? html`<i class="oth" style=${{ width: m.others / m.total * 100 + "%" }}></i>` : ""}</span>`;
 
 function Rail({ f, open, onOpenMem }) {
-  const { model, d, phase, busy, decode, tpr, ttft, used, vram, ram, cpu } = f;
+  const { model, d, phase, busy, decode, prefill, tpr, ttft, used, vram, ram, cpu } = f;
   const ctx = model.context && used !== null ? used / model.context : null;
   const load = cpu.all === null ? cpu.own : cpu.all;
   const memLine = (k, m) => m ? k + " " + gib(m.used) + " / " + gib(m.total) + " GiB (FLYX " + gib(m.own) + ")" : "";
   const state = busy ? "busy" : phase === "loading" || phase === "fetching" ? "load" : phase === "none" || phase === "unloaded" ? "off" : "";
-  const title = [model.id, t(phaseNames[phase] || phase), memLine("VRAM", vram), memLine("RAM", ram),
+  const title = [model.id, t(phaseNames[phase] || phase),
+                 Number.isFinite(decode) && decode > 0 ? t("Decode") + " " + fmt(decode, 1) + " tok/s" : "",
+                 Number.isFinite(prefill) && prefill > 0 ? t("Prefill") + " " + fmt(prefill, 0) + " tok/s" : "",
+                 memLine("VRAM", vram), memLine("RAM", ram),
                  model.context ? t("context") + " " + ktok(used || 0) + " / " + ktok(model.context) : ""].filter(Boolean).join("\n") +
                 "\n" + t("Click to open the sidebar.");
   const key = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };

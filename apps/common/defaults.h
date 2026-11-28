@@ -25,6 +25,6 @@ inline constexpr int kStartWaitMs = 10000;
 inline constexpr int kMinTerminalCols = 60;
 inline constexpr int kMaxCtx = 1 << 24;
 inline constexpr int kMaxDraftWidth = 64;
-inline constexpr double kMaxKvRamGb = 1e6;
+inline constexpr double kMaxGb = 1e6;
 
 }  // namespace flyx::apps

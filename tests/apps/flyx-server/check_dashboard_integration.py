@@ -70,6 +70,7 @@ def claude_settings(command, shell, keyed, mode):
     assert settings["env"]["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] == "18000"
     assert settings["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "9000"  # half the context, at most 128,000
     assert settings["env"]["CLAUDE_CODE_GATEWAY_HINT_HEADERS"] == "1"
+    assert settings["env"]["API_TIMEOUT_MS"] == "600000"
     token = settings["env"].get("ANTHROPIC_AUTH_TOKEN")
     assert token == ((None if shell == "sh" else KEY) if keyed else "flyx")
 
