@@ -8,6 +8,7 @@
 
 namespace flyx::interfaces {
 
+inline constexpr size_t kMaxConfigBytes = 16u << 20;
 inline constexpr int kMaxJsonDepth = 64;
 
 // Whether no array or object in `s` is nested more than `max_depth` deep (brackets inside strings do not count).

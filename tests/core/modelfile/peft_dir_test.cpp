@@ -101,6 +101,17 @@ int main() {
   const fs::path root = fs::temp_directory_path() / ("flyx_peft_dir_test_" + std::to_string(stamp));
   fs::remove_all(root);
 
+  for (const json& fields : {json{{"lora_alpha", "32"}}, json{{"use_rslora", 1}}, json{{"lora_alpha", 0}},
+                             json{{"lora_alpha", 1e-100}}, json{{"lora_alpha", 1e100}}}) {
+    const auto cfg = config(2, 16, fields);
+    const auto key = fields.begin().key();
+    flyx::modelfile::PeftConfig listed;
+    std::string why;
+    check(!flyx::modelfile::peft_config_ok(cfg.dump(), &listed, &why) && why.find(key) != std::string::npos,
+          "listing refuses invalid " + key);
+    refused(root, key, cfg, pair("model.layers.0.self_attn.q_proj", 2, 4, 4), key);
+  }
+
   {  // Qwen3 (Llama naming): attention and MLP, rank 16, alpha 32, F32.
     std::vector<Tensor> t;
     for (int l = 0; l < 2; ++l) {

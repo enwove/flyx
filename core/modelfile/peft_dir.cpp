@@ -103,10 +103,15 @@ json lora_config(const json& c) {
     throw std::runtime_error("r " + c.value("r", json()).dump() + ": a rank of 1 to 4096");
   const int64_t r = c["r"].get<int64_t>();
   // PEFT's default lora_alpha is 8.
-  const double alpha = c.contains("lora_alpha") && c["lora_alpha"].is_number() ? c["lora_alpha"].get<double>() : 8.0;
-  const bool rslora = given(c, "use_rslora");
+  if (c.contains("lora_alpha") && !c["lora_alpha"].is_number())
+    throw std::runtime_error("lora_alpha must be a number");
+  if (c.contains("use_rslora") && !c["use_rslora"].is_boolean())
+    throw std::runtime_error("use_rslora must be a boolean");
+  const double alpha = c.value("lora_alpha", 8.0);
+  const bool rslora = c.value("use_rslora", false);
   const double scale = rslora ? alpha / std::sqrt(double(r)) : alpha / double(r);
-  if (!std::isfinite(scale)) throw std::runtime_error("lora_alpha " + c.value("lora_alpha", json()).dump() + ": not finite");
+  if (!std::isfinite(float(scale)) || float(scale) == 0)
+    throw std::runtime_error("lora_alpha must give a finite nonzero float scale");
   return {{"rank", r}, {"scale", scale}, {"alpha", alpha}, {"rslora", rslora}, {"layout", "hf"}};
 }
 

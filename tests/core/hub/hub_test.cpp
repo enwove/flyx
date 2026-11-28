@@ -550,6 +550,20 @@ void cached_drafter_kinds(const fs::path& tmp) {
         "a DSpineDraftModel: DSpine");
   check(flyx::hub::in_cache("acme/DFlash", "main", &flash) && flyx::hub::drafter_kind(flash) == "dflash",
         "a DFlashDraftModel: DFlash");
+  const fs::path cfg = tmp / "models--acme--DFlash" / "snapshots" / commit / "config.json";
+  for (bool oversized : {false, true}) {
+    {
+      std::ofstream file(cfg, std::ios::binary | std::ios::trunc);
+      file << R"({"architectures":["DFlashDraftModel"],"x":)" << std::string(70, '[') << "0" << std::string(70, ']') << "}";
+      if (oversized) {
+        file.seekp(0);
+        file << R"({"architectures":["DFlashDraftModel"]})" << std::string(16u << 20, ' ');
+      }
+    }
+    flyx::hub::Repo bounded;
+    check(flyx::hub::in_cache("acme/DFlash", "main", &bounded) && bounded.architectures.empty(),
+          "cache inventory skips config beyond its size or depth limit");
+  }
 }
 
 void cached_allow_path_guard() {

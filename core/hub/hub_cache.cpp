@@ -8,6 +8,7 @@
 #include <fstream>
 #include <mutex>
 
+#include "core/interfaces/json_depth.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
@@ -153,7 +154,7 @@ std::vector<std::string> architectures_of(const fs::path& snap, const PathAllowF
   const fs::path cfg = snap / "config.json";
   if (allow_path && !allow_path(from_path(cfg))) return out;
   const std::string text = ops.read_text(cfg);
-  if (text.empty()) return out;
+  if (text.empty() || text.size() > interfaces::kMaxConfigBytes || !interfaces::json_depth_within(text)) return out;
   const auto j = nlohmann::json::parse(text, nullptr, false);
   if (j.is_object() && j.contains("architectures") && j["architectures"].is_array())
     for (const auto& a : j["architectures"])
@@ -205,8 +206,11 @@ fs::path repo_dir(const std::string& repo) {
 }
 
 std::string read_text(const fs::path& p) {
-  std::ifstream f(p, std::ios::binary);
-  std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  std::ifstream f(p, std::ios::binary | std::ios::ate);
+  const std::streamoff size = f.tellg();
+  if (size < 0 || uint64_t(size) > interfaces::kMaxConfigBytes) return {};
+  std::string s(size_t(size), '\0');
+  if (!f.seekg(0).read(s.data(), size)) return {};
   while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
   return s;
 }
