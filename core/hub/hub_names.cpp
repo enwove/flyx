@@ -373,10 +373,38 @@ const RepoFile* mmproj_file(const Repo& r) {
   return best;
 }
 
+namespace {
+
+// A name that marks its file an older version of another ("dspark-Inkling-2-Mini-Q8_0_Old.gguf"): a word "old".
+bool old_gguf_name(const std::string& path) {
+  std::string stem = detail::lower(detail::base_name(path));
+  if (stem.ends_with(".gguf")) stem.resize(stem.size() - 5);
+  for (size_t i = 0; i < stem.size();) {
+    const size_t j = std::min(stem.find_first_of(kSep, i), stem.size());
+    if (stem.compare(i, j - i, "old") == 0) return true;
+    i = j + 1;
+  }
+  return false;
+}
+
+}  // namespace
+
 std::vector<CompanionFile> companion_files(const Repo& r) {
   const RepoFile* def_mtp = mtp_file(r);
   const RepoFile* def_mm = mmproj_file(r);
-  bool dspark_default_set = false;
+  // The default DSpark drafter: the first listed, past those named as an older version while another is listed
+  // (unsloth's Inkling-2-Mini-GGUF lists dspark-Inkling-2-Mini-Q8_0_Old.gguf, no DSpark drafter by its header, first).
+  std::string def_dspark;
+  for (const bool skip_old : {true, false}) {
+    for (const RepoFile& f : r.files) {
+      SplitGguf sp;
+      if (!dspark_gguf_name(f.path) || (parse_split(f.path, &sp) && sp.part != 1) || (skip_old && old_gguf_name(f.path)))
+        continue;
+      def_dspark = f.path;
+      break;
+    }
+    if (!def_dspark.empty()) break;
+  }
   std::vector<CompanionFile> out;
   for (const RepoFile& f : r.files) {
     if (mtp_gguf_name(f.path)) {
@@ -384,8 +412,7 @@ std::vector<CompanionFile> companion_files(const Repo& r) {
     } else if (dspark_gguf_name(f.path)) {
       SplitGguf sp;
       if (parse_split(f.path, &sp) && sp.part != 1) continue;
-      out.push_back({f, "dspark", !dspark_default_set});
-      dspark_default_set = true;
+      out.push_back({f, "dspark", f.path == def_dspark});
     } else if (mmproj_gguf_name(f.path)) {
       out.push_back({f, "mmproj", def_mm && def_mm->path == f.path});
     }

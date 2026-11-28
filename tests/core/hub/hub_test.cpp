@@ -409,6 +409,23 @@ void cache_snapshots(const fs::path& tmp) {
     check(flyx::hub::select(ir, {ir.id, "dspark-Inkling-Q8_0.gguf"}, &picked, &why) && picked.size() == 1 &&
               picked[0].path == "dspark-Inkling-Q8_0.gguf",
           "select resolves repo:dspark-*.gguf companion directly (--drafter-file ORG/NAME:dspark-*.gguf)");
+    // unsloth/Inkling-2-Mini-GGUF lists an older file, no DSpark drafter by its header, before the one to take.
+    ir.files = {file("Inkling-Q4_K_M.gguf", 9), file("dspark-Inkling-Q8_0_Old.gguf", 2), file("dspark-Inkling-Q8_0.gguf", 2),
+                file("dspark-Bold-Q8_0.gguf", 2)};
+    auto default_dspark = [](const std::vector<flyx::hub::CompanionFile>& cs) {
+      std::string d;
+      for (const auto& c : cs)
+        if (c.kind == "dspark" && c.is_default) d = d.empty() ? c.file.path : d + "," + c.file.path;
+      return d;
+    };
+    check(default_dspark(flyx::hub::companion_files(ir)) == "dspark-Inkling-Q8_0.gguf",
+          "the default DSpark drafter is not one named as an older version while another is listed");
+    ir.files = {file("Inkling-Q4_K_M.gguf", 9), file("dspark-Inkling-Q8_0-old.gguf", 2)};
+    check(default_dspark(flyx::hub::companion_files(ir)) == "dspark-Inkling-Q8_0-old.gguf",
+          "an older version alone is still the default");
+    ir.files = {file("Inkling-Q4_K_M.gguf", 9), file("dspark-Bold-Q8_0.gguf", 2), file("dspark-Inkling-Q8_0.gguf", 2)};
+    check(default_dspark(flyx::hub::companion_files(ir)) == "dspark-Bold-Q8_0.gguf",
+          "\"old\" only as a word of the name (not Bold's)");
   }
   const std::string old_c = "1111111111111111111111111111111111111111", new_c = "2222222222222222222222222222222222222222";
   const fs::path repo = tmp / "models--acme--two-GGUF";

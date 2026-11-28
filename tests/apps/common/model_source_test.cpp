@@ -1,7 +1,8 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // apps/common/model_source: the DSpark drafter published beside a model, taken by default (wants_dspark): the one a
 // GGUF on disk has beside it (dspark_beside: its name, then its header), and the default dspark-*.gguf of the model's
-// repository, here a Hugging Face cache read offline.  Neither replaces a drafter that was named.
+// repository, here a Hugging Face cache read offline (the next one listed where the first's header is no DSpark
+// drafter's).  Neither replaces a drafter that was named.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -167,6 +168,30 @@ int main() {
   check(ok && f.drafters.size() == 1 && to_path(f.drafters.front()) == snap / first &&
             f.drafter_sources.size() == 1 && f.drafter_sources.front().size == total && fetched_bytes == total,
         "auto-fetch requests and reports the complete split");
+
+  // A remote listing whose first dspark-*.gguf is, by the header it shows once fetched, no DSpark drafter: the next.
+  {
+    flyx::hub::Repo listed;
+    check(flyx::hub::in_cache(cached_repo("Ink-Next-GGUF", {}), "main", &listed), "next-candidate cache exists");
+    listed.from_cache = false;
+    const auto lsnap = to_path(flyx::hub::snapshot_dir(listed));
+    const auto lblobs = lsnap.parent_path().parent_path() / "blobs";
+    const std::string plain_id(40, 'd'), dspark_id(40, 'e');
+    write_gguf(lblobs / plain_id, "dflash", 0);
+    write_gguf(lblobs / dspark_id, "dflash", 1);
+    listed.files.push_back({"dspark-Ink-A.gguf", fs::file_size(lblobs / plain_id), "", plain_id});
+    listed.files.push_back({"dspark-Ink-B.gguf", fs::file_size(lblobs / dspark_id), "", dspark_id});
+    flyx::apps::Fetched next;
+    ok = flyx::apps::fetch_dspark_companion(listed, flyx::apps::hub_ggufs(listed), {}, nullptr, &next, &err);
+    bool passed_over = false;
+    for (const std::string& n : next.notes)
+      passed_over = passed_over || n == listed.id + "/dspark-Ink-A.gguf is not a DSpark drafter: not drafting with it";
+    check(ok && next.drafters.size() == 1 && to_path(next.drafters[0]) == lsnap / "dspark-Ink-B.gguf" &&
+              next.drafter_sources.size() == 1 && next.drafter_sources[0].kind == "dspark" &&
+              next.drafter_sources[0].from == listed.id + "/dspark-Ink-B.gguf" && passed_over,
+          "a dspark-*.gguf whose fetched header is no DSpark drafter's gives way to the next one listed" +
+              (ok ? "" : ": " + err));
+  }
 
   const auto neutral_repo = cached_repo("Ink-Neutral-GGUF", {{"helper-Q8_0.gguf", 1}});
   ok = fetched(neutral_repo + ":Q4_K_M", {}, true, &f, &err);

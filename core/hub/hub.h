@@ -146,7 +146,8 @@ bool mmproj_gguf_name(const std::string& path);
 bool mtp_gguf_name(const std::string& path);
 // Whether a GGUF at `path` ('/' between directories) is a DSpark drafter file by name/directory.
 bool dspark_gguf_name(const std::string& path);
-// A companion GGUF in a repository (vision projector or drafter) listed alongside its main models.
+// A companion GGUF in a repository (vision projector or drafter) listed alongside its main models; the default
+// DSpark drafter is the first dspark-*.gguf listed, past any whose name marks it an older version (a word "old").
 struct CompanionFile {
   RepoFile file;
   std::string kind;      // "mmproj", "mtp" or "dspark"

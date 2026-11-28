@@ -60,8 +60,8 @@ using PathAllowFn = flyx::PathAllowFn;
 // Fetches what is missing. want_mtp: take the repository's MTP file for a GGUF without the layer.
 // want_vision: take the repository's mmproj GGUF when no explicit mmproj path was given.
 // want_dspark: with no DSpark drafter among `drafters`, take the one published beside the model: its repository's
-// preferred complete DSpark GGUF, or for a model file on disk dspark_beside's; either only where its
-// header says it is a DSpark drafter.
+// (fetch_dspark_companion), or for a model file on disk dspark_beside's; either only where its header says it is a
+// DSpark drafter.
 // lora: an adapter (fetch_lora; empty: none).
 bool fetch_model(const std::string& model, const std::vector<std::string>& drafters, bool want_mtp,
                  const hub::ProgressFn& progress, const std::atomic<bool>* stop, Fetched* out, std::string* err,
@@ -166,6 +166,13 @@ std::vector<HubGguf> hub_ggufs(const hub::Repo& repo, const PathAllowFn& allow_p
 // projector or MTP file (hub::mmproj_file, hub::mtp_file), the default DSpark drafter (hub::companion_files), else
 // the first complete one listed.
 const HubGguf* preferred_companion(const std::vector<HubGguf>& ggufs, const std::string& kind);
+// The DSpark drafter a repository publishes beside its model, for a load that names none: its dspark-*.gguf files,
+// preferred_companion's first, fetched in turn until one's header says it is a DSpark drafter (a file the cache does
+// not hold yet is a candidate by its name alone, and a repository can list another kind under such a name). Adds the
+// one taken to out's drafters, drafter_sources and notes, and a note for each passed over; false when a fetch fails.
+bool fetch_dspark_companion(const hub::Repo& repo, const std::vector<HubGguf>& ggufs, const hub::ProgressFn& progress,
+                            const std::atomic<bool>* stop, Fetched* out, std::string* err,
+                            const PathAllowFn& allow_path = {});
 
 // A GGUF's header (flyx::gguf_peek: its architecture, MTP layers, the repositories it comes from), read once while
 // the file keeps its size and time; valid false when it is no GGUF.
