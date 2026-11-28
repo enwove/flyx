@@ -82,7 +82,7 @@ Vitesse de décodage de la v0.2.1 en tokens/s, vérifiée sur quatre GPUs (greed
 
 <sub>**×** est l'accélération par rapport au décodage ordinaire sur les mêmes prompts, calculée à partir des débits non arrondis ; **Ordinaire** correspond à l'exécution chat / mixte. La sortie spéculative correspond token par token au décodage ordinaire dans toutes les exécutions ayant enregistré les identifiants de tokens (toutes sauf l'exécution mixte de Qwen sous Windows). Linux, sauf la RTX 5070 Ti sous Windows 11 natif.</sub>
 
-<sub>**Également mesuré :** le drafter **MTP** intégré à Qwen3.8-27B (sans fichier supplémentaire) atteint **286.6 / 158.0 / 121.7 / 167.2 tok/s** sur les prompts mixtes (5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4` :** prefill W4A4 à **15 496 tok/s** ; **203.8 tok/s** avec MTP à 128K de contexte (ordinaire : 73.4) ; **164.5 tok/s** à 256K avec **100 %** de rappel (exécution v0.2.0). Matériel, pilotes et commandes exactes : [docs/benchmarks.md](../benchmarks.md#v021-four-gpu-verified-benchmarks).</sub>
+<sub>**Également mesuré :** le drafter **MTP** intégré à Qwen3.8-27B (sans fichier supplémentaire) atteint **286.6 / 158.0 / 121.7 / 167.2 tok/s** sur les prompts mixtes (5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4` :** prefill W4A4 à **15 496 tok/s** ; **203.8 tok/s** avec MTP à 128K de contexte (ordinaire : 73.4) ; **164.5 tok/s** à 256K avec **100 %** de rappel (exécution v0.2.0). Matériel, pilotes et commandes exactes : [docs/benchmarks.md](../benchmarks.md#decode-and-prefill-on-four-gpus).</sub>
 
 ## Démarrage rapide
 
