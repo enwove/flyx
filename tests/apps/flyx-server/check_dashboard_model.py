@@ -78,8 +78,11 @@ CATALOG = {"cache": CACHE, "cache_from": "default", "dirs": [FOLDER], "models": 
      "repo": "acme/Model-DFlash2-GGUF", "quant": "BF16", "file": "Model-DFlash2-Draft-BF16.gguf",
      "path": CACHE + "\\Model-DFlash2-Draft-BF16.gguf", "size": int(1.0 * GB), "modified": 1.7e9,
      "revision": "def456", "current": True, "mtp": None, "mmproj": None}]}
+# A next page's cursor as the server makes one for a query's two streams (apps/flyx-server/hub_search.cpp), characters
+# a URL must escape in it: the page hands it back as it came.
+PAGE2_CURSOR = '{"gguf":"eyJ+/=&x","drafters":"a2"}'
 FOUND = {"query": "", "family": True, "architectures": ["qwen35", "qwen3", "inkling2_loop"], "arch": None,
-         "endpoint": "https://huggingface.co", "next_cursor": "page2-tok", "models": [
+         "endpoint": "https://huggingface.co", "next_cursor": PAGE2_CURSOR, "models": [
     {"id": REPO, "downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "created": None, "pipeline": None,
      "gated": False, "cached": True, "architecture": "qwen35", "runs": True},
     {"id": "acme/Inkling-2-Mini-GGUF", "downloads": 1900000, "likes": 1200, "updated": "2026-11-20T02:15:52.000Z", "created": None,
@@ -272,7 +275,7 @@ class Server:
             cursor = query.get("cursor", [""])[0]
             arch = query.get("arch", [""])[0]
             q_text = query.get("q", [""])[0]
-            if cursor == "page2-tok":
+            if cursor == PAGE2_CURSOR:
                 res = copy.deepcopy(FOUND_PAGE2)
                 res["endpoint"] = self.hub_endpoint
                 return route.fulfill(json=res)

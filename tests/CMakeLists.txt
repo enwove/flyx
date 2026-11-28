@@ -257,6 +257,8 @@ add_executable(known_drafters_test apps/common/known_drafters_test.cpp ${CMAKE_S
 target_link_libraries(known_drafters_test PRIVATE flyx_core)
 add_executable(drafter_speeds_test apps/flyx-server/drafter_speeds_test.cpp ${CMAKE_SOURCE_DIR}/apps/flyx-server/drafter_speeds.cpp)
 target_link_libraries(drafter_speeds_test PRIVATE flyx_core)
+add_executable(hub_search_test apps/flyx-server/hub_search_test.cpp ${CMAKE_SOURCE_DIR}/apps/flyx-server/hub_search.cpp)
+target_link_libraries(hub_search_test PRIVATE flyx_core Threads::Threads)
 add_executable(strata_snapshot_test backends/cuda/strata_snapshot_test.cpp)
 target_include_directories(strata_snapshot_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(draft_ring_test backends/cuda/draft_ring_test.cpp)
@@ -415,6 +417,8 @@ flyx_register_test(model_source model_source_test)
 add_test(NAME known_drafters COMMAND known_drafters_test)
 set_tests_properties(known_drafters PROPERTIES ENVIRONMENT "HF_HUB_OFFLINE=1")  # no network
 add_test(NAME drafter_speeds COMMAND drafter_speeds_test)
+# GET /v1/hub/search's pages for a query: GGUF repositories and safetensors drafters paged together (a stand-in Hub).
+add_test(NAME hub_search COMMAND hub_search_test)
 add_test(NAME chat_replies COMMAND tags_test)
 # Qwen3.5's own renderer against the Jinja engine on generated conversations, and its calls read back.
 add_test(NAME chat_qwen35 COMMAND qwen35_format_test ${ASSETS}/tiny.flyx

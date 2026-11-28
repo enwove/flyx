@@ -11,8 +11,9 @@
 //                         "default"), and offline flag
 //   POST /v1/hub/config   {"endpoint": URL or ""} sets or resets the Hub endpoint (persisted to serve.json)
 //   GET /v1/hub/search?q=TEXT&sort=trending|downloads|likes|updated|created&limit=N&cursor=C&arch=A   the Hub's
-//                         repositories with GGUF files; without q, filtered to the architectures this build runs
-//                         (optionally narrowed to arch=A), paginated via next_cursor
+//                         repositories with GGUF files and, beside them, the safetensors drafters the Hub's metadata
+//                         names (hub_search.h); without q, filtered to the architectures this build runs (optionally
+//                         narrowed to arch=A); paginated via next_cursor
 //   GET /v1/hub/files?repo=ORG/NAME   a repository's models: its GGUFs by quantization with their sizes (and which
 //                         are in the cache already), its MTP file, the drafters verified for it, what the Hub
 //                         says of it (downloads, license, its GGUFs' architecture) and whether this build runs that
@@ -60,6 +61,7 @@
 
 #include "apps/flyx-server/agent_launch.h"
 #include "apps/flyx-server/drafter_speeds.h"
+#include "apps/flyx-server/hub_search.h"
 #include "apps/flyx-server/gpu_apps.h"
 #include "apps/flyx-server/server.h"
 #include "core/interfaces/model.h"
@@ -632,30 +634,21 @@ void add_manage_routes(httplib::Server& http, Server* s) {
     hub::HubOutcome out;
     std::string next_cursor, err;
     if (!asked.empty()) {
-      if (!hub::search(asked, sort, limit, &found, &err, cursor, &next_cursor, /*gguf_only=*/true, &out))
+      // The GGUF repositories the query matches and the safetensors drafters beside them, as the Hub's metadata says
+      // they are, paged together (hub_search.h).
+      const HubSearchFn hub_search = [](const std::string& query, const std::string& by, int n,
+                                        std::vector<hub::Found>* list, std::string* why, const std::string& from,
+                                        std::string* next, bool gguf_only, hub::HubOutcome* outcome) {
+        return hub::search(query, by, n, list, why, from, next, gguf_only, outcome);
+      };
+      if (!search_page(hub_search, asked, sort, limit, cursor, &found, &next_cursor, &err, &out))
         return hub_error(r, out, err);
       if (cursor.empty()) {
-        std::set<std::string> seen_ids;
-        for (const auto& f : found) seen_ids.insert(f.id);
-        const std::string low = ascii_lower(asked);
-        const bool drafter_query = low.find("dflash") != std::string::npos || low.find("dspark") != std::string::npos ||
-                                   low.find("dspine") != std::string::npos || low.find("eagle") != std::string::npos ||
-                                   low.find("drafter") != std::string::npos || low.find("mtp") != std::string::npos;
-        // Include block drafters' safetensors repos (which filter=gguf omits) when searching drafters or when no GGUF
-        // matches.
-        if (found.empty() || drafter_query) {
-          std::vector<hub::Found> extra;
-          std::string e2;
-          if (hub::search(asked, sort, limit, &extra, &e2, "", nullptr, /*gguf_only=*/false)) {
-            for (auto& x : extra) {
-              if (x.is_drafter && seen_ids.insert(x.id).second) found.push_back(std::move(x));
-            }
-          }
-        }
-        // If the query names an exact repository (org/name), look it up directly so safetensors drafters or newly
-        // published repos are always found even when Hub search omits them.
+        // A query naming a repository (org/name): that one first, looked up directly, whether the Hub's search lists
+        // it or not (newly published, or matched by its name alone).
         hub::Name exact;
-        if (hub::parse_name(asked, &exact) && seen_ids.insert(exact.repo).second) {
+        if (hub::parse_name(asked, &exact) &&
+            std::none_of(found.begin(), found.end(), [&](const hub::Found& f) { return f.id == exact.repo; })) {
           hub::Repo repo;
           std::string e2;
           if (hub::describe(exact.repo, exact.revision, &repo, &e2, nullptr, remote_path_policy(*s, q))) {
