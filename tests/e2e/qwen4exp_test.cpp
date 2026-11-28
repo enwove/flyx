@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 
@@ -15,7 +16,11 @@ namespace {
 void require(bool ok, const std::string& message) {
   if (!ok) throw std::runtime_error(message);
 }
-void check_rounds(Engine& engine, const std::vector<int32_t>& prompt, bool sampled) {
+bool same_bits(const std::vector<float>& a, const std::vector<float>& b) {
+  return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0);
+}
+void check_rounds(Engine& engine, const std::vector<int32_t>& prompt, bool sampled,
+                  std::vector<float>* decode_trace) {
   const auto* api = engine.api();
   const int at = int(prompt.size());
   std::string error;
@@ -52,7 +57,22 @@ void check_rounds(Engine& engine, const std::vector<int32_t>& prompt, bool sampl
   flyx_host_pieces pieces{&data, 1, 0, std::max<uint64_t>(4096, bytes)};
   require(api->snapshot_save(spec.seq(), 0, 0, &pieces, bytes) == at, api->last_error());
   require(api->snapshot_load(loaded.seq(), &pieces, bytes, anchor) == at, api->last_error());
-  for (int j = 0; j < 14; ++j) want.push_back(round(plain, plain_plan, g).tokens[0]);
+  for (int j = 0; j < 14; ++j) {
+    want.push_back(round(plain, plain_plan, g).tokens[0]);
+    if (decode_trace) {
+      const auto start = decode_trace->size();
+      decode_trace->resize(start + engine.model().desc().vocab);
+      require(api->logits(plain.seq(), 0, decode_trace->data() + start) == 0, api->last_error());
+    }
+  }
+  if (decode_trace) {
+    flyx_graph_stats stats{};
+    require(api->graph_stats && api->graph_stats(plain.seq(), &stats) == 0, "CUDA graph statistics");
+    require(stats.captured > 0 && stats.from_graph == 14 && stats.captured < stats.from_graph,
+            "plain decode captures and replays its CUDA graph");
+    std::printf("decode graph launches %llu, captures %llu\n", (unsigned long long)stats.from_graph,
+                (unsigned long long)stats.captured);
+  }
   for (int j = 0; j < 3; ++j)
     require(round(loaded, plain_plan, g).tokens[0] == want[j], "snapshot preserves sampled anchor");
   auto plan_for = [&](bool tree) {
@@ -91,19 +111,43 @@ void check_rounds(Engine& engine, const std::vector<int32_t>& prompt, bool sampl
   }
 }
 
-void fixture(const std::string& stem, bool parent, const std::string& backend) {
+std::vector<float> reference_trace(const std::string& stem, const std::vector<int32_t>& prompt) {
+  EngineOptions opt;
+  opt.backend = "cpu_ref";
+  opt.max_ctx = 128;
+  opt.ple_placement = FLYX_PLE_HOST;
+  Engine engine;
+  std::string error;
+  require(engine.load(stem + ".gguf", opt, &error), error);
+  Session session(&engine);
+  require(session.init(&error), error);
+  const auto* api = engine.api();
+  const int vocab = engine.model().desc().vocab;
+  std::vector<float> trace(prompt.size() * vocab);
+  flyx_gen_params gen{};
+  for (size_t i = 0; i < prompt.size(); ++i) {
+    flyx_round_result result{};
+    require(api->prefill(engine.prefill_plan(), session.seq(), &prompt[i], 1, &gen) == 0, api->last_error());
+    require(api->read(session.seq(), &result) == 0, api->last_error());
+    require(api->logits(session.seq(), 0, trace.data() + i * vocab) == 0, api->last_error());
+  }
+  return trace;
+}
+
+void fixture(const std::string& stem, bool parent, const std::string& backend, bool fused) {
   const auto golden = nlohmann::json::parse(std::ifstream(stem + ".json"));
   const auto prompt = golden.at("prompt").get<std::vector<int32_t>>();
   const auto wanted = golden.at("logits").get<std::vector<std::vector<float>>>();
   const auto precise =
       golden.at("reference64").get<std::vector<std::vector<double>>>();
-  std::vector<float> baseline;
+  const auto cpu_logits = backend == "cuda" ? reference_trace(stem, prompt) : std::vector<float>();
+  std::vector<float> baseline, decode_baseline;
   for (int tier : {FLYX_PLE_GPU, FLYX_PLE_HOST, FLYX_PLE_DISK, FLYX_PLE_HYBRID}) {
     if (!parent && tier != FLYX_PLE_GPU) continue;
     EngineOptions opt;
     opt.backend = backend;
     if (backend == "cuda")
-      opt.backend_options = "head_cert=0";
+      opt.backend_options = fused ? "head_cert=0" : "head_cert=0,fusion=0";
     opt.prefill_chunk = 32;
     opt.max_ctx = 128;
     opt.ple_placement = tier;
@@ -120,11 +164,14 @@ void fixture(const std::string& stem, bool parent, const std::string& backend) {
     check(engine.tokenizer().prefix().empty(), "a GGUF BOS ID alone adds no prefix");
     const int text_end = desc.vocab - 1;
     check(engine.model_file().eos_ids() == std::vector<int32_t>{text_end - 1, text_end}, "both named stop tokens");
-    check_rounds(engine, prompt, false);
-    check_rounds(engine, prompt, true);
+    std::vector<float> decoded;
+    check_rounds(engine, prompt, false, backend == "cuda" ? &decoded : nullptr);
+    check_rounds(engine, prompt, true, backend == "cuda" ? &decoded : nullptr);
+    if (decode_baseline.empty()) decode_baseline = decoded;
+    else check(same_bits(decoded, decode_baseline), "graph-replayed logits match across every placement");
     const auto* api = engine.api();
     std::vector<float> trace;
-    double maximum = 0, max_double_error = 0;
+    double maximum = 0, max_double_error = 0, max_cpu_error = 0;
     for (int chunk : {1, 5, 32}) {
       Session s(&engine);
       require(s.init(&err), err);
@@ -142,6 +189,9 @@ void fixture(const std::string& stem, bool parent, const std::string& backend) {
                 api->last_error());
         const auto& ref = wanted[i + n - 1];
         for (size_t j = 0; j < logits.size(); ++j) {
+          require(std::isfinite(logits[j]), "finite output logits");
+          if (!cpu_logits.empty())
+            max_cpu_error = std::max(max_cpu_error, std::abs(double(logits[j]) - cpu_logits[(i + n - 1) * logits.size() + j]));
           maximum = std::max(maximum, std::abs(double(logits[j]) - ref[j]));
           max_double_error =
               std::max(max_double_error,
@@ -155,9 +205,12 @@ void fixture(const std::string& stem, bool parent, const std::string& backend) {
       }
     }
     std::printf("%s tier %d max absolute logits error %.8g\n", stem.c_str(), tier, maximum);
+    std::printf("  float64 reference logits max absolute error %.8g\n", max_double_error);
+    if (!cpu_logits.empty()) {
+      std::printf("  cpu_ref logits max absolute error %.8g\n", max_cpu_error);
+      check(max_cpu_error < 0.04, "CUDA logits versus cpu_ref");
+    }
     if (backend == "cpu_ref") {
-      std::printf("  float64 logits max absolute error %.8g\n",
-                  max_double_error);
       check(max_double_error < 5e-6, "float64 reference logits");
     }
     // CUDA stores attention K/V in binary16 and wide prefill GEMMs round their inputs.
@@ -165,17 +218,19 @@ void fixture(const std::string& stem, bool parent, const std::string& backend) {
     if (baseline.empty())
       baseline = trace;
     else
-      check(trace == baseline, "placement preserves every logit at every position");
+      check(same_bits(trace, baseline), "placement preserves every logit at every position");
   }
 }
 }  // namespace
 int main(int argc, char** argv) {
-  if (argc != 2 && argc != 3) return 2;
-  const std::string backend = argc == 3 ? argv[2] : "cpu_ref";
+  if (argc < 2 || argc > 4) return 2;
+  const std::string backend = argc >= 3 ? argv[2] : "cpu_ref";
+  if (argc == 4 && std::string(argv[3]) != "unfused") return 2;
+  const bool fused = argc < 4;
   try {
-    fixture(std::string(argv[1]) + "/qwen4exp_coder", false, backend);
-    fixture(std::string(argv[1]) + "/qwen4exp_parent", true, backend);
-    fixture(std::string(argv[1]) + "/qwen4exp_mixed", true, backend);
+    fixture(std::string(argv[1]) + "/qwen4exp_coder", false, backend, fused);
+    fixture(std::string(argv[1]) + "/qwen4exp_parent", true, backend, fused);
+    fixture(std::string(argv[1]) + "/qwen4exp_mixed", true, backend, fused);
   } catch (const std::exception& ex) {
     std::fprintf(stderr, "%s\n", ex.what());
     return 1;

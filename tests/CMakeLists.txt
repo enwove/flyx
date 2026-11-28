@@ -646,9 +646,8 @@ if(TARGET flyx-cuda)
   set_tests_properties(ple_recovery_cuda PROPERTIES FIXTURES_REQUIRED qwen4exp_models LABELS "gpu;golden")
   add_test(NAME qwen4exp_cuda COMMAND qwen4exp_e2e_test ${qwen4exp_assets} cuda)
   set_tests_properties(qwen4exp_cuda PROPERTIES FIXTURES_REQUIRED qwen4exp_models LABELS "gpu;golden")
-  add_test(NAME qwen4exp_cuda_unfused COMMAND qwen4exp_e2e_test ${qwen4exp_assets} cuda)
-  set_tests_properties(qwen4exp_cuda_unfused PROPERTIES FIXTURES_REQUIRED qwen4exp_models LABELS "gpu;golden"
-                        ENVIRONMENT "FLYX_BACKEND_OPTIONS=fusion=0")
+  add_test(NAME qwen4exp_cuda_unfused COMMAND qwen4exp_e2e_test ${qwen4exp_assets} cuda unfused)
+  set_tests_properties(qwen4exp_cuda_unfused PROPERTIES FIXTURES_REQUIRED qwen4exp_models LABELS "gpu;golden")
   flyx_add_golden_test(golden_cuda_qwen3_gguf ARGS cuda qwen3 ${ASSETS}/tiny_qwen3_gguf.gguf FIXTURES gguf_assets)
   flyx_add_golden_test(golden_cuda_qwen3_gguf_lora ARGS cuda qwen3_lora ${ASSETS}/tiny_qwen3_gguf.gguf
                        ${ASSETS}/peft_qwen3 FIXTURES gguf_assets)
