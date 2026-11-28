@@ -68,9 +68,11 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
                  const std::string& mmproj = "", bool want_vision = true, bool want_dspark = false,
                  const std::string& lora = "", const PathAllowFn& allow_path = {});
 
-// A LoRA adapter as Hugging Face PEFT saves it: a directory as it is, else a Hub repository's adapter_config.json
-// and adapter_model.safetensors fetched into the cache, "org/name" at its top, "org/name:FOLDER" in a folder of it
-// (a repository of several: the folder's path or its last part), "@REV" for a revision.  `path`: the directory.
+// A LoRA adapter as Hugging Face PEFT saves it: a directory as it is (or one of its two files, for their directory:
+// "." for a bare file name; any other file is refused), else a Hub repository's adapter_config.json and
+// adapter_model.safetensors fetched into the cache, "org/name" at its top, "org/name:FOLDER" in a folder of it (a
+// repository of several: the folder's path or its last part), "@REV" for a revision.  `path`: the directory, never
+// empty on success.
 bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop,
                 std::string* path, std::string* err, const PathAllowFn& allow_path = {});
 // fetch_lora's part after the repository is described: the adapter `folder` names in `repo` (spec's FOLDER; spec

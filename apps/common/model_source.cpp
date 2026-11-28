@@ -778,7 +778,11 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
     out->mmproj_source = mrepo.id.empty() ? mpath : clean_hub(mmproj);
     out->mmproj_size = bytes_on_disk(mpath, allow_path);
   }
-  if (!lora.empty() && !fetch_lora(lora, progress, stop, &out->lora, err, allow_path)) return false;
+  if (!lora.empty()) {
+    if (!fetch_lora(lora, progress, stop, &out->lora, err, allow_path)) return false;
+    // An empty path loads no adapter: never the base model answering for the adapter asked for.
+    if (out->lora.empty()) return *err = lora + ": names no LoRA adapter's directory", false;
+  }
   bool has_dspark = false;  // named: none other is taken
   for (const auto& ds : out->drafter_sources) has_dspark = has_dspark || ds.kind == "dspark";
   if (repo.id.empty()) {  // a path: only a DSpark drafter beside it to know of
@@ -853,9 +857,21 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
 
 bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const std::atomic<bool>* stop,
                 std::string* path, std::string* err, const PathAllowFn& allow_path) {
-  auto take_local = [&](const std::string& p) {  // the directory, or a file of it (its adapter_config.json, adapter_model.safetensors)
+  // The directory, or one of the two files PEFT saves in it (adapter_config.json, adapter_model.safetensors): their
+  // directory, the current one for a bare file name.  Never empty: an empty path asks for no adapter, and the base
+  // model would answer in the adapter's name.
+  auto take_local = [&](const std::string& p) {
     std::error_code ec;
-    const std::string resolved = fs::is_directory(to_path(p), ec) ? p : from_path(to_path(p).parent_path());
+    std::string resolved = p;
+    if (!fs::is_directory(to_path(p), ec)) {
+      const fs::path file = to_path(p);
+      const std::string leaf = from_path(file.filename());
+      if (leaf != "adapter_config.json" && leaf != "adapter_model.safetensors")
+        return *err = p + ": not a LoRA adapter (its directory, of adapter_config.json and adapter_model.safetensors, "
+                          "or one of those two files)",
+               false;
+      resolved = file.has_parent_path() ? from_path(file.parent_path()) : std::string(".");
+    }
     if (allow_path && !allow_path(resolved))
       return *err = resolved + ": path is not allowed by remote path policy", false;
     *path = resolved;

@@ -222,6 +222,43 @@ int main() {
           "single-quoted Hub LoRA name resolves via fallback" + (ok ? std::string() : ": " + err));
   }
 
+  // A local adapter named by one of the two files PEFT saves: their directory, the current one for a bare file name
+  // (never an empty path, which would load no adapter and let the base model answer in its name); any other file is
+  // refused, and fetch_model never turns an adapter asked for into none.
+  {
+    const fs::path adir = tmp / "bare-lora";
+    fs::create_directories(adir);
+    std::ofstream(adir / "adapter_config.json", std::ios::binary) << R"({"peft_type":"LORA","r":8})";
+    std::ofstream(adir / "adapter_model.safetensors", std::ios::binary) << std::string(64, 'w');
+    std::ofstream(adir / "notes.txt", std::ios::binary) << "not an adapter";
+    const fs::path cwd = fs::current_path();
+    fs::current_path(adir);
+    std::string p;
+    for (const std::string file : {"adapter_model.safetensors", "adapter_config.json"}) {
+      p.clear();
+      ok = flyx::apps::fetch_lora(file, {}, nullptr, &p, &err);
+      check(ok && !p.empty() && fs::equivalent(to_path(p), adir, ec),
+            "a bare " + file + " is its directory, the current one: " + (ok ? p : err));
+      p.clear();
+      ok = flyx::apps::fetch_lora(from_path(adir / file), {}, nullptr, &p, &err);
+      check(ok && to_path(p) == adir, "a path to " + file + " is its directory: " + (ok ? p : err));
+    }
+    for (const std::string file : {std::string("notes.txt"), from_path(adir / "notes.txt")}) {
+      p = "untouched";
+      ok = flyx::apps::fetch_lora(file, {}, nullptr, &p, &err);
+      check(!ok && p == "untouched" && err.find("not a LoRA adapter") != std::string::npos,
+            "another file is refused, not its directory taken: " + err);
+    }
+    ok = flyx::apps::fetch_model(from_path(model), {}, false, {}, nullptr, &f, &err, "", false, false,
+                                 "adapter_model.safetensors");
+    check(ok && !f.lora.empty() && fs::equivalent(to_path(f.lora), adir, ec),
+          "fetch_model keeps the adapter a bare file name asks for: " + (ok ? f.lora : err));
+    ok = flyx::apps::fetch_model(from_path(model), {}, false, {}, nullptr, &f, &err, "", false, false, "notes.txt");
+    check(!ok && err.find("not a LoRA adapter") != std::string::npos,
+          "and refuses a load whose adapter is no adapter: " + err);
+    fs::current_path(cwd);
+  }
+
   // Leading ~ expansion (HOME and USERPROFILE) and outer single-quote fallback (cmd.exe paste).
   {
     const std::string saved_home = flyx::os::getenv_str("HOME");
