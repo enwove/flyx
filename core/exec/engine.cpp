@@ -338,7 +338,7 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
   for (size_t i = 0; i < plans_.widths.size(); ++i)
     if (plans_.drafter_trees[i]) {
       const int chain = model_->block_drafts(plans_.drafters[i]);
-      round_trunks_[i] = model_->drafts_trees(plans_.drafters[i])
+      round_trunks_[i] = model_->drafts_trees(plans_.drafters[i]) || model_->trees_best_first(plans_.drafters[i])
                              ? -1
                              : std::min(plans_.widths[i], chain > 0 ? chain : plans_.widths[i]);
     }

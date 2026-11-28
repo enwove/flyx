@@ -981,7 +981,8 @@ void eagle_tree_grow(EagleTree* t, const DevParams* P, const DevGen* G, const in
                      const int* cand, const float* val, const float* prob, int kc, int beam, int vocab,
                      const float* gnode, float* hbuf, int H, cudaStream_t st);
 // The round's `width` drafts and their tree (TreeRows) from the nodes, the chain's first `trunk` first.
-void eagle_tree_finish(const EagleTree* t, int width, int trunk, int* drafts, TreeRows* tree, cudaStream_t st);
+void eagle_tree_finish(const EagleTree* t, const DevGen* G, int width, int trunk, int* drafts, TreeRows* tree,
+                       cudaStream_t st);
 
 // The keys [ks, ke) that split `split` of `splits` gives a row attending to `total` keys: as many splits as its
 // keys fill, kAttnMinSplitKeys or more each, starting on 32-key boundaries.  It depends on the row's own position

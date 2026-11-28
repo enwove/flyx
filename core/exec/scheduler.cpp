@@ -684,8 +684,8 @@ void Scheduler::advance_all() {
   if (!worked) os::sleep_us(100);  // on Windows a high-resolution timer, not the OS scheduler's 1 to 16 ms tick
 }
 
-// Every running generation's next round, jointly scheduled across sessions into batches of at most FLYX_MAX_ROWS
-// rows (core/speculation/batch_schedule.h). In step: they go out when every generation in its round
+// Every running generation's next round, jointly scheduled across sessions into batches of at most
+// Engine::batch_rows() rows (core/speculation/batch_schedule.h). In step: they go out when every generation in its round
 // phase has one to launch (one whose rounds in flight are at its limit reads one soon), so they share rounds rather
 // than each keeping its own two in flight at its own times.
 bool Scheduler::launch_rounds() {
@@ -706,7 +706,7 @@ bool Scheduler::launch_rounds() {
   }
   if (idx == 0) return false;
   batch_cands_.resize(idx);
-  const auto batches = plan_batches(batch_cost_, batch_cands_);
+  const auto batches = plan_batches(batch_cost_, batch_cands_, engine_->batch_rows());
   const auto* api = engine_->api();
   for (const auto& b : batches) {
     const size_t n = b.items.size();

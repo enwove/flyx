@@ -3,6 +3,7 @@
 // and device memory account).  Sessions are core/session/session.h.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <atomic>
 #include <memory>
@@ -241,6 +242,13 @@ class Engine {
   flyx_plan* round_plan(size_t i) const { return plans_.rounds[i]; }
   // Rounds whose drafts the engine gives (EngineOptions::lookup): no drafter runs.
   const std::vector<int>& lookup_widths() const { return plans_.given_widths; }
+  // The rows a round of several sessions may hold: FLYX_MAX_ROWS, or where the backend lowered wide rounds of given
+  // drafts (plans' wide_given_widths: its rounds of up to FLYX_MAX_WIDE_ROWS rows, every row its 1..16-row bits) as
+  // many as the widest of them.
+  int batch_rows() const {
+    const int widest = plans_.given_widths.empty() ? 0 : plans_.given_widths.back() + 1;
+    return std::clamp(widest, FLYX_MAX_ROWS, FLYX_MAX_WIDE_ROWS);
+  }
   const std::vector<double>& lookup_ms() const { return lookup_ms_; }
   flyx_plan* lookup_plan(size_t i) const { return plans_.given[i]; }
   // Rounds that verify a tree of given drafts (gen.parents), where the backend has them; empty: none.

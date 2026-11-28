@@ -1726,9 +1726,11 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
       if (seqs[j] == seqs[i]) return fail("launch_batch: a sequence twice");
     rows += plans[i]->width + 1;
   }
-  if (rows > FLYX_MAX_ROWS) return fail("launch_batch: more than FLYX_MAX_ROWS rows");
+  // Up to the rows a sequence's own buffers hold (m->wide_rows: FLYX_MAX_WIDE_ROWS where wide rounds are on), every
+  // row the bits a round of its own gives it (run_batch: the GEMMs of more than FLYX_MAX_ROWS rows as a wide round's)
+  if (rows > m->wide_rows) return fail("launch_batch: more rows than a round holds (" + std::to_string(m->wide_rows) + ")");
   // Canonicalize sequence order by pointer so equivalent batches share one cached graph regardless of caller order.
-  int ord[FLYX_MAX_ROWS];
+  int ord[FLYX_MAX_WIDE_ROWS];
   for (int i = 0; i < n; ++i) ord[i] = i;
   std::sort(ord, ord + n, [&](int a, int b) { return uintptr_t(seqs[a]) < uintptr_t(seqs[b]); });
 
@@ -1751,6 +1753,7 @@ int launch_batch(flyx_plan* const* plans, flyx_seq* const* seqs, const flyx_gen_
     bp.v.ld_feats = m->need.feats;
     bp.v.ld_ckv = m->need.ckv;
     bp.v.L = Launch{B.st, &lead->own.scratch, &m->opt.kernels, nullptr, &B.side};
+    bp.v.L.round_rows = true;  // a round's rows (more than FLYX_MAX_ROWS: a wide round's GEMMs, the 1..16-row bits)
     BatchKey key;
     key.n = n;
     bool prefill_claimed = false;

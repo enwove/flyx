@@ -123,21 +123,30 @@ void attn_rows(const BatchPass& bp, const AttnBlock& a, bool fused) {
 }
 
 // The head over all the rows; each sequence's penalties and choice on its rows.  The certified head when every
-// sequence chooses with it (it gives the token the full head gives), else the full head for all.
+// sequence chooses with it (it gives the token the full head gives), else the full head for all.  The logits hold a
+// round's FLYX_MAX_ROWS rows: a batch of more (a wide one) takes the head a group of whole sequences at a time, each
+// group FLYX_MAX_ROWS rows at most, as a wide round of one sequence takes it 16 rows at a time.
 void head_rows(const BatchPass& bp, const HeadBlock& h) {
   const RowView& v = bp.v;
   flyx_seq* lead = bp.seq[0].s;
   flyx_bmodel* m = lead->m;
   const int V = h.vocab;
   cudaStream_t st = v.L.st;
-  head_logits(h, v, 0, bp.rows, bp.cert, lead->cert, m->opt.kernels);
-  for (size_t i = 0; i < bp.seq.size(); ++i) {
-    const Pass& ps = bp.seq[i];
-    flyx_seq* s = ps.s;
-    float* lg = v.logits + size_t(bp.first[i]) * V;
-    if (ps.pen) penalize_rows(lg, V, V, ps.rows, s->G, s->reply, s->drafts, st);
-    choose_rows(lg, V, V, ps.rows, s->P, 1, s->G, s->mask, s->cz, s->ci, s->argv, s->argi,
-                v.b.choice + bp.first[i], st);
+  for (size_t i0 = 0; i0 < bp.seq.size();) {
+    size_t i1 = i0;
+    int rows = 0;
+    while (i1 < bp.seq.size() && rows + bp.seq[i1].rows <= FLYX_MAX_ROWS) rows += bp.seq[i1++].rows;
+    const int a = bp.first[i0];
+    head_logits(h, v, a, rows, bp.cert, lead->cert, m->opt.kernels);
+    for (size_t i = i0; i < i1; ++i) {
+      const Pass& ps = bp.seq[i];
+      flyx_seq* s = ps.s;
+      float* lg = v.logits + size_t(bp.first[i] - a) * V;
+      if (ps.pen) penalize_rows(lg, V, V, ps.rows, s->G, s->reply, s->drafts, st);
+      choose_rows(lg, V, V, ps.rows, s->P, 1, s->G, s->mask, s->cz, s->ci, s->argv, s->argi,
+                  v.b.choice + bp.first[i], st);
+    }
+    i0 = i1;
   }
 }
 
@@ -218,6 +227,81 @@ void mtp_draft_rows(const BatchPass& bp, const MtpBlock& b, const std::vector<si
   for (size_t idx : members) {
     const Pass& ps = bp.seq[idx];
     copy_ints(ps.s->mtok + 1, ps.s->drafts, ps.p->nodes[0].arg0, st);
+  }
+}
+
+// Lockstep batched EAGLE-4 chains across the sequences drafting with the same Eagle4Block, kEagleBeamMax at a time:
+// a step's layer GEMMs (q|k|v over the pair, o, the MLP), its candidate head's low-rank GEMMs and the exact scores of
+// their candidates read the drafter's weights once for every sequence, while each sequence's pair gather, rotary,
+// K/V and attention, and draft choice (mtp_choose: its own sampling, counts and position) stay its own, as in
+// eagle4_draft.  Drafts only: what a round verifies keeps the output plain decoding's.
+void eagle4_draft_rows(const BatchPass& bp, const Eagle4Block& b, const std::vector<size_t>& members, bool fused) {
+  const RowView& v = bp.v;
+  const flyx_bmodel* m = bp.seq[members[0]].s->m;
+  const auto& E = block<EmbedBlock>(m, b.embed);
+  const AttnBlock& a = b.attn;
+  const int H = b.hidden, nh = a.nh, nkv = a.nkv, hd = a.hd, V = b.vocab, q_w = nh * hd;
+  const int ld = std::max(V, kDraftPickFloats);
+  const int K = std::min(ops::kMtpCands, V);
+  const float scale = 1.f / std::sqrt(float(hd));
+  cudaStream_t st = v.L.st;
+  const Launch& L = v.L;
+  for (size_t off = 0; off < members.size(); off += size_t(kEagleBeamMax)) {
+    const size_t end = std::min(members.size(), off + size_t(kEagleBeamMax));
+    float* ez = bp.seq[members[off]].s->ez;  // kEagleBeamMax rows of the low-rank code
+    int max_w = 0;
+    for (size_t g = off; g < end; ++g) {
+      const Pass& ps = bp.seq[members[g]];
+      build_rows(ps.s->P, nullptr, 0, ps.s->mtok, 1, st);  // mtok[0] = anchor
+      max_w = std::max(max_w, ps.p->nodes[0].arg0);
+    }
+    std::vector<size_t> active;
+    for (int i = 0; i < max_w; ++i) {
+      active.clear();
+      for (size_t g = off; g < end; ++g)
+        if (i < bp.seq[members[g]].p->nodes[0].arg0) active.push_back(members[g]);
+      const int A = static_cast<int>(active.size());
+      for (int j = 0; j < A; ++j) {
+        flyx_seq* s = bp.seq[active[size_t(j)]].s;
+        float* hj = v.b.h + size_t(j) * H;
+        if (E.blk.data) embed_blocks(s->mtok + i, E.blk, H, hj, 1, st);
+        mtp_gather(s->P, kPosPosition, false, i == 0 ? nullptr : s->mg, s->ring, nullptr, 0, s->mtok + i, E.table, hj,
+                   b.in_norm.w, b.hidden_norm.w, b.in_norm.offset, b.in_norm.eps, H, 1, v.b.mcat + size_t(j) * 2 * H,
+                   st);
+        pair_hidden(s->P, kPosPosition, i == 0 ? nullptr : s->mg, s->ring, H, v.b.mx + size_t(j) * H, st);
+      }
+      gemm(v.b.mcat, 2 * H, a.w_in, a.n_in(), 2 * H, v.b.proj, v.ld_proj, A, false, L);
+      for (int j = 0; j < A; ++j) {
+        flyx_seq* s = bp.seq[active[size_t(j)]].s;
+        const KvBuf& kv = s->kv[size_t(a.kv)];
+        float* q = v.b.qbuf + size_t(j) * q_w;
+        attn_prep(v.b.proj + size_t(j) * v.ld_proj, v.ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, nullptr, nullptr,
+                  0.f, 0.f, a.theta, a.rot, nh, nkv, hd, 1, s->P, kPosPosition, false, q, kv.ref(), st, i - 1, nullptr,
+                  0, CanvasKeys{}, a.mrope());
+        s->stage_before(kv, i - 1, 1, st);
+        attention(q, kv.staged(), nh, nkv, hd, 1, true, 0, scale, s->P, nullptr, 0, v.b.act + size_t(j) * q_w, q_w,
+                  v.b.part, kRoundSplits, L, i - 1, b.window);
+      }
+      gemm(v.b.act, q_w, a.w_out, H, q_w, v.b.mx, H, A, true, L);
+      mlp_body(v.b.mx, b.mlp, A, v.b.h, v.b.proj, v.ld_proj, v.b.act, v.ld_act, L, fused);
+      rmsnorm(v.b.mx, H, b.norm.w, b.norm.offset, b.norm.eps, v.b.mhn, H, A, H, st);
+      gemm(v.b.mhn, H, b.cand_down, b.cand_rank, H, ez, b.cand_rank, A, false, L);
+      gemm(ez, b.cand_rank, b.cand_up, V, b.cand_rank, v.logits, ld, A, false, L);
+      draft_pick_rough(v.b.mhn, H, b.head, V, H, A, b.n_cands, K, v.b.mcand, v.b.mval, v.logits, L);
+      for (int j = 0; j < A; ++j) {
+        const Pass& ps = bp.seq[active[size_t(j)]];
+        flyx_seq* s = ps.s;
+        if (i + 1 < ps.p->nodes[0].arg0)  // the step's normed output: the next step's hidden
+          CK(cudaMemcpyAsync(s->mg, v.b.mhn + size_t(j) * H, size_t(H) * sizeof(float), cudaMemcpyDeviceToDevice, st));
+        mtp_choose(s->P, s->G, s->reply.count, v.b.mcand + size_t(j) * K, v.b.mval + size_t(j) * K, K, V, i, s->mtok,
+                   st);
+        mtp_oracle(s->P, s->oracle, i, s->mtok, st);
+      }
+    }
+    for (size_t g = off; g < end; ++g) {
+      const Pass& ps = bp.seq[members[g]];
+      copy_ints(ps.s->mtok + 1, ps.s->drafts, ps.p->nodes[0].arg0, st);
+    }
   }
 }
 
@@ -407,7 +491,8 @@ void run_batch(const BatchPass& bp) {
   // so drafter weights are shared across sessions; other drafters and given-draft nodes run per sequence.
   const MtpBlock* mtp_blk = nullptr;
   const DFlashBlock* dflash_blk = nullptr;
-  std::vector<size_t> mtp_members, dflash_members;
+  const Eagle4Block* e4_blk = nullptr;
+  std::vector<size_t> mtp_members, dflash_members, e4_members;
   std::vector<bool> has_conf(bp.seq.size(), true);
   const BatchDFlash& df = bp.seq[0].s->m->batch->dflash;
   for (size_t idx = 0; idx < bp.seq.size(); ++idx) {
@@ -417,6 +502,12 @@ void run_batch(const BatchPass& bp) {
       if (const auto* t = std::get_if<MtpBlock>(ps.p->block[0]); t && (!mtp_blk || mtp_blk == t)) {
         mtp_blk = t;
         mtp_members.push_back(idx);
+        continue;
+      }
+      if (const auto* e = std::get_if<Eagle4Block>(ps.p->block[0]);
+          e && ps.p->nodes[0].arg1 != FLYX_DRAFT_TREE && (!e4_blk || e4_blk == e)) {
+        e4_blk = e;
+        e4_members.push_back(idx);
         continue;
       }
       // A grouped chain must use the same block size it uses alone. Noncausal attention can see later rows.
@@ -445,6 +536,17 @@ void run_batch(const BatchPass& bp) {
     own.v.L.st = bp.v.L.st;
     ps.p->impl[0]->fn(own, ps.p->nodes[0], ps.p->block[0]);
   }
+  if (e4_members.size() >= 2) {
+    const bool fused = !generic_impl(bp.seq[e4_members[0]].p->impl[0]);
+    eagle4_draft_rows(bp, *e4_blk, e4_members, fused);
+    for (size_t idx : e4_members) has_conf[idx] = false;
+  } else if (e4_members.size() == 1) {
+    const Pass& ps = bp.seq[e4_members[0]];
+    Pass own = ps;
+    own.v = rows_of(ps.s);
+    own.v.L.st = bp.v.L.st;
+    ps.p->impl[0]->fn(own, ps.p->nodes[0], ps.p->block[0]);
+  }
   if (dflash_members.size() >= 2) {
     const bool fused = !generic_impl(bp.seq[dflash_members[0]].p->impl[0]);
     draft_block_rows(bp, *dflash_blk, dflash_members, fused);
@@ -462,7 +564,9 @@ void run_batch(const BatchPass& bp) {
   for (size_t k = t0; k < p0->nodes.size(); ++k) {
     const flyx_node& n = p0->nodes[k];
     const Block* b = p0->block[k];
-    const bool fused = !generic_impl(p0->impl[k]);
+    // A wide batch (more than FLYX_MAX_ROWS rows) on the generic paths: their GEMMs a wide round's (Launch::round_rows,
+    // the 1..16-row bits), where the fused producers' staged ones take the prefill kernels past 16 rows.
+    const bool fused = !generic_impl(p0->impl[k]) && bp.rows <= FLYX_MAX_ROWS;
     if (n.kind == FLYX_NODE_RUN) {
       if (const auto* e = std::get_if<EmbedBlock>(b)) {
         embed_rows(bp, *e);

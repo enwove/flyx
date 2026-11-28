@@ -180,11 +180,15 @@ __global__ void k_eagle_tree_grow(EagleTree* t, const DevParams* P, const DevGen
   frontier_rows(t, gnode, hbuf, H);
 }
 
-// The round's tree of `width` drafts: the oracle's path (its first `width`), else the trunk's first `trunk`; then the
-// best nodes by score (ties: the lower index; a parent's score is never below its child's, so the nodes taken are a
-// tree), in rows: the trunk (from the root each row's oracle child, else its trunk child, else its first taken
-// child) and the others in node order, so a parent's row is before its child's.
-__global__ void k_eagle_tree_finish(const EagleTree* t, int width, int trunk, int* drafts, TreeRows* tree) {
+// The round's tree of `width` drafts: the oracle's path (its first `width`), else sampling the trunk's first `trunk`
+// (the coupled chain, which a sampled round's accepted path follows); then the best nodes by score (ties: the lower
+// index; a parent's score is never below its child's, so the nodes taken are a tree), in rows: the trunk (from the
+// root each row's oracle child, else its trunk child, else its first taken child) and the others in node order, so a
+// parent's row is before its child's.  Greedy the trunk is each node's best child, which the scores take first
+// anyway: best first throughout (Qwen3.8-27B, 15 drafts on chat prompts: 4.01 tokens a round against 3.93 with
+// the chain of 7 forced).
+__global__ void k_eagle_tree_finish(const EagleTree* t, const DevGen* G, int width, int trunk, int* drafts,
+                                    TreeRows* tree) {
   pdl_trigger();
   if (threadIdx.x != 0) return;
   const int n = t->n;
@@ -194,7 +198,7 @@ __global__ void k_eagle_tree_finish(const EagleTree* t, int width, int trunk, in
     if (t->depth[v] <= width) oracle[v] = taken[v] = true;
   int count = 0;
   for (int u = 1; u < n; ++u) count += taken[u];
-  // without an oracle, the chain's first `trunk` drafts (the trunk the controller learns the chain from)
+  if (G->temperature <= 0.f) trunk = 0;
   if (count == 0)
     for (int u = 1; u < n && count < min(width, trunk); ++u)
       if (t->on_trunk[u]) taken[u] = true, ++count;
@@ -257,8 +261,9 @@ void eagle_tree_grow(EagleTree* t, const DevParams* P, const DevGen* G, const in
                                        H);
 }
 
-void eagle_tree_finish(const EagleTree* t, int width, int trunk, int* drafts, TreeRows* tree, cudaStream_t st) {
-  k_eagle_tree_finish<<<1, 32, 0, st>>>(t, width, trunk, drafts, tree);
+void eagle_tree_finish(const EagleTree* t, const DevGen* G, int width, int trunk, int* drafts, TreeRows* tree,
+                       cudaStream_t st) {
+  k_eagle_tree_finish<<<1, 32, 0, st>>>(t, G, width, trunk, drafts, tree);
 }
 
 }  // namespace flyx::cuda

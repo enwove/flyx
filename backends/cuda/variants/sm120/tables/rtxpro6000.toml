@@ -3,6 +3,9 @@
 # 24576x4096 4096x12288` (GB/s of weights streamed in brackets): Qwen3-8B's bf16 GEMMs as the engine runs them
 # (q|k|v, attention out, mlp gate|up, mlp down), every other shape and family the RTX 5090's.
 # 2026-11-25, RTX PRO 6000 Blackwell Server Edition 96 GB, 600 W, driver 620.70.06, CUDA 13.4.
+# Qwen3.8-27B's bf16 GEMMs and its EAGLE-4 drafter's (the Workstation Edition table's shapes), written by
+# `cuda_bench tune gemm 34816x5120 5120x17408 16480x5120 14336x5120 5120x6144 15360x10240 5120x5120 32768x5120
+# 5120x16384 5120x15360` on a Modal RTX PRO 6000 Blackwell Server Edition (driver 620.70.06), 2026-11-28.
 # Verified on Qwen3-8B (BF16) with DSpine at 15 drafts (docs/benchmarks.md section 6, the same answers): GSM8K 617.6 to
 # 642.6 tok/s, HumanEval 490.8 to 505.0 against the RTX 5090's table.
 sku = "rtxpro6000"
@@ -47,4 +50,96 @@ rules = [
   { rows = [2, 4], nt = 2, warps = 16, unroll = 8 },  # r4 1023
   { rows = [5, 8], nt = 1, warps = 16, unroll = 16 },  # r8 1040
   { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 1008
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 34816x5120
+format = "bf16"
+n = 34816
+k = 5120
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 16 },  # r1 1516
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 8 },  # r4 1479
+  { rows = [5, 16], nt = 4, warps = 16, unroll = 4 },  # r8 1423 r16 1402
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 5120x17408
+format = "bf16"
+n = 5120
+k = 17408
+rules = [
+  { rows = [1, 16], nt = 4, warps = 16, unroll = 4 },  # r1 1407 r4 1396 r8 1376 r16 1215
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 16480x5120
+format = "bf16"
+n = 16480
+k = 5120
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 8 },  # r1 1489
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 4 },  # r4 1452
+  { rows = [5, 16], nt = 4, warps = 16, unroll = 4 },  # r8 1384 r16 1348
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 14336x5120
+format = "bf16"
+n = 14336
+k = 5120
+rules = [
+  { rows = [1, 1], nt = 1, warps = 16, unroll = 16 },  # r1 1464
+  { rows = [2, 4], nt = 1, warps = 16, unroll = 4 },  # r4 1432
+  { rows = [5, 8], nt = 2, warps = 16, unroll = 4 },  # r8 1326
+  { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 1326
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 5120x6144
+format = "bf16"
+n = 5120
+k = 6144
+rules = [
+  { rows = [1, 1], nt = 1, warps = 8, unroll = 8 },  # r1 1368
+  { rows = [2, 4], nt = 2, warps = 8, unroll = 8 },  # r4 1283
+  { rows = [5, 16], nt = 4, warps = 16, unroll = 4 },  # r8 1272 r16 1251
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 15360x10240
+format = "bf16"
+n = 15360
+k = 10240
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 4 },  # r1 1493 r4 1412
+  { rows = [5, 16], nt = 4, warps = 16, unroll = 4 },  # r8 1381 r16 1306
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 5120x5120
+format = "bf16"
+n = 5120
+k = 5120
+rules = [
+  { rows = [1, 1], nt = 1, warps = 8, unroll = 8 },  # r1 1365
+  { rows = [2, 16], nt = 4, warps = 16, unroll = 4 },  # r4 1290 r8 1277 r16 1258
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 32768x5120
+format = "bf16"
+n = 32768
+k = 5120
+rules = [
+  { rows = [1, 4], nt = 1, warps = 16, unroll = 4 },  # r1 1511 r4 1474
+  { rows = [5, 16], nt = 4, warps = 16, unroll = 4 },  # r8 1409 r16 1406
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 5120x16384
+format = "bf16"
+n = 5120
+k = 16384
+rules = [
+  { rows = [1, 16], nt = 4, warps = 16, unroll = 4 },  # r1 1477 r4 1467 r8 1449 r16 1275
+]
+
+[[gemm]]  # qwen3.8-27b / its eagle4 drafter, bf16 5120x15360
+format = "bf16"
+n = 5120
+k = 15360
+rules = [
+  { rows = [1, 16], nt = 4, warps = 16, unroll = 4 },  # r1 1408 r4 1398 r8 1380 r16 1238
 ]

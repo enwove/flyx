@@ -27,6 +27,10 @@ class BatchCostModel {
   // in a batch: lockstep MTP and grouped DFlash2 read drafter weights and the 1-bit draft head once across
   // concurrent sessions, leaving per-session mixer/attention/table overhead beyond the widest member.
   static constexpr double kSharedDraftShare = 0.15;
+  // Fraction of a 1-row pass each session past the first adds to a batch (its own GDN/attention mixers, accept and
+  // commit): Qwen3.8-27B BF16 on an RTX PRO 6000, 8 sessions decoding plainly in one batch of 8 rows cost 45.6 ms
+  // against 37.5 for a round of 8 rows of one session (1.16 ms each past the first, 3.2% of the 35.8 ms 1-row pass).
+  static constexpr double kExtraSessionShare = 0.035;
 
   // Builds the cost model from the engine's calibrated round and lookup timings.
   void build(const std::vector<int>& widths, const std::vector<int>& drafters, const std::vector<double>& round_ms,
@@ -63,10 +67,11 @@ struct ScheduledBatch {
 };
 
 // Assigns each session in `sessions` one of its candidates and groups them into
-// batches of at most FLYX_MAX_ROWS total rows.  Non-batchable sessions (tree rounds,
-// relaxed acceptance) are isolated into solo batches so they never prevent other
-// sessions from sharing a batch.
+// batches of at most `max_rows` total rows (FLYX_MAX_ROWS, or up to FLYX_MAX_WIDE_ROWS where the backend runs rounds
+// that wide: Engine::batch_rows).  Non-batchable sessions (tree rounds, relaxed acceptance) are isolated into solo
+// batches so they never prevent other sessions from sharing a batch.
 std::vector<ScheduledBatch> plan_batches(const BatchCostModel& cost,
-                                         const std::vector<std::vector<RoundCandidate>>& sessions);
+                                         const std::vector<std::vector<RoundCandidate>>& sessions,
+                                         int max_rows = FLYX_MAX_ROWS);
 
 }  // namespace flyx

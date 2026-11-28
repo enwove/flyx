@@ -386,7 +386,7 @@ struct BatchKey {
       return flags < o.flags;
     }
   };
-  Entry seqs[FLYX_MAX_ROWS]{};
+  Entry seqs[FLYX_MAX_WIDE_ROWS]{};
   bool operator<(const BatchKey& o) const {
     if (n != o.n) return n < o.n;
     if (cert != o.cert) return cert < o.cert;
