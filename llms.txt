@@ -27,7 +27,7 @@ Start here when deploying, integrating, or modifying `flyx`. Each document below
 ## Build, Test, and Contribute
 
 - [AGENTS.md](AGENTS.md): Mandatory engineering rules for coding agents—directory layering boundaries, 5 correctness gates, build/test verification commands, and code standards. Read this before modifying any source file.
-- [docs/building.md](docs/building.md): Toolchain requirements, CMake presets (`dev`, `debug`, `cpu`, `dev-windows`, `cpu-windows`, `release-linux`, `release-windows`), CMake options, and Linux/Windows release packaging.
+- [docs/building.md](docs/building.md): Toolchain requirements, CMake presets (`dev`, `debug`, `cpu`, `dev-windows`, `cpu-windows`, `release-linux`, `release-windows`), CMake options, Linux/Windows release packaging, and the server image (`packaging/Dockerfile.server`) with its Compose deployment.
 - [docs/testing.md](docs/testing.md): Test dependencies, `ctest` suite map, CUPTI tracing, and coding-agent integration checks.
 - [docs/design/architecture.md](docs/design/architecture.md): Repository directory map, request lifecycle, scheduler/prefix-cache orchestration, KV tiering & StrataFlux 2-bit mechanics, speculative decoding invariants, and Model -> Program -> Region -> Op execution model.
 - [docs/design/numerics.md](docs/design/numerics.md): Machine-verified (`tools/check_numerics.py`) per-kernel precision contract, bitwise equivalence classes, and comparison against `llama.cpp`.

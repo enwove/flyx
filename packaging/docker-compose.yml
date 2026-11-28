@@ -1,0 +1,83 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+#
+# One flyx server: the image of packaging/Dockerfile.server, a GPU, and a volume for the model cache and serve.json.
+# The context is the parent directory because the image builds from the repository.
+#
+#   cp packaging/.env.example packaging/.env         # optional: model, API key, GPU, architectures
+#   docker compose -f packaging/docker-compose.yml up -d --build
+#   docker compose -f packaging/docker-compose.yml logs -f flyx      # the line to open: .../#key=<the generated key>
+#
+# The port is published on 127.0.0.1, where the dashboard and the API answer to your own machine; set
+# FLYX_PUBLISH_ADDR=0.0.0.0 in packaging/.env to publish every interface.  Either way the server runs with a key:
+# FLYX_API_KEY if you set one, and a random one the entrypoint prints (and keeps in the volume) if you do not, because
+# a request that arrives through a published port is not localhost to the server (docs/building.md's Docker section).
+# Serving several cards means one service per card: the process takes a single device.
+
+services:
+  flyx:
+    build:
+      context: ..
+      dockerfile: packaging/Dockerfile.server
+      args:
+        CUDA_IMAGE: >-
+          ${CUDA_IMAGE:-nvidia/cuda:13.0.2-devel-ubuntu22.04@sha256:1c517d4fb96528c8999e14e6e6b16d7e2ff9ae8d194fd788d60fdc88e693e982}
+        RUNTIME_IMAGE: >-
+          ${RUNTIME_IMAGE:-ubuntu:22.04@sha256:b000e69a50ff940390233025e7a337fb8469b509e2334fa4d018ac30f3e18cdb}
+        FLYX_CUDA_ARCHS: ${FLYX_CUDA_ARCHS:-80-real;89-real;90-real;100-real;120-real;120-virtual}
+        FLYX_JOBS: ${FLYX_JOBS:-0}
+    image: flyx:${FLYX_IMAGE_TAG:-local}
+    restart: unless-stopped
+    # PID 1 of a container ignores SIGTERM while a large model is still downloading, before flyx installs its own
+    # handler; `init` reaps it and forwards the signal, so `docker compose stop` stops within the grace period.
+    init: true
+    working_dir: /data
+    environment:
+      HOME: /data
+      HF_HOME: /data/hf
+      FLYX_HOST: 0.0.0.0
+      FLYX_PORT: ${FLYX_PORT:-8080}
+      FLYX_API_KEY: ${FLYX_API_KEY:-}
+      FLYX_MODEL: ${FLYX_MODEL:-}
+      FLYX_ARGS: ${FLYX_ARGS:-}
+      FLYX_MODELS_DIR: /models
+      CUDA_DEVICE_ORDER: PCI_BUS_ID
+      HF_TOKEN: ${HF_TOKEN:-}
+      HF_ENDPOINT: ${HF_ENDPOINT:-}
+    ports:
+      - "${FLYX_PUBLISH_ADDR:-127.0.0.1}:${FLYX_PORT:-8080}:${FLYX_PORT:-8080}"
+    volumes:
+      - flyx-data:/data
+      # Own .gguf files, read-only: the dashboard lists them and FLYX_MODEL loads one by its full path
+      # (/models/<file>.gguf; a bare name resolves against /data, then the Hub).  Uncommented,
+      # MODELS_DIR also lands in the image's build context, which packaging/Dockerfile.server.dockerignore excludes.
+      # - ${MODELS_DIR:-./data/models}:/models:ro
+    healthcheck:
+      # The first model of tens of GB downloads on first use, so /health stays green long after the port opens.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${FLYX_PORT:-8080}/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10m
+      retries: 3
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # One card, chosen by its number as nvidia-smi shows it.  A container that reserves devices by id sees
+              # exactly those cards, and inside it CUDA numbers them from 0 — which is why there is no
+              # CUDA_VISIBLE_DEVICES here: the id below is the knob, and the variable would have to name 0.
+              # `count: all` reserves every card instead, and then CUDA_VISIBLE_DEVICES is what picks one.
+              device_ids: ["${GPU_DEVICE:-0}"]
+              capabilities: [gpu]
+    # The container's user has uid 1000; a bind mount of a host folder has to be readable by it.
+    user: "1000:1000"
+    # A knob, not a requirement: --kv-ram pins host K/V through CUDA (cudaHostAlloc, cuMemCreate), which does not read
+    # RLIMIT_MEMLOCK.  Docker's own default is 64 MiB and the NVIDIA Container Toolkit raises it; rootless Docker and
+    # Podman may refuse to raise a hard limit, and dropping this block from them changes nothing for flyx.
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+
+volumes:
+  flyx-data:
