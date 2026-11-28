@@ -12,7 +12,7 @@
 //   near tie may part), through short prefill passes (the rounds' kernels)
 //   and long ones; drafting changes nothing.
 // * Drafters in files of their own: the MTP layer from a GGUF of its own, and
-//   a DFlash2 drafter file.
+//   a DFlash2 drafter file; each packed in one .flyx file with its model.
 // * NVFP4 weights whose inputs are NVFP4 in passes of more than 16 rows (the
 //   W4A4 kernels, tiny_w4a4.flyx, a Qwen3.5 128 wide): the
 //   float64 backend's tokens, teacher forced, with the same prefill passes
@@ -25,6 +25,7 @@
 #include <stdexcept>
 
 #include "core/exec/generation.h"
+#include "core/modelfile/readers.h"
 #include "nlohmann/json.hpp"
 #include "ops/dtype/ref.h"
 #include "tests/common/check.h"
@@ -311,6 +312,45 @@ void split_mtp(const std::string& dir, const std::string& backend) {
   check(why.find("no MTP layer") != std::string::npos, "the model without its MTP file has no MTP layer (" + why + ")");
   why = refusal(whole, backend, {.speculative = true, .drafter_files = {mtp}});
   check(why.find("has its MTP layer") != std::string::npos, "a model with its MTP layer takes no drafter file (" + why + ")");
+}
+
+// A GGUF model and its drafter packed in one .flyx file (flyx pack, core/modelfile/flyx_pack.cpp): the drafter bundled
+// drafts with nothing beside the file, and the one file gives the two files' tokens and every round's drafts: the MTP
+// layer of a file of its own beside the quantized tiny Qwen3.5, and a Q8_0 DFlash2 GGUF drafter beside the tiny one.
+void one_file(const std::string& dir, const std::string& backend) {
+  struct Pair {
+    std::string model, drafter, kind;
+  };
+  const Pair pairs[] = {{"tiny_q8_target.gguf", "tiny_q8_mtp.gguf", "mtp"},
+                        {"tiny_gguf.gguf", "tiny_draft_q8.gguf", "dflash2"}};
+  std::ifstream f(dir + "/golden.json");
+  const json golden = json::parse(f);
+  for (const Pair& pair : pairs) {
+    ModelFile two_files;
+    std::string err;
+    const std::string packed = dir + "/one_file_" + pair.kind + ".flyx";
+    check(two_files.open(dir + "/" + pair.model, &err) &&
+              two_files.add(dir + "/" + pair.drafter, &err, {}, ModelFile::CompanionRole::Drafter) &&
+              modelfile::write_packed(two_files, {}, packed, &err),
+          pair.model + " and " + pair.drafter + " packed in one file: " + err);
+    auto one = engine(packed, backend, {.speculative = true, .drafter = pair.kind});
+    auto two = engine(dir + "/" + pair.model, backend,
+                      {.speculative = true, .drafter = pair.kind, .drafter_files = {dir + "/" + pair.drafter}});
+    for (const auto& item : golden.at("cases")) {
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      std::vector<int32_t> ta, tb;
+      const auto ra = traced(*one, p, 40, &ta), rb = traced(*two, p, 40, &tb);
+      size_t drafted = 0;
+      bool same = ra.size() == rb.size();
+      for (size_t i = 0; same && i < ra.size(); ++i) {
+        drafted += size_t(ra[i].n_drafts);
+        same = std::equal(ra[i].drafts, ra[i].drafts + ra[i].n_drafts, rb[i].drafts, rb[i].drafts + rb[i].n_drafts);
+      }
+      check(same_tokens(ta, tb) && same && drafted > 0,
+            pair.kind + " packed in the model's file: the two files' tokens and every round's drafts (" +
+                std::to_string(drafted) + " drafts)");
+    }
+  }
 }
 
 // Prefill tokens [from, to) of t at the sequence's position, in passes of up to `rows` rows that choose no token.
@@ -1095,6 +1135,7 @@ int main(int argc, char** argv) {
     split_shards(dir, backend);
     explicit_head_dim(dir, backend);
     split_mtp(dir, backend);
+    one_file(dir, backend);
     dflash_file(dir, backend);
     dspine_file(dir, backend);
     if (backend != "cpu_ref") packed(dir, backend);

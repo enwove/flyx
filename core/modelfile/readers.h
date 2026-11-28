@@ -51,11 +51,46 @@ inline bool plain_tensor_nbytes(int dtype, const std::vector<int64_t>& shape, ui
   return true;
 }
 
+// Byte size of a tensor of any dtype a file may hold: plain_tensor_nbytes's, or GGML blocks whose rows (the last
+// dimension) are whole blocks.
+inline bool tensor_nbytes(int dtype, const std::vector<int64_t>& shape, uint64_t* out) {
+  const int64_t per = flyx_block_values(dtype);
+  if (!per) return plain_tensor_nbytes(dtype, shape, out);
+  if (shape.empty() || shape.back() % per) return false;
+  uint64_t blocks = 1;
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (shape[i] < 0) return false;
+    const uint64_t d = static_cast<uint64_t>(i + 1 == shape.size() ? shape[i] / per : shape[i]);
+    if (d != 0 && blocks > std::numeric_limits<uint64_t>::max() / d) return false;
+    blocks *= d;
+  }
+  const uint64_t bb = static_cast<uint64_t>(flyx_block_bytes(dtype));
+  if (blocks > std::numeric_limits<uint64_t>::max() / bb) return false;
+  *out = blocks * bb;
+  return true;
+}
+
 // .flyx (python/convert/flyx_convert/fileformat.py): magic, version, a
-// JSON header, tensors and blobs in an aligned data section.
+// JSON header, tensors and blobs in an aligned data section.  A file packed
+// from a GGUF (flyx pack: write_packed below) requires "gguf": its header is the
+// GGUF reader's (header["gguf"], source.format "gguf"), its tensors GGML blocks
+// under their GGUF names, and its "bundled" files (a drafter, a projector) are
+// what the GGUF reader read of them: they come back in `bundled`, in order, to
+// be the model's first companions.  The reader takes "gguf" off "requires" and
+// "bundled" off the header, so a packed file's Contents are its GGUF's.
+struct Bundled {
+  ModelFile::CompanionRole role = ModelFile::CompanionRole::Any;
+  ModelFile::Contents c;
+};
 bool is_flyx(const uint8_t* data, size_t size);
 bool read_flyx(const uint8_t* data, size_t size, const std::string& path, ModelFile::Contents* out,
-               std::string* err);
+               std::string* err, std::vector<Bundled>* bundled = nullptr);
+// The dtype's name in a .flyx header ("bf16", "ggml_q4_k", ...); null for one a file never holds.
+const char* flyx_dtype_name(int dtype);
+// A .flyx file holding what `file` read of a GGUF model and its companions (drafters, a projector; not a LoRA
+// adapter, which runs beside a model only when asked for), its blocks byte for byte; `extra` (an object, or null for
+// none) adds keys to the header ("recommended", "packed"): the ones a reader reads are refused.  Written to a file beside `path`, then renamed.
+bool write_packed(const ModelFile& file, const nlohmann::json& extra, const std::string& path, std::string* err);
 
 // GGUF, little-endian v2 and v3 (gguf_format.cpp): the container only.  The
 // metadata becomes header["gguf"], the vocabulary the tokenizer tables, and

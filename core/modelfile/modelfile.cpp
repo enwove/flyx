@@ -8,7 +8,8 @@ namespace flyx {
 namespace {
 
 bool read(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::string& path, ModelFile::Contents* c,
-          std::string* err, bool need_tokenizer, const PathAllowFn& allow_path) {
+          std::string* err, bool need_tokenizer, const PathAllowFn& allow_path,
+          std::vector<modelfile::Bundled>* bundled = nullptr) {
   if (allow_path && !allow_path(path))
     return *err = path + ": path is not allowed by remote path policy", false;
   maps->clear();
@@ -17,7 +18,7 @@ bool read(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::string&
   if (!first->open(path, err)) return false;
   *c = {};
   if (modelfile::is_flyx(first->data(), first->size()))
-    return modelfile::read_flyx(first->data(), first->size(), path, c, err);
+    return modelfile::read_flyx(first->data(), first->size(), path, c, err, bundled);
   if (modelfile::is_gguf(first->data(), first->size()))
     return modelfile::read_gguf(maps, path, c, err, need_tokenizer, allow_path);
   *err = path + ": not a model file this build reads (.flyx or .gguf)";
@@ -35,16 +36,26 @@ std::string drafter_source_kind(const std::string& path, const PathAllowFn& allo
 bool ModelFile::open(const std::string& path, std::string* err, const PathAllowFn& allow_path) {
   companions_.clear();
   maps_.clear();
+  bundled_ = 0;
   if (allow_path && !allow_path(path))
     return *err = path + ": path is not allowed by remote path policy", false;
   if (modelfile::is_drafter_dir(path, allow_path))
     return *err = path + " holds a drafter alone, not a model: give it beside the model (--drafter-file)", false;
-  if (!read(&maps_, path, &c_, err, /*need_tokenizer=*/true, allow_path)) return false;
+  std::vector<modelfile::Bundled> bundled;
+  if (!read(&maps_, path, &c_, err, /*need_tokenizer=*/true, allow_path, &bundled)) return false;
   // The header is the file's word: a key of another type than expected is read as absent, never thrown on.
   const auto kind = c_.header.find("kind");
   if (kind != c_.header.end() && kind->is_string() && kind->get_ref<const std::string&>() == "drafter")
     return *err = path + " holds a drafter alone, not a model: give it beside the model (--drafter-file)", false;
   if (c_.header.is_object()) c_.header.erase("companions");  // add() lists them; what a file put there is not one
+  for (auto& b : bundled) {  // in this file's mapping: the companions own no mapping of their own
+    auto more = std::make_unique<Companion>();
+    more->role = b.role;
+    more->c = std::move(b.c);
+    c_.header["companions"].push_back(more->c.header);
+    companions_.push_back(std::move(more));
+  }
+  bundled_ = int(companions_.size());
   return true;
 }
 

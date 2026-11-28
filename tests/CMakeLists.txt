@@ -210,6 +210,7 @@ endfunction()
 flyx_add_unit_test(tokenizer_test core/tokenizer/tokenizer_test.cpp)
 flyx_add_unit_test(merge_test core/tokenizer/merge_test.cpp)
 flyx_add_unit_test(flyx_format_test core/modelfile/flyx_test.cpp)
+flyx_add_unit_test(flyx_pack_test core/modelfile/flyx_pack_test.cpp)
 flyx_add_unit_test(drafter_dir_test core/modelfile/drafter_dir_test.cpp)
 flyx_add_unit_test(peft_dir_test core/modelfile/peft_dir_test.cpp)
 flyx_add_unit_test(hub_test core/hub/hub_test.cpp Threads::Threads)
@@ -328,6 +329,9 @@ add_test(NAME make_gguf_assets
 set_tests_properties(make_gguf_assets PROPERTIES FIXTURES_REQUIRED assets FIXTURES_SETUP gguf_assets)
 
 add_test(NAME gguf_reader COMMAND gguf_test ${ASSETS})
+# A .flyx file packed from a GGUF (flyx pack) reads as its GGUF and the files beside it: every block type, a split
+# file, the MTP layer and drafters of their own; what the writer and the reader refuse.
+add_test(NAME flyx_pack COMMAND flyx_pack_test ${ASSETS})
 add_test(NAME ggml_blocks COMMAND ggml_test ${ASSETS})
 add_test(NAME gguf_models COMMAND gguf_models_test ${ASSETS})
 # The DFlash2 drafter the architectures share (models/drafters/): its config checked before a tensor is bound, the
@@ -346,7 +350,7 @@ flyx_add_golden_test(golden_cpu_ref_qwen35_gguf_lora ARGS cpu_ref qwen35_lora ${
 # The same GGUF file with a PEFT LoRA adapter beside it (--lora), against transformers with it merged.
 flyx_add_golden_test(golden_cpu_ref_qwen3_gguf_lora ARGS cpu_ref qwen3_lora ${ASSETS}/tiny_qwen3_gguf.gguf
                      ${ASSETS}/peft_qwen3 FIXTURES gguf_assets)
-set_tests_properties(gguf_reader ggml_blocks gguf_models dflash2_models gguf_qwen2_nfc gguf_qwen2_none gguf_cpu_ref
+set_tests_properties(gguf_reader flyx_pack ggml_blocks gguf_models dflash2_models gguf_qwen2_nfc gguf_qwen2_none gguf_cpu_ref
                      PROPERTIES FIXTURES_REQUIRED gguf_assets)
 
 flyx_add_py_test(dspine_reference ${CMAKE_SOURCE_DIR}/tests/python/reference/dspine_test.py ARGS ${ASSETS} FIXTURES assets)

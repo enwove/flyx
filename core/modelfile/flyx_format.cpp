@@ -22,16 +22,64 @@ constexpr char kOldMagic[8] = {'F', 'A', 'S', 'T', 'E', 'S', 'T', '\0'};
 constexpr uint32_t kPlainFormat = 1, kRequiresFormat = 2;
 constexpr size_t kAlignData = 4096;
 
+// A dtype by its name in a header; GGML's blocks (a packed GGUF's) by GGML's names.
+constexpr std::pair<const char*, int> kDtypes[] = {
+    {"bf16", FLYX_DT_BF16},
+    {"f16", FLYX_DT_F16},
+    {"f32", FLYX_DT_F32},
+    {"f64", FLYX_DT_F64},
+    {"i32", FLYX_DT_I32},
+    {"u32", FLYX_DT_U32},
+    {"u8", FLYX_DT_U8},
+    {"i64", FLYX_DT_I64},
+    {"nvfp4", FLYX_DT_NVFP4},
+    {"f8e4m3", FLYX_DT_F8E4M3},
+    {"ggml_q4_0", FLYX_DT_GGML_Q4_0},
+    {"ggml_q4_1", FLYX_DT_GGML_Q4_1},
+    {"ggml_q5_0", FLYX_DT_GGML_Q5_0},
+    {"ggml_q5_1", FLYX_DT_GGML_Q5_1},
+    {"ggml_q8_0", FLYX_DT_GGML_Q8_0},
+    {"ggml_q2_k", FLYX_DT_GGML_Q2_K},
+    {"ggml_q3_k", FLYX_DT_GGML_Q3_K},
+    {"ggml_q4_k", FLYX_DT_GGML_Q4_K},
+    {"ggml_q5_k", FLYX_DT_GGML_Q5_K},
+    {"ggml_q6_k", FLYX_DT_GGML_Q6_K},
+    {"ggml_iq2_xxs", FLYX_DT_GGML_IQ2_XXS},
+    {"ggml_iq2_xs", FLYX_DT_GGML_IQ2_XS},
+    {"ggml_iq2_s", FLYX_DT_GGML_IQ2_S},
+    {"ggml_iq3_xxs", FLYX_DT_GGML_IQ3_XXS},
+    {"ggml_iq3_s", FLYX_DT_GGML_IQ3_S},
+    {"ggml_iq1_s", FLYX_DT_GGML_IQ1_S},
+    {"ggml_iq1_m", FLYX_DT_GGML_IQ1_M},
+    {"ggml_iq4_nl", FLYX_DT_GGML_IQ4_NL},
+    {"ggml_iq4_xs", FLYX_DT_GGML_IQ4_XS},
+    {"ggml_nvfp4", FLYX_DT_GGML_NVFP4},
+    {"ggml_mxfp4", FLYX_DT_GGML_MXFP4},
+    {"ggml_q2_0", FLYX_DT_GGML_Q2_0},
+};
+
 int dtype_of(const std::string& s) {
-  static const std::map<std::string, int> m = {
-      {"bf16", FLYX_DT_BF16}, {"f16", FLYX_DT_F16}, {"f32", FLYX_DT_F32}, {"f64", FLYX_DT_F64},
-      {"i32", FLYX_DT_I32},   {"u32", FLYX_DT_U32}, {"u8", FLYX_DT_U8},   {"i64", FLYX_DT_I64},
-      {"nvfp4", FLYX_DT_NVFP4}, {"f8e4m3", FLYX_DT_F8E4M3}};
-  auto it = m.find(s);
-  return it == m.end() ? -1 : it->second;
+  for (const auto& [name, dtype] : kDtypes)
+    if (s == name) return dtype;
+  return -1;
+}
+
+// The part of a file packed from a GGUF that a reader must not ignore: its layout is the GGUF's.
+constexpr const char* kGgufPart = "gguf";
+
+ModelFile::CompanionRole role_of(const std::string& s) {
+  if (s == "drafter") return ModelFile::CompanionRole::Drafter;
+  if (s == "projector") return ModelFile::CompanionRole::Projector;
+  throw std::runtime_error("a bundled file's role is \"drafter\" or \"projector\", not \"" + s + "\"");
 }
 
 }  // namespace
+
+const char* flyx_dtype_name(int dtype) {
+  for (const auto& [name, d] : kDtypes)
+    if (d == dtype) return name;
+  return nullptr;
+}
 
 bool is_flyx(const uint8_t* data, size_t size) {
   return size >= 8 && (std::memcmp(data, kMagic, 8) == 0 || std::memcmp(data, kOldMagic, 8) == 0);
@@ -63,7 +111,7 @@ bool read_header(const uint8_t* p, size_t size, const std::string& path, nlohman
 }  // namespace
 
 bool read_flyx(const uint8_t* p, size_t size, const std::string& path, ModelFile::Contents* out,
-               std::string* err) {
+               std::string* err, std::vector<Bundled>* bundled) {
   uint32_t ver;
   uint64_t hlen;
   if (!read_header(p, size, path, &out->header, &ver, &hlen, err)) return false;
@@ -72,32 +120,14 @@ bool read_flyx(const uint8_t* p, size_t size, const std::string& path, ModelFile
   const size_t data_start = (24 + size_t(hlen) + kAlignData - 1) / kAlignData * kAlignData;
   const size_t data_size = data_start < size ? size - data_start : 0;
   auto inside = [&](uint64_t off, uint64_t n) { return data_start <= size && off <= data_size && n <= data_size - off; };
-  try {
-    out->arch = out->header.value("arch", "");
-    const bool named = out->header.is_object() && out->header.contains("requires");
-    if (named != (ver == kRequiresFormat)) {
-      *err = path + ": file format " + std::to_string(ver) +
-             (named ? " with \"requires\" (format 2's: the parts a reader must not ignore)"
-                    : " without \"requires\" (the parts a reader must not ignore)");
-      return false;
-    }
-    if (named) {
-      const auto& r = out->header.at("requires");
-      bool names = r.is_array() && !r.empty();
-      for (const auto& x : r) names = names && x.is_string() && !x.get<std::string>().empty();
-      if (!names) {
-        *err = path + ": \"requires\" is not a list of the parts a reader must not ignore: " + r.dump();
-        return false;
-      }
-    }
-
-    const auto& ts = out->header.at("tensors");
-    out->names.reserve(ts.size());
-    out->tensors.reserve(ts.size());
+  // A header's "tensors" as views into the data: each one inside the file, its size its shape's and dtype's.
+  auto read_tensors = [&](const nlohmann::json& ts, ModelFile::Contents* c) -> bool {
+    c->names.reserve(ts.size());
+    c->tensors.reserve(ts.size());
     for (auto it = ts.begin(); it != ts.end(); ++it) {
       const auto& r = it.value();
       flyx_tensor_view v{};
-      out->names.push_back(it.key());
+      c->names.push_back(it.key());
       v.dtype = dtype_of(r.at("dtype").get<std::string>());
       auto shape = r.at("shape").get<std::vector<int64_t>>();
       if (v.dtype < 0 || shape.size() > 4) {
@@ -119,15 +149,79 @@ bool read_flyx(const uint8_t* p, size_t size, const std::string& path, ModelFile
         return false;
       }
       uint64_t want_bytes = 0;
-      if (!plain_tensor_nbytes(v.dtype, shape, &want_bytes) || v.nbytes != want_bytes) {
+      if (!tensor_nbytes(v.dtype, shape, &want_bytes) || v.nbytes != want_bytes) {
         *err = "tensor " + it.key() + ": byte size does not match shape and dtype";
         return false;
       }
       v.data = p + data_start + off;
-      out->index[it.key()] = out->tensors.size();
-      out->tensors.push_back(v);
+      c->index[it.key()] = c->tensors.size();
+      c->tensors.push_back(v);
     }
-    for (size_t i = 0; i < out->tensors.size(); ++i) out->tensors[i].name = out->names[i].c_str();
+    for (size_t i = 0; i < c->tensors.size(); ++i) c->tensors[i].name = c->names[i].c_str();
+    return true;
+  };
+  try {
+    out->arch = out->header.value("arch", "");
+    const bool named = out->header.is_object() && out->header.contains("requires");
+    if (named != (ver == kRequiresFormat)) {
+      *err = path + ": file format " + std::to_string(ver) +
+             (named ? " with \"requires\" (format 2's: the parts a reader must not ignore)"
+                    : " without \"requires\" (the parts a reader must not ignore)");
+      return false;
+    }
+    if (named) {
+      const auto& r = out->header.at("requires");
+      bool names = r.is_array() && !r.empty();
+      for (const auto& x : r) names = names && x.is_string() && !x.get<std::string>().empty();
+      if (!names) {
+        *err = path + ": \"requires\" is not a list of the parts a reader must not ignore: " + r.dump();
+        return false;
+      }
+    }
+
+    if (!read_tensors(out->header.at("tensors"), out)) return false;
+
+    // A file packed from a GGUF (write_packed): its header is the GGUF reader's, its bundled files companions.
+    bool packed = false;
+    if (named) {
+      auto& r = out->header["requires"];
+      for (auto it = r.begin(); it != r.end();)
+        if (*it == kGgufPart) packed = true, it = r.erase(it);
+        else ++it;
+      if (r.empty()) out->header.erase("requires");
+    }
+    if (packed) {
+      const auto& h = out->header;
+      if (!h.contains("source") || !h["source"].is_object() || h["source"].value("format", "") != "gguf" ||
+          !h.contains("gguf") || !h["gguf"].is_object()) {
+        *err = path + ": requires \"gguf\" without a GGUF's header (source.format \"gguf\", \"gguf\")";
+        return false;
+      }
+    }
+    if (out->header.contains("bundled")) {
+      if (!packed) {
+        *err = path + ": \"bundled\" files in a file not packed from a GGUF (\"requires\": [\"gguf\"])";
+        return false;
+      }
+      if (!bundled) {
+        *err = path + " bundles files of its own: give it as the model, not beside one";
+        return false;
+      }
+      for (const auto& b : out->header.at("bundled")) {
+        Bundled one;
+        one.role = role_of(b.at("role").get<std::string>());
+        one.c.header = b.at("header");
+        if (!one.c.header.is_object() || one.c.header.contains("bundled") || one.c.header.contains("companions")) {
+          *err = path + ": a bundled file's header is not one file's";
+          return false;
+        }
+        one.c.arch = one.c.header.value("arch", "");
+        if (b.contains("directory_config")) one.c.directory_config = b.at("directory_config");  // a drafter directory's
+        if (!read_tensors(b.at("tensors"), &one.c)) return false;
+        bundled->push_back(std::move(one));
+      }
+      out->header.erase("bundled");
+    }
 
     if (out->header.contains("blobs"))
       for (auto it = out->header["blobs"].begin(); it != out->header["blobs"].end(); ++it) {
