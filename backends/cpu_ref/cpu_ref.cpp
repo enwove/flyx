@@ -21,6 +21,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -53,6 +54,8 @@ struct RefModel {
   std::unordered_set<const flyx_tensor_view*> q8;    // ... or, in every pass, as 8-bit integers with a scale per
                                                          // 32 values (FLYX_ACT_Q8)
   std::unordered_set<const flyx_tensor_view*> a4;    // NVFP4 weights whose inputs are NVFP4 in those passes
+  std::unordered_set<const flyx_tensor_view*> amxfp8;  // MXFP4 weights whose inputs are MXFP8 (FLYX_ACT_MXFP8)
+  std::unordered_set<const flyx_tensor_view*> amxfp8_q8;  // ... MXFP8 in passes of more rows, 8 bits in rounds
   mutable std::unordered_map<int, Vec> cache;
   int dflash = -1;  // the tapped drafter's block (DFlash2's, DSpine's or EAGLE-4's), -1: none
   int dspark = -1;  // the DSpark drafter block, -1: none
@@ -111,6 +114,9 @@ double residual_add(const RefModel* M, int rows, double x, double y) {
 void lin(const RefModel* M, int wi, const double* x, int rows, int K, int N, double* y, int gemm_rows) {
   const flyx_tensor_view* w = M->w(wi);
   if (M->q8.count(w)) flyx::ops::linear_a8(x, rows, K, w, N, y);
+  else if (M->amxfp8.count(w)) flyx::ops::linear_amxfp8(x, rows, K, w, N, y);
+  else if (M->amxfp8_q8.count(w) && gemm_rows > FLYX_MAX_ROWS) flyx::ops::linear_amxfp8(x, rows, K, w, N, y);
+  else if (M->amxfp8_q8.count(w)) flyx::ops::linear_a8(x, rows, K, w, N, y);
   else if (gemm_rows > FLYX_MAX_ROWS && M->a4.count(w)) flyx::ops::linear_a4(x, rows, K, w, N, y);
   else if (M->a16h.count(w)) flyx::ops::linear_a16h(x, rows, K, w, N, y);
   else if (M->a16.count(w)) flyx::ops::linear_a16(x, rows, K, w, N, y);
@@ -127,6 +133,9 @@ void lin_expert(const RefModel* M, int wi, int e, const double* x, int K, int N,
   slice.data = static_cast<const double*>(w->data) + size_t(e) * size_t(N) * size_t(K);
   slice.nbytes = uint64_t(N) * uint64_t(K) * sizeof(double);
   if (M->q8.count(w)) flyx::ops::linear_a8(x, 1, K, &slice, N, y);
+  else if (M->amxfp8.count(w)) flyx::ops::linear_amxfp8(x, 1, K, &slice, N, y);
+  else if (M->amxfp8_q8.count(w) && gemm_rows > FLYX_MAX_ROWS) flyx::ops::linear_amxfp8(x, 1, K, &slice, N, y);
+  else if (M->amxfp8_q8.count(w)) flyx::ops::linear_a8(x, 1, K, &slice, N, y);
   else if (gemm_rows > FLYX_MAX_ROWS && M->a4.count(w)) flyx::ops::linear_a4(x, 1, K, &slice, N, y);
   else if (M->a16h.count(w)) flyx::ops::linear_a16h(x, 1, K, &slice, N, y);
   else if (M->a16.count(w)) flyx::ops::linear_a16(x, 1, K, &slice, N, y);
@@ -168,6 +177,29 @@ bool has_mrope(const flyx_attn_block& B) {
 void prep_head(const RefModel* M, const flyx_attn_block& B, const flyx_norm& n, const double* x, int pos,
                double* y, const int32_t* pos_3d = nullptr) {
   const double* w = n.w < 0 ? nullptr : M->vec(n.w).data();
+  if (B.rope.kind == FLYX_ROPE_YARN) {  // YaRN's factors, then q and k each scaled by its mscale (ops/rope/ref.h)
+    if (B.rot_dim != B.head_dim || has_mrope(B)) throw std::runtime_error("YaRN rotary on part of a head or 3D");
+    std::vector<double> inv(size_t(B.rot_dim / 2));
+    flyx::ops::yarn_inv_freq(B.theta, B.rot_dim, B.rope.factor, B.rope.orig_ctx, B.rope.beta_fast, B.rope.beta_slow,
+                             B.rope.truncate != 0, inv.data());
+    if (w) flyx::ops::rmsnorm(x, w, B.head_dim, n.eps, n.offset, y);
+    else if (y != x) std::copy(x, x + B.head_dim, y);
+    flyx::ops::rope_with(y, pos, inv.data(), B.rot_dim);
+    const double ms = flyx::ops::yarn_mscale(B.rope.factor);
+    for (int i = 0; i < B.head_dim; ++i) y[i] *= ms;
+    return;
+  }
+  if (B.rope.kind == FLYX_ROPE_PROPORTIONAL) {  // the whole head's halves, pairs past rot_dim / 2 not turned
+    if (has_mrope(B) || B.rot_dim > B.head_dim || B.rot_dim % 2) throw std::runtime_error("proportional rotary: 3D or "
+                                                                                          "more dims than the head's");
+    std::vector<double> inv(size_t(B.head_dim / 2));
+    flyx::ops::proportional_inv_freq(B.theta, B.head_dim, B.rot_dim, inv.data());
+    if (w) flyx::ops::rmsnorm(x, w, B.head_dim, n.eps, n.offset, y);
+    else if (y != x) std::copy(x, x + B.head_dim, y);
+    flyx::ops::rope_with(y, pos, inv.data(), B.head_dim);
+    return;
+  }
+  if (B.rope.kind != FLYX_ROPE_PLAIN) throw std::runtime_error("unknown rotary scaling");
   if (pos_3d && has_mrope(B)) {
     flyx::ops::prep_head_3d(x, w, B.head_dim, n.eps, n.offset, pos_3d[0], pos_3d[1], pos_3d[2], B.theta, B.rot_dim,
                             B.mrope_section, B.mrope_interleaved != 0, y);
@@ -228,6 +260,7 @@ struct RefSeq {
   std::unordered_map<int, const float*> embed_override;
   const int32_t* pos_3d = nullptr;
   Vec x, feats;
+  Vec pli;  // ABI 58: the pass's per-layer inputs (FLYX_BLOCK_PER_LAYER_INPUT), rows x layers x dim
   // Pass-local depth-residual and looped-pass scratch (ABI 45).
   std::vector<Vec> res_bank, prelude_blocks, loop_bank;
   Vec prelude_cur, loop_bank_out, loop_msg;
@@ -277,9 +310,33 @@ void embed_rows(RefSeq* s, const flyx_embed_block& e, const int32_t* ids, int n,
       for (int c = 0; c < H; ++c)
         row[c] = residual16 ? flyx::ops::round_bf16(double(ov->second[c])) : double(ov->second[c]);
     } else {
-      for (int c = 0; c < H; ++c) row[c] = load(E, size_t(ids[r]) * H + c);
+      const double scale = e.scale > 0.f ? double(e.scale) : 1.0;
+      for (int c = 0; c < H; ++c) row[c] = load(E, size_t(ids[r]) * H + c) * scale;
       if (e.has_norm) norm(s->m, e.norm, row, H, row);
     }
+  }
+}
+
+// Every layer's input of its own (ABI 58, Gemma 4's E2B / E4B): pli[r] = (norm(proj(x[r]) * proj_scale)
+// + table[token[r]] * table_scale) * mix, each layer's dim-wide slice normed alone.
+void per_layer_inputs(RefSeq* s, const flyx_per_layer_input_block& B) {
+  const auto* M = s->m;
+  const int H = B.hidden, P = B.dim, W = B.layers * B.dim;
+  const auto* T = M->w(B.table);
+  s->pli.assign(size_t(s->rows) * size_t(W), 0.0);
+  Vec y(static_cast<size_t>(W));
+  for (int r = 0; r < s->rows; ++r) {
+    const int t = s->tok[size_t(r)];
+    if (t < 0 || t >= B.vocab) throw std::runtime_error("per-layer inputs: a token outside their table");
+    lin(M, B.proj, &s->x[size_t(r) * H], 1, H, W, y.data(), s->rows);
+    double* out = &s->pli[size_t(r) * size_t(W)];
+    for (int l = 0; l < B.layers; ++l) {
+      double* yl = &y[size_t(l) * P];
+      for (int k = 0; k < P; ++k) yl[k] *= double(B.proj_scale);
+      norm(M, B.norm, yl, P, yl);
+    }
+    for (int j = 0; j < W; ++j)
+      out[j] = (y[size_t(j)] + load(T, size_t(t) * W + size_t(j)) * double(B.table_scale)) * double(B.mix);
   }
 }
 
@@ -372,15 +429,34 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
   Vec h(size_t(R) * H), qg(size_t(R) * qw), k(size_t(R) * nkv * hd), v(size_t(R) * nkv * hd);
   for (int r = 0; r < R; ++r) norm(M, B.norm, &s->x[size_t(r) * H], H, &h[size_t(r) * H]);
   lin(M, B.q, h.data(), R, H, qw, qg.data(), R);
-  lin(M, B.k, h.data(), R, H, nkv * hd, k.data(), R);
-  lin(M, B.v, h.data(), R, H, nkv * hd, v.data(), R);
+  if (!B.kv_shared) lin(M, B.k, h.data(), R, H, nkv * hd, k.data(), R);
+  if (!B.kv_shared && !B.v_from_k) lin(M, B.v, h.data(), R, H, nkv * hd, v.data(), R);
   lora(M, B.lora[FLYX_LIN_Q], h.data(), R, H, qw, qg.data());  // q's and the gate's rows, the weight's layout (open)
   lora(M, B.lora[FLYX_LIN_K], h.data(), R, H, nkv * hd, k.data());
+  if (B.v_from_k) {  // v is k's projection, before k's norm and rotary (Gemma 4's attention_k_eq_v)
+    if (B.v >= 0 || B.lora[FLYX_LIN_V].rank || B.v_b >= 0) throw std::runtime_error("v from k beside a v weight");
+    v = k;
+  }
   lora(M, B.lora[FLYX_LIN_V], h.data(), R, H, nkv * hd, v.data());
+  if (B.q_b >= 0 && B.gate) throw std::runtime_error("q biases on a gated attention block");
+  for (auto [bw, y, n] : {std::tuple{B.q_b, &qg, nh * hd}, {B.k_b, &k, nkv * hd}, {B.v_b, &v, nkv * hd}})
+    if (bw >= 0) {
+      const Vec& b = M->vec(bw);
+      for (int r = 0; r < R; ++r)
+        for (int c = 0; c < n; ++c) (*y)[size_t(r) * n + c] += b[size_t(c)];
+    }
+  if (B.v_norm)  // each head's v RMS-normed without a weight, at k_norm's eps
+    for (int r = 0; r < R; ++r)
+      for (int j = 0; j < nkv; ++j) {
+        double* vh = &v[(size_t(r) * nkv + j) * hd];
+        flyx::ops::rmsnorm(vh, nullptr, hd, B.k_norm.eps, 0.0, vh);
+      }
+  const double scale = B.scale > 0.f ? double(B.scale) : 1.0 / std::sqrt(double(hd));
+  const double* sinks = B.sinks >= 0 ? M->vec(B.sinks).data() : nullptr;
   Vec& KC = s->K[size_t(B.kv)][0];
   Vec& VC = s->V[size_t(B.kv)][0];
   Vec tmp(hd);
-  for (int r = 0; r < R; ++r) {
+  for (int r = 0; r < R && !B.kv_shared; ++r) {  // another block's K/V: that one writes it
     int pos = s->start + r;
     const int32_t* p3 = s->pos_3d ? s->pos_3d + size_t(r) * 3 : nullptr;
     const int rope_pos = pos + (has_mrope(B) ? s->rope_delta : 0);
@@ -397,8 +473,13 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
     const int rope_pos = pos + (has_mrope(B) ? s->rope_delta : 0);
     for (int hh = 0; hh < nh; ++hh) {
       prep_head(M, B, B.q_norm, &qg[size_t(r) * qw + q_at(B, hh)], rope_pos, q.data(), p3);
-      attend(q.data(), KC.data(), VC.data(), pos + 1, nkv, hd, hh / (nh / nkv), 1.0 / std::sqrt(double(hd)),
-             &o[size_t(hh) * hd]);
+      const int from = B.window > 0 ? std::max(0, pos + 1 - B.window) : 0;  // a sliding window's first position
+      if (sinks)
+        attend_range_sink(q.data(), KC.data(), VC.data(), from, pos + 1, nkv, hd, hh / (nh / nkv), scale, sinks[hh],
+                          &o[size_t(hh) * hd]);
+      else
+        attend_range(q.data(), KC.data(), VC.data(), from, pos + 1, nkv, hd, hh / (nh / nkv), scale,
+                     &o[size_t(hh) * hd]);
     }
     if (B.gate)
       for (int hh = 0; hh < nh; ++hh) {
@@ -407,14 +488,33 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
       }
     lin(M, B.o, o.data(), 1, nh * hd, H, y.data(), R);
     lora(M, B.lora[FLYX_LIN_O], o.data(), 1, nh * hd, H, y.data());
+    if (B.o_b >= 0)
+      for (int c = 0; c < H; ++c) y[c] += M->vec(B.o_b)[size_t(c)];
+    if (B.has_post_norm) norm(M, B.post_norm, y.data(), H, y.data());
     for (int c = 0; c < H; ++c) s->x[size_t(r) * H + c] = residual_add(M, R, s->x[size_t(r) * H + c], y[c]);
   }
 }
 
-// x += down(silu(gate(h)) * up(h)), h = norm(x), for R rows of x.
-void mlp(const RefModel* M, const flyx_mlp_block& B, double* x, int R) {
+// x += down(act(gate(h)) * up(h)), h = norm(x), for R rows of x; then, with a per-layer stage, x += per_layer_norm(
+// per_layer_proj(act(per_layer_gate(x)) * pli)) (pli: R rows of the pass's per-layer inputs); then x *= out_scale where
+// the block has one.
+void mlp(const RefModel* M, const flyx_mlp_block& B, double* x, int R, const Vec* pli = nullptr) {
   const int H = B.hidden, I = B.inter;
   Vec h(H), g(I), u(I), y(H);
+  auto act = [&](double v) {
+    if (B.act == FLYX_MLP_GELU_TANH) return flyx::ops::gelu_tanh(v);
+    if (B.act == FLYX_MLP_SILU) return silu(v);
+    throw std::runtime_error("unknown MLP activation");
+  };
+  int P = 0, W = 0;
+  if (B.has_per_layer) {
+    const auto& q = M->block(B.per_layer_input).per_layer_input;
+    P = q.dim;
+    W = q.layers * q.dim;
+    if (!pli || pli->size() < size_t(R) * size_t(W) || B.per_layer_index < 0 || B.per_layer_index >= q.layers)
+      throw std::runtime_error("an MLP block's per-layer stage without the pass's per-layer inputs");
+  }
+  Vec pg(static_cast<size_t>(P));
   for (int r = 0; r < R; ++r) {
     double* xr = &x[size_t(r) * H];
     norm(M, B.norm, xr, H, h.data());
@@ -422,13 +522,26 @@ void mlp(const RefModel* M, const flyx_mlp_block& B, double* x, int R) {
     lin(M, B.up, h.data(), 1, H, I, u.data(), R);
     lora(M, B.lora[0], h.data(), 1, H, I, g.data());
     lora(M, B.lora[1], h.data(), 1, H, I, u.data());
-    for (int i = 0; i < I; ++i) g[i] = silu(g[i]) * u[i];
+    for (int i = 0; i < I; ++i) g[i] = act(g[i]) * u[i];
     // NVFP4 inputs in a pass: the engine's gate|up GEMM leaves its SwiGLU rows in bf16 (as vLLM's and SGLang's)
     if (R > FLYX_MAX_ROWS && M->a4.count(M->w(B.down)))
       for (int i = 0; i < I; ++i) g[i] = flyx::ops::round_bf16(g[i]);
     lin(M, B.down, g.data(), 1, I, H, y.data(), R);
     lora(M, B.lora[2], g.data(), 1, I, H, y.data());
+    if (B.has_post_norm) norm(M, B.post_norm, y.data(), H, y.data());
     for (int c = 0; c < H; ++c) xr[c] = residual_add(M, R, xr[c], y[c]);
+    if (B.has_per_layer) {
+      const double* pr = &(*pli)[size_t(r) * size_t(W) + size_t(B.per_layer_index) * size_t(P)];
+      lin(M, B.per_layer_gate, xr, 1, H, P, pg.data(), R);
+      for (int k = 0; k < P; ++k) pg[size_t(k)] = act(pg[size_t(k)]) * pr[k];
+      lin(M, B.per_layer_proj, pg.data(), 1, P, H, y.data(), R);
+      norm(M, B.per_layer_norm, y.data(), H, y.data());
+      for (int c = 0; c < H; ++c) xr[c] = residual_add(M, R, xr[c], y[c]);
+    }
+    if (B.has_out_scale) {
+      const double sc = M->vec(B.out_scale)[0];
+      for (int c = 0; c < H; ++c) xr[c] = residual_add(M, R, xr[c] * sc, 0.0);
+    }
   }
 }
 
@@ -610,8 +723,31 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
   for (int r = 0; r < R; ++r)
     norm(M, B.norm, cur.data() + size_t(r) * size_t(H), H, h.data() + size_t(r) * size_t(H));
   Vec r_logits(size_t(R) * size_t(E));
-  lin(M, B.router, h.data(), R, H, E, r_logits.data(), R);
+  if (B.has_router_norm) {  // the router's own input: router_norm(x) * router_in * router_mul (Gemma 4's)
+    Vec ri(size_t(R) * size_t(H));
+    const double* w = B.router_norm.w >= 0 ? M->vec(B.router_norm.w).data() : nullptr;
+    const double* in = B.router_in >= 0 ? M->vec(B.router_in).data() : nullptr;
+    const double mul = B.router_mul != 0.f ? double(B.router_mul) : 1.0;
+    for (int r = 0; r < R; ++r) {
+      double* y = ri.data() + size_t(r) * size_t(H);
+      flyx::ops::rmsnorm(cur.data() + size_t(r) * size_t(H), w, H, B.router_norm.eps, B.router_norm.offset, y);
+      for (int c = 0; c < H; ++c) y[c] *= (in ? in[c] : 1.0) * mul;
+    }
+    lin(M, B.router, ri.data(), R, H, E, r_logits.data(), R);
+  } else {
+    lin(M, B.router, h.data(), R, H, E, r_logits.data(), R);
+  }
+  if (B.router_logit_b >= 0)
+    for (int r = 0; r < R; ++r)
+      for (int e = 0; e < E; ++e) r_logits[size_t(r) * size_t(E) + size_t(e)] += M->vec(B.router_logit_b)[size_t(e)];
   const double* r_bias = B.router_bias >= 0 ? M->vec(B.router_bias).data() : nullptr;
+  if ((B.gate_up >= 0) == (B.gate >= 0) || (B.gate >= 0) != (B.up >= 0))
+    throw std::runtime_error("an MoE block names its gate and up fused or apart, one way");
+  if (B.act == FLYX_MOE_SITU ? !(B.situ_beta > 0.f)
+                              : B.act != FLYX_MOE_SWIGLU && B.act != FLYX_MOE_SWIGLU_OAI && B.act != FLYX_MOE_GELU_TANH)
+    throw std::runtime_error("an MoE block's activation out of range");
+  // an expert's bias row (b [E, n]), none where the block names none
+  auto bias = [&](int bw, int e, int n) { return bw >= 0 ? M->vec(bw).data() + size_t(e) * size_t(n) : nullptr; };
 
   Vec moe_raw(size_t(R) * size_t(H), 0.0);
   Vec gu(static_cast<size_t>(2 * I)), act(static_cast<size_t>(I)), down_out(static_cast<size_t>(H));
@@ -620,14 +756,31 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
   for (int r = 0; r < R; ++r) {
     moe_route(&r_logits[size_t(r) * size_t(E)], r_bias, E, K, B.gating != 0, B.norm_weights != 0, B.norm_eps,
               B.route_scale, eidx.data(), ew.data());
+    if (B.has_expert_scale)  // each routed weight times its expert's scale, after the normalization
+      for (int k = 0; k < K; ++k) ew[size_t(k)] *= M->vec(B.expert_scale)[size_t(eidx[size_t(k)])];
     double* dst = &moe_raw[size_t(r) * size_t(H)];
     const double* hr = &h[size_t(r) * size_t(H)];
     for (int k = 0; k < K; ++k) {
-      lin_expert(M, B.gate_up, eidx[size_t(k)], hr, H, 2 * I, gu.data(), R);
-      for (int i = 0; i < I; ++i)
-        act[size_t(i)] = B.situ_beta > 0.f ? situ(gu[size_t(i)], gu[size_t(I + i)], B.situ_beta, B.situ_linear_beta)
-                                           : silu(gu[size_t(i)]) * gu[size_t(I + i)];
-      lin_expert(M, B.down, eidx[size_t(k)], act.data(), I, H, down_out.data(), R);
+      const int e = eidx[size_t(k)];
+      if (B.gate_up >= 0) {
+        lin_expert(M, B.gate_up, e, hr, H, 2 * I, gu.data(), R);
+      } else {
+        lin_expert(M, B.gate, e, hr, H, I, gu.data(), R);
+        lin_expert(M, B.up, e, hr, H, I, gu.data() + I, R);
+      }
+      for (auto [b, off] : {std::pair{bias(B.gate_b, e, I), 0}, {bias(B.up_b, e, I), I}})
+        if (b)
+          for (int i = 0; i < I; ++i) gu[size_t(off + i)] += b[i];
+      for (int i = 0; i < I; ++i) {
+        const double g = gu[size_t(i)], u = gu[size_t(I + i)];
+        act[size_t(i)] = B.act == FLYX_MOE_SITU         ? situ(g, u, B.situ_beta, B.situ_linear_beta)
+                         : B.act == FLYX_MOE_SWIGLU_OAI ? swiglu_oai(g, u, B.act_alpha, B.act_limit)
+                         : B.act == FLYX_MOE_GELU_TANH  ? flyx::ops::gelu_tanh(g) * u
+                                                        : silu(g) * u;
+      }
+      lin_expert(M, B.down, e, act.data(), I, H, down_out.data(), R);
+      if (const double* b = bias(B.down_b, e, H))
+        for (int c = 0; c < H; ++c) down_out[size_t(c)] += b[c];
       const double w = ew[size_t(k)];
       for (int c = 0; c < H; ++c) dst[c] += w * down_out[size_t(c)];
     }
@@ -638,6 +791,35 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
                         &moe_out);
   } else {
     moe_out = std::move(moe_raw);
+  }
+  if (B.has_post_norm)
+    for (int r = 0; r < R; ++r) norm(M, B.post_norm, &moe_out[size_t(r) * H], H, &moe_out[size_t(r) * H]);
+  if (B.has_shared) {  // the MLP beside the experts, on the same rows: its own norms, its output added to theirs
+    const flyx_mlp_block& F = M->block(B.shared).mlp;
+    if (F.hidden != H || F.act != FLYX_MLP_GELU_TANH && F.act != FLYX_MLP_SILU)
+      throw std::runtime_error("an MoE block's MLP beside its experts of another width or activation");
+    const int Is = F.inter;
+    Vec hs(H), g(Is), u(Is), y(H);
+    for (int r = 0; r < R; ++r) {
+      norm(M, F.norm, cur.data() + size_t(r) * size_t(H), H, hs.data());
+      lin(M, F.gate, hs.data(), 1, H, Is, g.data(), R);
+      lin(M, F.up, hs.data(), 1, H, Is, u.data(), R);
+      for (int i = 0; i < Is; ++i)
+        g[size_t(i)] = (F.act == FLYX_MLP_GELU_TANH ? flyx::ops::gelu_tanh(g[size_t(i)]) : silu(g[size_t(i)])) *
+                       u[size_t(i)];
+      lin(M, F.down, g.data(), 1, Is, H, y.data(), R);
+      if (F.has_post_norm) norm(M, F.post_norm, y.data(), H, y.data());
+      for (int c = 0; c < H; ++c) moe_out[size_t(r) * H + c] += y[size_t(c)];
+    }
+  }
+  if (B.has_out_norm) {  // x = (x + out_norm(the sum)) * out_scale
+    const double sc = B.out_scale >= 0 ? M->vec(B.out_scale)[0] : 1.0;
+    Vec y(H);
+    for (int r = 0; r < R; ++r) {
+      norm(M, B.out_norm, &moe_out[size_t(r) * H], H, y.data());
+      for (int c = 0; c < H; ++c) s->x[size_t(r) * H + c] = (ffn_inp[size_t(r) * H + c] + y[size_t(c)]) * sc;
+    }
+    return;
   }
   for (size_t i = 0; i < s->x.size(); ++i) s->x[i] = ffn_inp[i] + moe_out[i];
 }
@@ -1320,6 +1502,126 @@ void eagle4_context(RefSeq* s, const flyx_eagle4_block& B, int rows) {
   for (int r = 0; r < rows; ++r) std::copy_n(&hs[size_t(r) * H], H, &s->hidden_at[size_t(base + r) * H]);
 }
 
+// ---- Gemma 4's assistant (flyx_gemma4_mtp_block) -------------------------------
+
+// One of its layers' attention on its row x, the query at position p: q only, over the target's K/V before p (a
+// sliding layer's from p - window + 1); x += post_norm(o(...)).
+void gemma4_mtp_attention(RefSeq* s, const flyx_attn_block& B, double* x, int p) {
+  const auto* M = s->m;
+  const int H = B.hidden, nh = B.n_heads, nkv = B.n_kv, hd = B.head_dim;
+  Vec h(H), qa(size_t(nh) * hd), q(hd), o(size_t(nh) * hd), y(H);
+  norm(M, B.norm, x, H, h.data());
+  lin(M, B.q, h.data(), 1, H, nh * hd, qa.data(), 1);
+  const double scale = B.scale > 0.f ? double(B.scale) : 1.0 / std::sqrt(double(hd));
+  const Vec& KC = s->K[size_t(B.kv)][0];
+  const Vec& VC = s->V[size_t(B.kv)][0];
+  const int from = B.window > 0 ? std::max(0, p + 1 - B.window) : 0;
+  for (int hh = 0; hh < nh; ++hh) {
+    prep_head(M, B, B.q_norm, &qa[size_t(hh) * hd], p, q.data(), nullptr);
+    attend_range(q.data(), KC.data(), VC.data(), from, p, nkv, hd, hh / (nh / nkv), scale, &o[size_t(hh) * hd]);
+  }
+  lin(M, B.o, o.data(), 1, nh * hd, H, y.data(), 1);
+  if (B.has_post_norm) norm(M, B.post_norm, y.data(), H, y.data());
+  for (int c = 0; c < H; ++c) x[c] += y[c];
+}
+
+// Element i of an integer tensor (its token order: int32 or int64).
+int32_t token_at(const flyx_tensor_view* t, size_t i) {
+  const auto* p = static_cast<const uint8_t*>(t->data);
+  if (t->dtype == FLYX_DT_I32) {
+    int32_t v;
+    std::memcpy(&v, p + 4 * i, 4);
+    return v;
+  }
+  if (t->dtype != FLYX_DT_I64) throw std::runtime_error("gemma4_mtp: its token order is not int32 or int64");
+  int64_t v;
+  std::memcpy(&v, p + 8 * i, 8);
+  return int32_t(v);
+}
+
+// Drafts `width` tokens from the anchor at position p, a step each (backend_abi.h): step 1 from the target's
+// final-normed hidden at p - 1, step i from the step before's h' and draft.
+void gemma4_mtp_draft(RefSeq* s, const flyx_gemma4_mtp_block& B, int width) {
+  const auto* M = s->m;
+  const auto& e = M->block(B.embed).embed;
+  const auto& head = M->block(B.head).head;
+  const int H = B.hidden, Ht = B.target_hidden, V = B.vocab, p = s->position;
+  const auto* E = M->w(e.table);
+  const double escale = e.scale > 0.f ? double(e.scale) : 1.0;
+  Vec h(s->hidden_at.begin() + size_t(p - 1) * Ht, s->hidden_at.begin() + size_t(p) * Ht);
+  Vec cat(2 * size_t(Ht)), x(H), g(H);
+  const int per = B.centroids >= 0 ? V / B.n_centroids : 0;
+  const int C = B.centroids >= 0 ? B.top_k * per : V;  // the tokens scored
+  const size_t n_clusters = B.centroids >= 0 ? size_t(B.top_k) : 0;
+  Vec cscore(B.centroids >= 0 ? size_t(B.n_centroids) : 0), score(static_cast<size_t>(C)), cval(n_clusters);
+  std::vector<int32_t> ids(static_cast<size_t>(C)), clusters(n_clusters);
+  int tok = s->anchor;
+  s->drafts.assign(width, 0);
+  for (int i = 0; i < width; ++i) {
+    for (int c = 0; c < Ht; ++c) cat[size_t(c)] = load(E, size_t(tok) * Ht + c) * escale;
+    std::copy(h.begin(), h.end(), cat.begin() + Ht);
+    lin(M, B.pre_proj, cat.data(), 1, 2 * Ht, H, x.data(), 1);
+    for (int l = 0; l < B.layers; ++l) {
+      gemma4_mtp_attention(s, M->block(B.first_layer + 2 * l).attn, x.data(), p);
+      mlp(M, M->block(B.first_layer + 2 * l + 1).mlp, x.data(), 1);
+    }
+    norm(M, head.norm, x.data(), H, g.data());
+    lin(M, B.post_proj, g.data(), 1, H, Ht, h.data(), 1);
+    // its candidates: every token, or the tokens of its top_k clusters (the higher score, the lower index on ties),
+    // each scored exactly by the head
+    if (B.centroids >= 0) {
+      linear(g.data(), 1, H, M->w(B.centroids), B.n_centroids, cscore.data());
+      topk(cscore.data(), B.n_centroids, B.top_k, clusters.data(), cval.data());
+      const auto* order = M->w(B.token_order);
+      for (int c = 0; c < B.top_k; ++c)
+        for (int j = 0; j < per; ++j)
+          ids[size_t(c) * per + j] = token_at(order, size_t(clusters[size_t(c)]) * per + j);
+    } else {
+      for (int t = 0; t < V; ++t) ids[size_t(t)] = t;
+    }
+    const auto* W = M->w(head.w);
+    for (int c = 0; c < C; ++c) {
+      double l = 0;
+      for (int k = 0; k < H; ++k) l += load(W, size_t(ids[size_t(c)]) * H + k) * g[size_t(k)];
+      score[size_t(c)] = l;
+    }
+    // the draft as ops::draft_choice takes it over the best kMtpCands (the higher score, the lower id on ties), as
+    // MTP's and as the CUDA backend's
+    const int k = std::min(flyx::ops::kMtpCands, C);
+    std::vector<int> order(static_cast<size_t>(C));
+    for (int c = 0; c < C; ++c) order[size_t(c)] = c;
+    auto key = [&](int c) { return score[size_t(c)] != score[size_t(c)] ? -INFINITY : score[size_t(c)]; };
+    std::partial_sort(order.begin(), order.begin() + k, order.end(), [&](int a, int b) {
+      return key(a) != key(b) ? key(a) > key(b) : ids[size_t(a)] < ids[size_t(b)];
+    });
+    int32_t cand[flyx::ops::kMtpCands], count[flyx::ops::kMtpCands];
+    float fval[flyx::ops::kMtpCands];
+    const bool pen = penalized(s->gen);
+    for (int c = 0; c < k; ++c) {
+      cand[c] = ids[size_t(order[size_t(c)])];
+      fval[c] = float(score[size_t(order[size_t(c)])]);
+      count[c] = pen && !s->counts.empty() ? s->counts[size_t(cand[c])] : 0;
+      for (int j = 0; pen && j < i; ++j) count[c] += s->drafts[size_t(j)] == cand[c];
+    }
+    const flyx_gen_params& gp = s->gen;
+    int d = flyx::ops::draft_choice(cand, fval, pen ? count : nullptr, k, V, gp.temperature, gp.top_p, gp.top_k,
+                                    gp.presence_penalty, gp.frequency_penalty, gp.seed, p + 1 + i);
+    if (forced_drafts(s)) d = forced_draft(s, p + 1 + i);
+    s->drafts[i] = d;
+    tok = d;
+  }
+}
+
+// After a pass over `rows` rows from position base: each row's final-normed hidden into the ring (the assistant's
+// layers read the target's own K/V, which the pass wrote).
+void gemma4_mtp_context(RefSeq* s, const flyx_gemma4_mtp_block& B, int rows) {
+  const auto* M = s->m;
+  const auto& head = M->block(B.target_head).head;
+  const int Ht = B.target_hidden;
+  for (int r = 0; r < rows; ++r)
+    norm(M, head.norm, &s->x[size_t(r) * Ht], Ht, &s->hidden_at[size_t(s->start + r) * Ht]);
+}
+
 // ---- round bookkeeping ----------------------------------------------------------
 
 void accept(RefSeq* s, int width) {
@@ -1418,17 +1720,20 @@ const char* node_label(const flyx_node& n, const flyx_block* b, int phase) {
         case FLYX_BLOCK_MLP: return pre ? "prefill mlp" : "round mlp";
         case FLYX_BLOCK_REL_ATTN: return pre ? "prefill rel_attn" : "round rel_attn";
         case FLYX_BLOCK_MOE: return pre ? "prefill moe" : "round moe";
+        case FLYX_BLOCK_PER_LAYER_INPUT: return pre ? "prefill per-layer inputs" : "round per-layer inputs";
         case FLYX_BLOCK_HEAD: return pre ? "prefill head" : "round head";
         default: return "run";
       }
     case FLYX_NODE_DRAFT:
       if (b->kind == FLYX_BLOCK_MTP) return "draft mtp";
       if (b->kind == FLYX_BLOCK_EAGLE4) return "draft eagle4";
+      if (b->kind == FLYX_BLOCK_GEMMA4_MTP) return "draft gemma4_mtp";
       return b->kind == FLYX_BLOCK_DSPARK ? "draft dspark" : b->kind == FLYX_BLOCK_DSPINE ? "draft dspine" : "draft dflash2";
     case FLYX_NODE_CONTEXT:
       if (b->kind == FLYX_BLOCK_DV) return "context dv";
       if (b->kind == FLYX_BLOCK_MTP) return "context mtp";
       if (b->kind == FLYX_BLOCK_EAGLE4) return "context eagle4";
+      if (b->kind == FLYX_BLOCK_GEMMA4_MTP) return "context gemma4_mtp";
       return b->kind == FLYX_BLOCK_DSPARK   ? "context dspark"
              : b->kind == FLYX_BLOCK_DSPINE ? "context dspine"
                                             : "context dflash2";
@@ -1460,7 +1765,8 @@ void run_nodes(RefPlan* p, RefSeq* s) {
             break;
           case FLYX_BLOCK_GDN: gdn_mixer(s, b->gdn, p->phase == FLYX_PHASE_ROUND); break;
           case FLYX_BLOCK_ATTN: attn_mixer(s, b->attn); break;
-          case FLYX_BLOCK_MLP: mlp(M, b->mlp, s->x.data(), s->rows); break;
+          case FLYX_BLOCK_MLP: mlp(M, b->mlp, s->x.data(), s->rows, &s->pli); break;
+          case FLYX_BLOCK_PER_LAYER_INPUT: per_layer_inputs(s, b->per_layer_input); break;
           case FLYX_BLOCK_REL_ATTN: rel_attn_mixer(s, b->rel_attn, p->phase == FLYX_PHASE_ROUND); break;
           case FLYX_BLOCK_MOE: moe_ffn(s, b->moe, p->phase == FLYX_PHASE_ROUND); break;
           case FLYX_BLOCK_HEAD:
@@ -1496,6 +1802,7 @@ void run_nodes(RefPlan* p, RefSeq* s) {
       case FLYX_NODE_DRAFT:
         if (b->kind == FLYX_BLOCK_MTP) mtp_draft(s, b->mtp, n.arg0);
         else if (b->kind == FLYX_BLOCK_EAGLE4) eagle4_draft(s, b->eagle4, n.arg0);
+        else if (b->kind == FLYX_BLOCK_GEMMA4_MTP) gemma4_mtp_draft(s, b->gemma4_mtp, n.arg0);
         else if (b->kind == FLYX_BLOCK_DSPARK) dspark_draft(s, b->dspark, n.arg0);
         else if (b->kind == FLYX_BLOCK_DSPINE) dspine_block(s, b->dspine, n.arg0);
         else draft_block(s, b->dflash2, n.arg0);
@@ -1506,6 +1813,7 @@ void run_nodes(RefPlan* p, RefSeq* s) {
         if (rows == 0) break;
         if (b->kind == FLYX_BLOCK_MTP) mtp_context(s, b->mtp, rows);
         else if (b->kind == FLYX_BLOCK_EAGLE4) eagle4_context(s, b->eagle4, rows);
+        else if (b->kind == FLYX_BLOCK_GEMMA4_MTP) gemma4_mtp_context(s, b->gemma4_mtp, rows);
         else if (b->kind == FLYX_BLOCK_DSPARK) dspark_context(s, b->dspark, rows);
         else if (b->kind == FLYX_BLOCK_DSPINE) block_context(s, b->dspine, rows, slayer);
         else block_context(s, b->dflash2, rows, dlayer);
@@ -1684,10 +1992,15 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       v->data = data->data();
       v->nbytes = data->size() * sizeof(double);
       m->W.push_back(v.get());
-      if (blocks) m->a16h.insert(v.get());
-      if (nvfp4 || q_fp4) m->a16.insert(v.get());
+      const bool bf16_in = blocks && w.activations == FLYX_ACT_BF16;  // MXFP4 weights asked for bf16 inputs
+      const bool mxfp8_in = blocks && w.activations == FLYX_ACT_MXFP8;  // ... or MXFP8 ones
+      const bool mxfp8_q8_in = blocks && w.activations == FLYX_ACT_MXFP8_Q8;  // ... in prefill, 8 bits in rounds
+      if (blocks && !bf16_in && !mxfp8_in && !mxfp8_q8_in) m->a16h.insert(v.get());
+      if (nvfp4 || q_fp4 || bf16_in) m->a16.insert(v.get());
+      if (mxfp8_in) m->amxfp8.insert(v.get());
+      if (mxfp8_q8_in) m->amxfp8_q8.insert(v.get());
       if ((blocks && w.activations == FLYX_ACT_Q8) || q_q8) m->q8.insert(v.get());
-      if (nvfp4 && w.activations == FLYX_ACT_NVFP4) m->a4.insert(v.get());
+      if (nvfp4 && w.activations == FLYX_ACT_NVFP4_BF16) m->a4.insert(v.get());
       m->owned.push_back(std::move(data));
       m->owned_views.push_back(std::move(v));
     }
@@ -1695,8 +2008,17 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       const flyx_block& b = desc->blocks[i];
       const int k = b.kind;
       // DV's blocks (ABI 42) are taken and never run: such a model decodes here as without DV (lower).
-      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_EAGLE4)
+      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_PER_LAYER_INPUT)
         throw std::runtime_error("block kind " + std::to_string(k) + ": not implemented by cpu_ref");
+      if (k == FLYX_BLOCK_ATTN && b.attn.kv_shared && (b.attn.k >= 0 || b.attn.v >= 0 || b.attn.v_from_k))
+        throw std::runtime_error("an attention block reading another's K/V with a k or v projection of its own");
+      if (k == FLYX_BLOCK_GEMMA4_MTP) {
+        const auto& g = b.gemma4_mtp;
+        if (g.target_hidden != desc->hidden || g.layers < 1 ||
+            (g.centroids >= 0 && (g.n_centroids < 1 || g.vocab % g.n_centroids || g.top_k < 1 ||
+                                  g.top_k > g.n_centroids || g.token_order < 0)))
+          throw std::runtime_error("gemma4_mtp: its target's width, at least one layer, whole clusters");
+      }
       if (k == FLYX_BLOCK_VISION_STEM && b.vision_stem.cls_token >= 0)
         throw std::runtime_error("vision_stem: cls_token is not yet implemented by cpu_ref");
       // its fc_norm per tap, its taps and its own width the target's (as the CUDA backend's bind checks)
@@ -1885,7 +2207,8 @@ int lower(flyx_bmodel* bm, const flyx_program* prog, flyx_plan** out) {
       most = b.kind == FLYX_BLOCK_DFLASH2  ? std::max(b.dflash2.block, FLYX_MAX_ROWS) - 1
              : b.kind == FLYX_BLOCK_DSPARK ? b.dspark.block - 1
              : b.kind == FLYX_BLOCK_DSPINE ? b.dspine.block - 1  // the rows it was made for: no wider block
-             : b.kind == FLYX_BLOCK_MTP || b.kind == FLYX_BLOCK_EAGLE4 ? FLYX_MAX_ROWS - 1
+             : b.kind == FLYX_BLOCK_MTP || b.kind == FLYX_BLOCK_EAGLE4 || b.kind == FLYX_BLOCK_GEMMA4_MTP
+                 ? FLYX_MAX_ROWS - 1
                                            : 0;
     }
   }

@@ -1,7 +1,8 @@
 # Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 # Tuning table for NVIDIA RTX PRO 6000 Blackwell Server Edition, written by `cuda_bench tune gemm 6144x4096 4096x4096
 # 24576x4096 4096x12288` (GB/s of weights streamed in brackets): Qwen3-8B's bf16 GEMMs as the engine runs them
-# (q|k|v, attention out, mlp gate|up, mlp down), every other shape and family the RTX 5090's.
+# (q|k|v, attention out, mlp gate|up, mlp down), and, below, its Q8_0 pass rules from gpt-oss-20b; every other shape
+# and family the RTX 5090's.
 # 2026-11-25, RTX PRO 6000 Blackwell Server Edition 96 GB, 600 W, driver 620.70.06, CUDA 13.4.
 # Verified on Qwen3-8B (BF16) with DSpine at 15 drafts (docs/benchmarks.md section 6, the same answers): GSM8K 617.6 to
 # 642.6 tok/s, HumanEval 490.8 to 505.0 against the RTX 5090's table.
@@ -47,4 +48,42 @@ rules = [
   { rows = [2, 4], nt = 2, warps = 16, unroll = 8 },  # r4 1023
   { rows = [5, 8], nt = 1, warps = 16, unroll = 16 },  # r8 1040
   { rows = [9, 16], nt = 4, warps = 16, unroll = 4 },  # r16 1008
+]
+
+[rules]
+# Passes of more than 16 rows in 8 bits: the RTX 5090's rules but for Q8_0, whose are this GPU's: `cuda_bench tune
+# blocks_q8 gpt-oss-20b-MXFP4.gguf` (2026-11-27, driver 620.70.06; its q, k, v and out matrices), against the
+# defaults:
+# blocks_q8, passes of 32, 64 and 128 rows: 6809 us with these rules, 8339 with the defaults (-18.3%)
+# blocks_q8, passes of 512 rows: 4824 us with these rules, 5217 with the defaults (-7.5%)
+blocks_q8 = [
+  { types = ["Q4_1"], rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q4_1"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["Q4_1"], rows = [129, 2147483647], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q4_1"], bn = 128, qk = 64, bm = 128 },
+  { types = ["Q5_1"], rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q5_1"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["Q5_1"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["Q5_1"], bn = 128, qk = 64, bm = 128 },
+  { types = ["Q8_0"], rows = [17, 128], bn = 64, qk = 128, bm = 64 },
+  { types = ["Q8_0"], bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [17, 128], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [17, 128], n_max = 6144, bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [129, 2147483647], n_max = 64, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [129, 2147483647], n_max = 2048, bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], rows = [129, 2147483647], n_max = 65536, bn = 128, qk = 256, bm = 128 },
+  { types = ["IQ2_XXS", "IQ3_XXS", "IQ3_S", "IQ1_S"], bn = 128, qk = 64, bm = 128 },
+  { types = ["IQ2_S", "IQ1_M"], rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_S", "IQ1_M"], rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { types = ["IQ2_S", "IQ1_M"], rows = [129, 2147483647], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { types = ["IQ2_S", "IQ1_M"], rows = [129, 2147483647], n_max = 65536, bn = 128, qk = 256, bm = 128 },
+  { types = ["IQ2_S", "IQ1_M"], bn = 128, qk = 64, bm = 128 },
+  { rows = [17, 128], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { rows = [17, 128], n_max = 6144, bn = 128, qk = 256, bm = 64 },
+  { rows = [17, 128], n_max = 12288, bn = 64, qk = 128, bm = 64 },
+  { rows = [17, 128], bn = 128, qk = 256, bm = 64 },
+  { rows = [129, 2147483647], n_max = 2048, bn = 64, qk = 128, bm = 64 },
+  { bn = 128, qk = 64, bm = 128 },
 ]

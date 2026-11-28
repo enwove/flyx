@@ -100,7 +100,7 @@ FOUND = {"query": "", "family": True, "architectures": ["qwen35", "qwen3", "inkl
     {"id": "acme/Inkling-2-Mini-GGUF", "downloads": 1900000, "likes": 1200, "updated": "2026-11-20T02:15:52.000Z", "created": None,
      "pipeline": "text-generation", "gated": False, "cached": False, "architecture": "inkling2_loop", "runs": True},
     {"id": "acme/Other-9B-GGUF", "downloads": 1200, "likes": 14, "updated": "2026-02-20T02:15:52.000Z", "created": None,
-     "pipeline": "text-generation", "gated": True, "cached": False, "architecture": "gemma4", "runs": False}]}
+     "pipeline": "text-generation", "gated": True, "cached": False, "architecture": "mamba2", "runs": False}]}
 FOUND_PAGE2 = {"query": "", "family": True, "architectures": ["qwen35", "qwen3", "inkling2_loop"], "arch": None,
                "endpoint": "https://huggingface.co", "next_cursor": None, "models": [
     {"id": "acme/Page2-Model-GGUF", "downloads": 500, "likes": 9, "updated": "2026-11-01T02:15:52.000Z", "created": None,
@@ -165,7 +165,7 @@ def repository(repo_spec, helper_cached=False, mtp_read=True):
                  "size": int(0.9 * GB), "cached": False, "disk": None, "default": False},
             ] if runs else [],
             "info": {"downloads": 7383193, "likes": 6300, "updated": "2026-11-12T02:15:52.000Z", "license": "apache-2.0", "pipeline": None,
-                     "gated": False, "architecture": "qwen35" if runs else "gemma4", "context": 262144, "parameters": 27320697856},
+                     "gated": False, "architecture": "qwen35" if runs else "mamba2", "context": 262144, "parameters": 27320697856},
             "ggufs": [{"name": repo + ":" + q + rev_sfx, "quant": q, "size": int(s * GB), "split": False, "parts": 1, "complete": True, "cached": c and runs,
                        "disk": CACHE + "\\" + repo.split("/")[1].replace("-GGUF", "") + "-" + q + ".gguf" if c and runs else None}
                       for q, s, c in quants]}
@@ -828,7 +828,7 @@ def check_hub(page, server, want):
     # A repository of an architecture this build does not run is not loaded.
     view(page, "library")
     page.locator('#hf-list .prow[data-repo="acme/Other-9B-GGUF"]').click()
-    expect(page.locator("#hf-unsupported")).to_contain_text("gemma4")
+    expect(page.locator("#hf-unsupported")).to_contain_text("mamba2")
     page.locator('#mf-files .mrow[data-name$=":Q5_K_M"]').click()
     expect(page.locator("#mf-load")).to_be_disabled()
     # A dflash GGUF drafter repo is never marked unsupported and lets the user draft with its GGUF directly.

@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 55u
+#define FLYX_BACKEND_ABI_VERSION 58u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -166,13 +166,19 @@ typedef struct {
  * 0032).  models/ fills it from what the file says, so it is the same on
  * every backend and GPU; ops/ holds each rounding in float64. */
 typedef enum {
-  FLYX_ACT_FORMAT = 0,  /* the format's own: bf16 (bf16, F16, F32 and NVFP4 weights); binary16 over a row's
-                              power-of-two scale (GGML blocks) */
-  FLYX_ACT_Q8 = 1,      /* GGML blocks, every pass: 8-bit integers with a scale per 32 values (ops/dtype/ref.h:
-                              round_q8).  ABI 18: before, rounds (up to FLYX_MAX_ROWS rows) kept FORMAT */
-  FLYX_ACT_NVFP4 = 2,   /* NVFP4 weights, passes of more rows: NVFP4 as well (e2m1 values, an e4m3 scale per 16, a
-                              scale per row; ops/dtype/ref.h: round_nvfp4).  ABI 17: a backend built before would
-                              not know it and compute bf16 */
+  /* Each as PREFILL/DECODE: the inputs of passes of more than FLYX_MAX_ROWS rows / of rounds and shorter passes
+   * (--activations names them so). */
+  FLYX_ACT_FORMAT = 0,    /* the format's own in both: bf16 (bf16, F16, F32 and NVFP4 weights); binary16 over a row's
+                             power-of-two scale (GGML blocks) */
+  FLYX_ACT_Q8 = 1,        /* GGML blocks, q8/q8: 8-bit integers with a scale per 32 values (ops/dtype/ref.h:
+                             round_q8), llama.cpp's q8_1 */
+  FLYX_ACT_NVFP4_BF16 = 2,     /* NVFP4 weights, nvfp4/bf16: e2m1 values, an e4m3 scale per 16 and a scale per row
+                             (ops/dtype/ref.h: round_nvfp4), then bf16 */
+  FLYX_ACT_BF16 = 3,      /* MXFP4 weights, bf16/bf16: round_bf16 of the float32 values, the weights' values exact in
+                             bf16 as well (vLLM's MXFP4 experts, Marlin) */
+  FLYX_ACT_MXFP8 = 4,     /* MXFP4 weights, mxfp8/mxfp8: e4m3 values with a power-of-two scale per 32 (ops/dtype/ref.h:
+                             round_mxfp8) on block-scaled tensor cores (SGLang's, FlashInfer's CUTLASS kernels) */
+  FLYX_ACT_MXFP8_Q8 = 5,  /* MXFP4 weights, mxfp8/q8: FLYX_ACT_MXFP8's in prefill, FLYX_ACT_Q8's in rounds */
 } flyx_activations;
 
 /* Host memory in pieces of one size (ABI 22): bytes go piece after piece, so
@@ -315,16 +321,48 @@ typedef enum {
   FLYX_BLOCK_DSPARK_LAYER = 18, /* ABI 45: one layer of DSpark */
   FLYX_BLOCK_DSPINE = 19,       /* ABI 51: DSpine, a block drafter whose rows pass a code bridge's message on */
   FLYX_BLOCK_DSPINE_LAYER = 20, /* ABI 51: a DSpine layer: a Qwen3 layer, then its bridge's read and write */
-  FLYX_BLOCK_EAGLE4 = 21        /* ABI 55: EAGLE-4, a one-layer drafter run a step a draft from target taps */
+  FLYX_BLOCK_EAGLE4 = 21,       /* ABI 55: EAGLE-4, a one-layer drafter run a step a draft from target taps */
+  FLYX_BLOCK_GEMMA4_MTP = 22,   /* ABI 58: Gemma 4's assistant, layers that read the target's K/V, a step a draft */
+  FLYX_BLOCK_PER_LAYER_INPUT = 23 /* ABI 58: every layer's input of its own (Gemma 4's E2B / E4B) */
 } flyx_block_kind;
 
-/* Token rows -> residual rows: x = table[token], optionally followed by RMSNorm (has_norm != 0, ABI 45). */
+/* Token rows -> residual rows: x = table[token] * scale, optionally followed by RMSNorm (has_norm != 0, ABI 45). */
 typedef struct {
   int32_t hidden, vocab;
   int32_t table;                       /* [vocab, hidden] */
   int32_t has_norm;                    /* ABI 45: 1 = apply norm after lookup; 0 = none */
   flyx_norm norm;
+  float scale;                         /* ABI 58: each row times scale (Gemma's sqrt(hidden)); 0 = 1 */
+  int32_t pad0;
 } flyx_embed_block;
+
+/* ABI 58 (Gemma 4's E2B / E4B): an input of its own for every layer, from the pass's tokens and its embedded rows x
+ * (run after the embedding): pli[r] = (norm(proj(x[r]) * proj_scale) + table[token[r]] * table_scale) * mix, layers
+ * times dim values a row, each layer's dim-wide slice normed alone.  An MLP block's per-layer stage reads its slice. */
+typedef struct {
+  int32_t hidden, layers, dim, vocab;
+  int32_t table;                       /* [vocab, layers * dim] */
+  int32_t proj;                        /* [layers * dim, hidden] */
+  flyx_norm norm;                      /* [dim]: every layer's slice */
+  float table_scale, proj_scale, mix;
+  int32_t pad0;
+} flyx_per_layer_input_block;
+
+/* Rotary scaling of an attention block (ABI 56).  PLAIN: theta^(-2i / rot_dim).  YARN (Peng et al., "YaRN", 2023,
+ * as gpt-oss defines it): each pair's frequency between theta's (extrapolated) and theta's / factor (interpolated)
+ * by a linear ramp over the dims whose wavelengths fall between orig_ctx / beta_fast and orig_ctx / beta_slow
+ * rotations (rounded out to whole dims when truncate), and q and k each scaled by 0.1 ln(factor) + 1 after the
+ * rotary; rot_dim is the head's.  ops/rope/ref.h (yarn_inv_freq, yarn_mscale).  PROPORTIONAL (ABI 58, Gemma 4's
+ * global layers): the whole head's halves rotated, pair i (dims i and i + head_dim / 2) at theta^(-2i / head_dim)
+ * for i < rot_dim / 2 and not rotated past it: rot_dim dims turn, at the frequencies the whole head would give
+ * them.  ops/rope/ref.h (proportional_inv_freq). */
+typedef enum { FLYX_ROPE_PLAIN = 0, FLYX_ROPE_YARN = 1, FLYX_ROPE_PROPORTIONAL = 2 } flyx_rope_kind;
+typedef struct {
+  int32_t kind;                        /* flyx_rope_kind */
+  int32_t orig_ctx;                    /* YARN: the context the unscaled frequencies were trained for */
+  float factor, beta_fast, beta_slow;  /* YARN */
+  int32_t truncate;                    /* YARN: 1 = the ramp's ends rounded out to whole dims */
+} flyx_rope_scaling;
 
 /* x += o(attention(rope(q_norm(q)), rope(k_norm(k)), v) [* sigmoid(gate)]) with
  * q, k, v projections of norm(x); per head, causal over the sequence, keys
@@ -353,6 +391,26 @@ typedef struct {
   int32_t mrope_section[3];
   int32_t mrope_interleaved;
   int32_t lora_gate;                   /* ABI 50: flyx_gate_layout of lora[FLYX_LIN_Q]'s b rows (gate only) */
+  /* ABI 56 (gpt-oss): biases added to q, k, v and o's outputs (-1: none); sinks [n_heads]: a logit per head in the
+   * denominator of every softmax of that head, its value read by none (-1: none); window: 0, every position up to
+   * the query's, or > 0, the window positions up to it (the query's own included), its K/V state then a ring of
+   * that window (flyx_state.window); the rotary's scaling. */
+  int32_t q_b, k_b, v_b, o_b;
+  int32_t sinks;
+  int32_t window;
+  flyx_rope_scaling rope;
+  /* ABI 58 (Gemma 4): scale, q.k's scale (0: 1 / sqrt(head_dim)); v_norm 1: each head's v RMS-normed without a
+   * weight (k_norm's eps) before it is cached; v_from_k 1: v is k's projection (no v weight, v -1), taken before k's
+   * norm and rotary; has_post_norm 1: x += post_norm(o(...)) (Gemma's post-attention norm) instead of x += o(...);
+   * kv_shared 1: no k or v projection (k and v -1, k_norm none): its K/V state (kv) is another block's, which writes
+   * it, this one only reading it (Gemma 4's layers that share an earlier one's cache, its assistant's layers).  Zero,
+   * as a block built zeroed has: none of them. */
+  float scale;
+  int32_t v_norm, v_from_k;
+  int32_t has_post_norm;
+  flyx_norm post_norm;
+  int32_t kv_shared;
+  int32_t pad1;
 } flyx_attn_block;
 
 /* Gated delta net, as ops/ops.h: from h = norm(x), mixed = qkv(h) through
@@ -377,12 +435,30 @@ typedef struct {
   int32_t lora_head_order;             /* flyx_gdn_head_order */
 } flyx_gdn_block;
 
-/* x += down(silu(gate(h)) * up(h)), h = norm(x). */
+/* The activation of an MLP block's gate rows (ABI 58).  SILU: silu(gate) * up.  GELU_TANH: gelu(gate) * up, GELU's
+ * tanh approximation (Gemma's gelu_pytorch_tanh).  ops/activation/ref.h. */
+typedef enum { FLYX_MLP_SILU = 0, FLYX_MLP_GELU_TANH = 1 } flyx_mlp_act;
+
+/* x += down(act(gate(h)) * up(h)), h = norm(x). */
 typedef struct {
   int32_t hidden, inter;
   flyx_norm norm;
   int32_t gate, up, down;
   flyx_lora lora[3];                   /* ABI 43: on gate, up and down, as an attention block's */
+  /* ABI 58 (Gemma 4): act (flyx_mlp_act); has_post_norm 1: x += post_norm(down(...)) instead of x += down(...);
+   * has_out_scale 1: then x *= out_scale ([1], Gemma's layer_scalar: the whole residual, after the add).  Zero, as a
+   * block built zeroed has: SiLU, neither. */
+  int32_t act;
+  int32_t has_post_norm;
+  flyx_norm post_norm;
+  int32_t has_out_scale, out_scale;
+  /* ABI 58 (Gemma 4's E2B / E4B): has_per_layer 1: after the residual add, before out_scale,
+   * x += per_layer_norm(per_layer_proj(act(per_layer_gate(x)) * pli[per_layer_index])), pli the pass's
+   * FLYX_BLOCK_PER_LAYER_INPUT rows (block per_layer_input), act this block's. */
+  int32_t has_per_layer, per_layer_input, per_layer_index;
+  int32_t per_layer_gate, per_layer_proj; /* [dim, hidden], [hidden, dim] */
+  int32_t pad1;
+  flyx_norm per_layer_norm;
 } flyx_mlp_block;
 
 /* logits = w(norm(x)), optional softcapping (cap * tanh(logit / cap) when softcap > 0, ABI 45),
@@ -531,6 +607,29 @@ typedef struct {
   int32_t ring;                        /* state (width hidden): h per position */
   int32_t float_weights;               /* beside a float target: AUTO lets the backend choose, or request Q8 / NVFP4 */
 } flyx_eagle4_block;
+
+/* Gemma 4's assistant (multi-token prediction, ABI 58; transformers' Gemma4AssistantForCausalLM): `layers` Gemma 4
+ * layers of its own width (FLYX_BLOCK_ATTN, kv_shared: q only, reading the K/V of the target's last layer of its kind,
+ * sliding or global; FLYX_BLOCK_MLP), run a step a draft from (h, the token t), at the anchor's position p every
+ * step: each step reads the target's K/V before p (a sliding layer's from p - window + 1), and writes none.
+ *   x = pre_proj [embed(t) | h]         (embed: the target's table and scale; h target_hidden wide)
+ *   the layers; g = head.norm(x); h' = post_proj g: the next step's h
+ *   the draft: the best of head.w[t] . g over every token (centroids -1), or over the tokens of the top_k clusters
+ *   by centroids g (token_order: each cluster's vocab / n_centroids tokens in turn)
+ * Step 1 takes the target's final-normed hidden at p - 1 (its ring) and the anchor; step i the step before's h' and
+ * draft.  Its context keeps the target's final-normed hidden a position.  Only drafting reads it. */
+typedef struct {
+  int32_t hidden, target_hidden, vocab;
+  int32_t embed;                       /* block: the target's embedding (its table and scale) */
+  int32_t pre_proj, post_proj;         /* [hidden, 2 target_hidden], [target_hidden, hidden] */
+  int32_t first_layer, layers;         /* blocks first_layer + 2 i (attention) and + 2 i + 1 (MLP) for i < layers */
+  int32_t head;                        /* block: FLYX_BLOCK_HEAD, hidden wide, its own norm and table */
+  int32_t target_head;                 /* block: the target's head, whose norm its ring's rows take */
+  int32_t centroids, token_order;      /* [n_centroids, hidden], an integer [vocab]; -1: every token scored */
+  int32_t n_centroids, top_k;
+  int32_t ring;                        /* state (width target_hidden): the target's final-normed hidden a position */
+  int32_t float_weights;               /* beside a float target: AUTO lets the backend choose, or Q8 / NVFP4 */
+} flyx_gemma4_mtp_block;
 
 /* The tree DV drafts (flyx_dv_block.tree; ops/draft/ref.h). */
 typedef enum {
@@ -712,9 +811,16 @@ typedef struct {
   int32_t kv, sconv;                   /* state indices: FLYX_STATE_KV and FLYX_STATE_SHORTCONV */
 } flyx_rel_attn_block;
 
+/* An expert's activation on its gate and up rows (ABI 56).  SWIGLU: silu(gate) * up.  SITU: Inkling-2's
+ * (situ_beta, situ_linear_beta).  SWIGLU_OAI (gpt-oss): g = min(gate, act_limit), u = clamp(up, -act_limit,
+ * act_limit), (u + 1) * g * sigmoid(act_alpha * g).  GELU_TANH (ABI 58, Gemma 4): gelu_tanh(gate) * up.
+ * ops/activation/ref.h. */
+typedef enum { FLYX_MOE_SWIGLU = 0, FLYX_MOE_SITU = 1, FLYX_MOE_SWIGLU_OAI = 2, FLYX_MOE_GELU_TANH = 3 } flyx_moe_act;
+
 /* Sparse Mixture-of-Experts block (ABI 45): optional depth-residual mix and cross-pass FFN controller,
  * RMSNorm, F32 router (softmax or sigmoid + optional bias), top-k routing with optional normalization & scale,
- * 3D fused gate_up [E, 2*I, H] + SiTU (situ_beta > 0) or SwiGLU + 3D down [E, H, I], optional post-FFN shortconv. */
+ * 3D gate and up [E, I, H] (fused [E, 2*I, H], or apart, ABI 56) + the activation + 3D down [E, H, I], optional
+ * post-FFN shortconv. */
 typedef struct {
   int32_t hidden, inter, n_experts, top_k, conv;
   int32_t gating;                      /* 0 = softmax, 1 = sigmoid */
@@ -728,6 +834,33 @@ typedef struct {
   int32_t loop_rank;                   /* 0 on pass 0 */
   int32_t loop_ctrl_down, loop_ctrl_gain, loop_ctrl_forget;
   int32_t sconv, sconv_offset;         /* FLYX_STATE_SHORTCONV index and channel offset */
+  /* ABI 56 (gpt-oss): the activation (flyx_moe_act) and SWIGLU_OAI's alpha and limit; gate and up apart (gate_up
+   * -1) as two [E, I, H] weights; biases added to an expert's gate, up ([E, I]) and down ([E, H]) outputs (-1:
+   * none); router_logit_b [E] added to the router's logits before the gating (router_bias shifts the selection
+   * alone). */
+  int32_t act;
+  float act_alpha, act_limit;
+  int32_t gate, up;
+  int32_t gate_b, up_b, down_b;
+  int32_t router_logit_b;
+  /* ABI 58 (Gemma 4's 26B-A4B), each off in a block built zeroed.  has_router_norm 1: the router reads
+   * router_norm(x) (its weight -1: none) * router_in [H] (-1: none) * router_mul, not the experts' normed rows;
+   * has_expert_scale 1: the routed weights times expert_scale [E] after their normalization; has_shared 1: the MLP
+   * block `shared` (FLYX_BLOCK_MLP: its own norm before it, its post_norm after, never its out_scale) runs beside the
+   * experts on the same rows, its output added to theirs; has_post_norm 1: the experts' output normed (post_norm)
+   * before that sum; has_out_norm 1: x = (x + out_norm(the sum)) * out_scale ([1], -1: 1) in place of x += it. */
+  int32_t has_router_norm;
+  flyx_norm router_norm;
+  int32_t router_in;
+  float router_mul;
+  int32_t has_expert_scale, expert_scale;
+  int32_t has_shared, shared;
+  int32_t has_post_norm;
+  flyx_norm post_norm;
+  int32_t has_out_norm;
+  flyx_norm out_norm;
+  int32_t out_scale;
+  int32_t pad1;
 } flyx_moe_block;
 
 /* One layer of a DSpark parallel block drafter (ABI 45): per-layer context tap mix + K/V projection,
@@ -782,6 +915,8 @@ typedef struct {
     flyx_dspine_block dspine;             /* ABI 51 */
     flyx_dspine_layer_block dspine_layer; /* ABI 51 */
     flyx_eagle4_block eagle4;             /* ABI 55 */
+    flyx_gemma4_mtp_block gemma4_mtp;     /* ABI 58 */
+    flyx_per_layer_input_block per_layer_input; /* ABI 58 */
   };
 } flyx_block;
 
@@ -936,7 +1071,7 @@ typedef struct {
 typedef struct {
   char name[96];
   int32_t sm_major, sm_minor, sm_count;
-  /* Whether the backend computes NVFP4 inputs (FLYX_ACT_NVFP4) on this device (ABI 25): the engine opens a model
+  /* Whether the backend computes NVFP4 inputs (FLYX_ACT_NVFP4_BF16) on this device (ABI 25): the engine opens a model
    * whose file says NVFP4 inputs with bf16 ones where it does not. */
   int32_t fp4_inputs;
   uint64_t mem_total, mem_free;

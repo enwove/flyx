@@ -631,7 +631,19 @@ struct ChatTemplate::Impl {
     const auto& msgs = conv.msgs;
     const std::string& text = out->text;
     const size_t n = msgs.size();
-    const std::optional<size_t> end = probe_conversation_end(conv.tools, conv.opt, *out, &out->in_reasoning);
+    std::optional<size_t> end = probe_conversation_end(conv.tools, conv.opt, *out, &out->in_reasoning);
+    // Tool results whose generation prompt is not a user turn's (Gemma 4: the reply goes on in the model's turn, its
+    // thought reopened): the conversation rendered without one, where the rest is the template's own text.
+    if (!end && conv.opt.add_generation_prompt && n > 0 && msgs.back().role == "tool") {
+      RenderedChat r;
+      std::string ignored;
+      const auto& lit = out->literal;
+      if (render(conv, n, false, &r, &ignored) && text.size() > r.text.size() && text.starts_with(r.text) &&
+          !lit.empty() && lit.back().begin <= r.text.size() && lit.back().end == text.size()) {
+        end = r.text.size();
+        out->in_reasoning = chat->opens_reasoning(std::string_view(text).substr(*end));
+      }
+    }
     if (end) out->conversation_end = *end;
 
     // Branch points, where a later request is likely to continue or diverge:

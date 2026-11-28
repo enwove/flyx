@@ -52,6 +52,17 @@ void DrafterRegistry::scan(const ModelFile& file, const TargetSpec& target, cons
   for (int i = 0; i < file.companions(); ++i) {
     const json& h = hdr.at("companions").at(size_t(i));
     const std::string what = companion_label(i);
+    // the architecture's own MTP drafter (Gemma 4's assistant)
+    if (mtp && mtp->claims && in_companion(i, [&] { return mtp->claims(h); })) {
+      if (sources_.mtp) throw std::runtime_error(what + "the model has its MTP drafter already");
+      sources_.mtp = true;
+      sources_.mtp_beside = true;
+      mtp_companion_ = i;
+      continue;
+    }
+    if (h.is_object() && h.contains("draft") && h["draft"].is_object() &&
+        h["draft"].value("kind", "") == "gemma4_mtp")
+      throw std::runtime_error(what + "Gemma 4's assistant, which a " + target.arch + " model does not run");
     // llama.cpp's DSpark GGUF (its own block, beside a drafter of DFlash2's block), or a drafter of DFlash2's block
     // (a drafter file's "draft", or an arch "dflash" GGUF).  One DSpark a model, of either.
     if (is_dspark_companion(h)) {
@@ -158,6 +169,12 @@ int DrafterRegistry::attach(Drafter kind, const ModelFile& file, Tables& T, cons
                             const MtpHooks* mtp, DrafterReach* reach) {
   target_layers_ = target.layers;
   explicit_post_norm_ = target.has_post_norm_tap;
+  if (kind == Drafter::kMtp && mtp && mtp->build) {  // a step a draft, as MTP's
+    const int blk = mtp->build(mtp_companion_);
+    context_blocks_.push_back(blk);
+    *reach = {FLYX_MAX_ROWS - 1, false};
+    return blk;
+  }
   if (kind == Drafter::kMtp) {
     if (!mtp || !mtp->build_layer || !mtp->tensor_name)
       throw std::runtime_error("MTP drafter is not supported by this model architecture");

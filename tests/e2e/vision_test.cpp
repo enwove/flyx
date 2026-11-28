@@ -605,6 +605,7 @@ struct TinyVlm {
     b.attn.rot_dim = kRot;
     b.attn.gate = FLYX_GATE_NONE;
     b.attn.theta = 10000.0;
+    b.attn.q_b = b.attn.k_b = b.attn.v_b = b.attn.o_b = b.attn.sinks = -1;
     b.attn.norm = make_norm(w_anorm);
     b.attn.q_norm = make_norm(w_qn);
     b.attn.k_norm = make_norm(w_kn);
@@ -646,6 +647,7 @@ struct TinyVlm {
     b.attn.rot_dim = kRot;
     b.attn.gate = FLYX_GATE_NONE;
     b.attn.theta = 10000.0;
+    b.attn.q_b = b.attn.k_b = b.attn.v_b = b.attn.o_b = b.attn.sinks = -1;
     b.attn.norm = make_norm(w_mtp_an);
     b.attn.q_norm = make_norm(w_mtp_qn);
     b.attn.k_norm = make_norm(w_mtp_kn);

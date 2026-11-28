@@ -14,6 +14,10 @@
   LoRA adapter for them as Hugging Face PEFT saves one (peft_quant/)
 * the tiny Qwen3.5 with its matrices quantized (tiny_q8.gguf: the block types
   of 32 weights, mixed, as its matrices are 64 and 128 wide)
+* a tiny gpt-oss in MXFP4 and Q8_0 and the same in float32, with transformers' tokens for them (tiny_gpt_oss.py)
+* a tiny Gemma 4 in Q8_0 and the same in float32, with experts too (in Q8_0, float32 and GGML's NVFP4), with
+  transformers' tokens for them (tiny_gemma4.py)
+* a small tokenizer of Gemma 4's kind (SentencePiece's BPE) with tokenizers' ids (gemma4_tokenizer.py)
 """
 from __future__ import annotations
 
@@ -28,6 +32,11 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "python" / "convert"))
 from flyx_convert.fileformat import Reader, Writer
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import gemma4_tokenizer  # noqa: E402
+import tiny_gemma4  # noqa: E402
+import tiny_gpt_oss  # noqa: E402
 
 QUANTS = ("Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K",
           "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_S", "IQ1_M", "IQ4_NL", "IQ4_XS", "NVFP4")
@@ -581,6 +590,15 @@ def main(out):
     quantized_tiny(out)
     explicit_head_dim(out)
     dflash2_ggufs(out)
+    tiny_gpt_oss.write(out)
+    tiny_gpt_oss.write(out, quant=False, stem="gpt_oss_f32")
+    tiny_gemma4.write(out)
+    tiny_gemma4.write(out, quant=False, stem="gemma4_f32")
+    tiny_gemma4.write(out, stem="gemma4_moe", moe=True)
+    tiny_gemma4.write(out, quant=False, stem="gemma4_moe_f32", moe=True)
+    tiny_gemma4.write(out, stem="gemma4_moe_nvfp4", moe=True, nvfp4=nvfp4_blocks)
+    tiny_gemma4.write(out, stem="gemma4_e", e=True)
+    gemma4_tokenizer.write(out)
     print("wrote GGUF model, tokenizer and independent quantization fixtures")
 
 

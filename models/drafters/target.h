@@ -7,6 +7,8 @@
 #include <string>
 #include <utility>
 
+#include <nlohmann/json.hpp>
+
 namespace flyx::models::drafters {
 
 // Target model dimensions and block handles shared by all speculative drafters.
@@ -38,6 +40,11 @@ struct MtpHooks {
   std::function<std::string(const std::string& canonical, int companion)> tensor_name;
   // Builds the MTP layer's attention and MLP blocks in Tables and returns {attn_block, mlp_block}.
   std::function<std::pair<int, int>(int companion)> build_layer;
+  // An architecture whose MTP drafter is a block of its own (Gemma 4's assistant) sets these instead of the two
+  // above: whether a companion file's header is its drafter (throwing on one made for another model), and the drafter
+  // block built from that companion.
+  std::function<bool(const nlohmann::json& companion_header)> claims;
+  std::function<int(int companion)> build;
 };
 
 }  // namespace flyx::models::drafters

@@ -262,12 +262,7 @@ struct value_float_t : public value_t {
     virtual std::string type() const override { return "Float"; }
     virtual double as_float() const override { return val_flt; }
     virtual int64_t as_int() const override { return val_int; }
-    virtual string as_string() const override {
-        std::string out = std::to_string(val_flt);
-        out.erase(out.find_last_not_of('0') + 1, std::string::npos); // remove trailing zeros
-        if (out.back() == '.') out.push_back('0'); // leave one zero if no decimals
-        return out;
-    }
+    virtual string as_string() const override;  // flyx: Python's repr (value.cpp, README.flyx.md)
     virtual bool as_bool() const override {
         return val_flt != 0.0;
     }

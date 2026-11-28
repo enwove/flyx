@@ -25,6 +25,26 @@ void draft_head_pick(const HeadBlock& head, const float* x, int nr, int k, int* 
   }
 }
 
+// Gemma 4's clustered assistant head (E2B / E4B), a row: its centroids' logits, the tokens of its top_k best clusters
+// scored by its bf16 head, their best k (ids and logits; prob and margin over those candidates), in the pick's room.
+void cluster_head_pick(const Gemma4MtpBlock& b, const HeadBlock& head, const float* x, int k, int* idx, float* val,
+                       const DraftPickScratch& sc, const Launch& L, float* prob, float* margin) {
+  if (!head.w || head.softcap > 0.f) throw std::logic_error("cuda: a clustered assistant head not in bf16, or capped");
+  const int H = head.hidden, per = head.vocab / b.n_centroids, C = b.top_k * per;
+  float* cscore = sc.logits;              // [n_centroids]
+  float* cval = cscore + b.n_centroids;   // [top_k]
+  float* score = cval + b.top_k;          // [C]
+  int* clusters = reinterpret_cast<int*>(score + C);  // [top_k]
+  int* cand = clusters + b.top_k;         // [C]
+  int* pos = cand + C;                    // [k]
+  gemm(x, H, b.centroids, b.n_centroids, H, cscore, b.n_centroids, 1, false, L);
+  topk_rows(cscore, b.n_centroids, b.n_centroids, b.top_k, clusters, cval, 1, L.st);
+  cluster_candidates(clusters, b.top_k, b.token_order, per, cand, L.st);
+  gather_logits(head.w, H, cand, C, x, score, L.st);
+  topk_rows(score, C, C, k, pos, val, 1, L.st, sc.topv, sc.topi, sc.top_rows, prob, margin);
+  map_ids(pos, cand, k, idx, L.st);
+}
+
 bool draft_head_additive_ready(const HeadBlock& head, const Lin& extra, const SignHead& extra_coarse, int K_extra) {
   return head.coarse.bits && extra_coarse.bits && (head.wb.data || head.w) &&
          (extra.w || (extra.packed() && extra.blk.size() == 1 && K_extra % 128 == 0));
@@ -83,13 +103,14 @@ bool residual16_model(flyx_bmodel* m) {
     for (size_t i = 0; i < m->blocks.size() && ok; ++i) {
       if (drafter_parts[i]) continue;
       const Block& b = m->blocks[i];
-      if (const auto* e = std::get_if<EmbedBlock>(&b)) ok = e->table != nullptr && !e->has_norm;
+      if (const auto* e = std::get_if<EmbedBlock>(&b)) ok = e->table != nullptr && !e->has_norm && e->scale == 1.f;
       else if (const auto* g = std::get_if<GdnBlock>(&b))
         ok = g->w_in.q && g->w_out.q && g->hidden % 128 == 0 && g->v_width() % 128 == 0 && !g->lora;
       else if (const auto* a = std::get_if<AttnBlock>(&b))  // adapters (ABI 43) add float32 products: float32 rows
-        ok = a->w_in.q && a->w_out.q && a->hidden % 128 == 0 && a->nh * a->hd % 128 == 0 && !a->lora;
+        ok = a->w_in.q && a->w_out.q && a->hidden % 128 == 0 && a->nh * a->hd % 128 == 0 && !a->lora &&
+             !a->post_norm.w;
       else if (const auto* f = std::get_if<MlpBlock>(&b))
-        ok = f->w_gu.q && f->w_down.q && f->hidden % 128 == 0 && f->inter % 128 == 0 && !f->lora;
+        ok = f->w_gu.q && f->w_down.q && f->hidden % 128 == 0 && f->inter % 128 == 0 && !f->lora && f->plain();
       else if (std::holds_alternative<RelAttnBlock>(b) || std::holds_alternative<MoeBlock>(b))
         ok = false;
     }
@@ -106,39 +127,66 @@ bool residual16_pass(const Pass& ps) {
 bool residual16(const Pass& ps) { return ps.s->m->opt.fusion && residual16_pass(ps); }
 
 void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_proj, float* act, int ld_act,
-              const Launch& L, bool fused, bool add16) {
+              const Launch& L, bool fused, bool add16, float* branch, const float* pli, int ld_pli) {
   const int H = f.hidden, I = f.inter;
   const Norm& n = f.norm;
+  if (f.per_layer >= 0 && (!pli || branch || add16 || !f.post_norm.w))
+    throw std::logic_error("cuda: an MLP's per-layer stage without the pass's per-layer inputs");
+  // Gemma's: down's output into h (H wide: free past the gate|up GEMM, which the generic path's h fed), normed and
+  // added to x (norm_add), then x times its scalar; or, beside its experts, normed into branch (x read alone)
+  const bool post = f.post_norm.w != nullptr;
+  if (add16 && post) throw std::logic_error("cuda: a bf16 residual's MLP with a norm after down");
+  if (branch && (!post || add16)) throw std::logic_error("cuda: an MLP beside experts without its norm after down");
+  float* const down_y = post ? h : x;
+  auto finish = [&] {
+    if (branch) rmsnorm(h, H, f.post_norm.w, f.post_norm.offset, f.post_norm.eps, branch, H, R, H, L.st);
+    else if (post && f.per_layer < 0)
+      norm_add(x, H, h, H, f.post_norm.w, f.post_norm.offset, f.post_norm.eps, f.out_scale, R, H, L.st);
+    if (f.per_layer < 0) return;
+    // Gemma 4's E2B / E4B: down's normed output added, then its layer's input gated by the residual (into proj, free
+    // past the down GEMM), projected into h, normed and added, the layer times its scalar
+    const int P = f.per_layer_dim;
+    norm_add(x, H, h, H, f.post_norm.w, f.post_norm.offset, f.post_norm.eps, nullptr, R, H, L.st);
+    gemm(x, H, f.w_pl_gate, P, H, proj, ld_proj, R, false, L);
+    per_layer_gate(proj, ld_proj, pli + size_t(f.per_layer) * P, ld_pli, P, f.act, R, L.st);
+    gemm(proj, ld_proj, f.w_pl_proj, H, P, h, H, R, false, L);
+    norm_add(x, H, h, H, f.pl_norm.w, f.pl_norm.offset, f.pl_norm.eps, f.out_scale, R, H, L.st);
+  };
   if (fused) {
     rmsnorm_split(x, H, n.w, n.offset, n.eps, R, H, L, f.w_gu.q8_inputs());
-    // SwiGLU in the gate|up GEMM's epilogue: no float32 gate|up rows (bf16 and NVFP4 weights on both sides).
+    // The activation in the gate|up GEMM's epilogue: no float32 gate|up rows (bf16 and NVFP4 weights on both sides).
     if (R > 16 && I % 8 == 0 && !f.w_gu.packed() && !f.w_down.packed()) {
-      gemm_glu_presplit(f.w_gu, I, H, R, L);
-      gemm_on_glu(f.w_down, H, I, x, H, R, true, L);
+      Launch gu = L;
+      gu.glu_act = f.act;
+      gemm_glu_presplit(f.w_gu, I, H, R, gu);
+      gemm_on_glu(f.w_down, H, I, down_y, H, R, !post, L);
+      finish();
       return;
     }
-    // A round on block weights with 8-bit inputs on both sides: the gate|up GEMM writes the SwiGLU too, beside its own
-    // input (the bits of swiglu_split), which the down GEMM takes.
+    // A round on block weights with 8-bit inputs on both sides: the gate|up GEMM writes the activated rows too, beside
+    // its own input (the bits of swiglu_split), which the down GEMM takes.
     if (R <= 16 && f.w_gu.packed() && f.w_down.q8_inputs() &&
         gemm_blocks_round_glu_takes(f.w_gu.blk.data(), int(f.w_gu.blk.size()), R, I, L)) {
-      const RoundGlu glu{proj, ld_proj, I};
+      const RoundGlu glu{proj, ld_proj, I, f.act};
       Launch gu = L;
       gu.glu = &glu;
       gemm_presplit(f.w_gu, 2 * I, H, proj, ld_proj, R, false, gu);
       const Scratch act_q8 = glu_inputs(*L.scratch);
       Launch down = L;
       down.scratch = &act_q8;
-      gemm_presplit(f.w_down, H, I, x, H, R, true, down);
+      gemm_presplit(f.w_down, H, I, down_y, H, R, !post, down);
+      finish();
       return;
     }
     gemm_presplit(f.w_gu, 2 * I, H, proj, ld_proj, R, false, L);
-    swiglu_split(proj, ld_proj, I, R, L, f.w_down.q8_inputs());
-    gemm_presplit(f.w_down, H, I, x, H, R, true, L);
+    swiglu_split(proj, ld_proj, I, R, L, f.w_down.q8_inputs(), nullptr, {}, f.act);
+    gemm_presplit(f.w_down, H, I, down_y, H, R, !post, L);
+    finish();
     return;
   }
   rmsnorm(x, H, n.w, n.offset, n.eps, h, H, R, H, L.st);
   gemm(h, H, f.w_gu, 2 * I, H, proj, ld_proj, R, false, L);
-  swiglu(proj, ld_proj, I, act, ld_act, R, L.st);
+  swiglu(proj, ld_proj, I, act, ld_act, R, L.st, f.act);
   // The fused gate|up GEMM keeps the SwiGLU rows in bf16 (gemm_glu_staged); a down projection of NVFP4 inputs rounds
   // them from those rows (gemm_on_glu), whatever the gate|up weights are.
   if (R > 16 && I % 8 == 0 && !f.w_gu.packed() && !f.w_down.packed() && prefill_rows_bf16(L, f.w_down.q, I))
@@ -147,7 +195,8 @@ void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_
     gemm(act, ld_act, f.w_down, H, I, h, H, R, false, L);
     add_rows_bf16(x, H, h, H, H, R, L.st);
   } else {
-    gemm(act, ld_act, f.w_down, H, I, x, H, R, true, L);
+    gemm(act, ld_act, f.w_down, H, I, down_y, H, R, !post, L);
+    finish();
   }
 }
 
@@ -502,6 +551,71 @@ void eagle4_draft_tree(flyx_seq* s, const Eagle4Block& b, int width, const Launc
   eagle_tree_finish(s->etree, width, kEagleTrunk, s->drafts, s->tree, st);
 }
 
+// Gemma 4's assistant: draft step i from [embed(t) * scale | h] at the anchor's position P->position, its layers'
+// queries there reading the target's K/V before it (a sliding layer's from P->position - window + 1: the attention
+// at P->position - 1 over window - 1 keys), none written; h the ring's at P->position - 1 for the first step, the step
+// before's post_proj output (s->mg) after it.  The draft as MTP's: its head's best kMtpCands, then mtp_choose.
+void gemma4_mtp_draft(flyx_seq* s, const Gemma4MtpBlock& b, int width, const Launch& L, bool fused, int start) {
+  const auto* m = s->m;
+  const auto& E = block<EmbedBlock>(m, b.embed);
+  const auto& head = block<HeadBlock>(m, b.head);
+  const RowBufs& own = s->own;
+  const int H = b.hidden, Ht = b.target_hidden;
+  cudaStream_t st = L.st;
+  if (start == 0) build_rows(s->P, nullptr, 0, s->mtok, 1, st);  // mtok[0] = anchor
+  for (int i = start; i < width; ++i) {
+    if (E.blk.data) embed_blocks(s->mtok + i, E.blk, Ht, own.mcat, 1, st);
+    else embed(s->mtok + i, E.table, Ht, own.mcat, 1, st);
+    if (E.scale != 1.f) scale_rows(own.mcat, 2 * Ht, Ht, E.scale, 1, st);
+    pair_hidden(s->P, kPosPosition, i == 0 ? nullptr : s->mg, s->ring, Ht, own.mcat + Ht, st);
+    gemm(own.mcat, 2 * Ht, b.pre_proj, H, 2 * Ht, own.mx, H, 1, false, L);
+    for (int j = 0; j < b.layers; ++j) {
+      const auto& a = block<AttnBlock>(m, b.first_layer + 2 * j);
+      const auto& f = block<MlpBlock>(m, b.first_layer + 2 * j + 1);
+      const KvBuf& kb = s->kv[size_t(a.kv)];
+      const int nh = a.nh, hd = a.hd;
+      norm_project(own.mx, own.h, own.proj, s->ld_proj, 1, a.norm, a.w_in, a.n_in(), H, L, fused);
+      attn_prep(own.proj, s->ld_proj, 0, a.q_width(), a.q_width(), a.q_norm.w, nullptr, a.q_norm.offset,
+                a.q_norm.eps, a.theta, a.rot, nh, 0, hd, 1, s->P, kPosPosition, false, own.qbuf, KvRef{}, st, 0,
+                nullptr, 0, CanvasKeys{}, MRoPE{}, a.rope);
+      s->stage_before(kb, -1, 1, st);
+      attention(own.qbuf, kb.staged(), nh, a.nkv, hd, 1, true, 0, a.scale, s->P, nullptr, 0, own.act, nh * hd,
+                own.part, kRoundSplits, L, -1, a.window > 0 ? a.window - 1 : 0);
+      gemm(own.act, nh * hd, a.w_out, H, nh * hd, own.h, H, 1, false, L);
+      norm_add(own.mx, H, own.h, H, a.post_norm.w, a.post_norm.offset, a.post_norm.eps, nullptr, 1, H, st);
+      mlp_body(own.mx, f, 1, own.h, own.proj, s->ld_proj, own.act, s->ld_act, L, fused);
+    }
+    rmsnorm(own.mx, H, head.norm.w, head.norm.offset, head.norm.eps, own.h, H, 1, H, st);
+    gemm(own.h, H, b.post_proj, Ht, H, s->mg, Ht, 1, false, L);  // the next step's h
+    const int K = std::min(ops::kMtpCands, head.vocab);
+    if (b.n_centroids) cluster_head_pick(b, head, own.h, K, s->mcand, s->mval, pick_scratch(s), L, s->draft_prob + i,
+                                         s->draft_margin + i);
+    else draft_head_pick(head, own.h, 1, K, s->mcand, s->mval, s, L, s->draft_prob + i, s->draft_margin + i);
+    mtp_choose(s->P, s->G, s->reply.count, s->mcand, s->mval, K, head.vocab, i, s->mtok, st);
+    mtp_oracle(s->P, s->oracle, i, s->mtok, st);
+  }
+  copy_ints(s->mtok + 1 + start, s->drafts + start, width - start, st);
+}
+
+// After a pass: each row's final-normed hidden (the target's head's norm) into the ring.
+void gemma4_mtp_context(const Pass& ps, const Gemma4MtpBlock& b) {
+  const RowView& rv = ps.v;
+  auto* s = ps.s;
+  const auto& head = block<HeadBlock>(s->m, b.target_head);
+  const int H = b.target_hidden, R = ps.rows;
+  const int sel = ps.round ? kPosStart : kPosPosition;
+  cudaStream_t st = rv.L.st;
+  if (residual16(ps)) rmsnorm(x16_of(rv), H, head.norm.w, head.norm.offset, head.norm.eps, rv.b.mhn, H, R, H, st);
+  else rmsnorm(rv.b.x, H, head.norm.w, head.norm.offset, head.norm.eps, rv.b.mhn, H, R, H, st);
+  if (!ps.round && s->pass_snap > 0 && s->ring_snap) {  // as mtp_context: h[pass_snap - 1] before hring_put
+    const int snap_row = s->pass_snap - s->position;
+    const float* src = snap_row == 0 ? s->ring + size_t((s->pass_snap - 1) % kHring) * size_t(H)
+                                     : rv.b.mhn + size_t(snap_row - 1) * size_t(H);
+    CK(cudaMemcpyAsync(s->ring_snap, src, size_t(H) * sizeof(float), cudaMemcpyDeviceToDevice, st));
+  }
+  hring_put(s->P, sel, ps.round, rv.b.mhn, H, R, s->ring, H, st);
+}
+
 // After a pass: each row's h = fc([fc_norm_i(tap_i)]) into the ring, and the K/V of the positions base-1 ..
 // base+rows-2 from (h at j, token at j+1), as mtp_context.  In a round the entries past the accepted rows hold
 // rejected rows; they are rewritten (by the next draft steps or context pass) before anything attends to them.
@@ -694,7 +808,7 @@ void attn_windows(const Pass& ps, const AttnBlock& a, const KvBuf& kb, int windo
   auto* s = ps.s;
   const int R = ps.rows, nh = a.nh, nkv = a.nkv, hd = a.hd;
   cudaStream_t st = rv.L.st;
-  const float scale = 1.f / std::sqrt(float(hd));
+  const float scale = a.scale;
   const float* gate = a.gate ? rv.b.proj + nh * hd : nullptr;
   const int from = s->window_from(kb), len = s->window_len(kb), end = s->position + R;
   // A pass of a round's rows or fewer (pageable caches only: windows() gives the others none) takes a round's
@@ -713,7 +827,7 @@ void attn_windows(const Pass& ps, const AttnBlock& a, const KvBuf& kb, int windo
       sw.state = planes[launches & 1];
       sw.carry = planes[(launches + 1) & 1];
       attention_split(rv.b.qbuf, kv, nh, nkv, hd, R, true, 0, scale, s->P, gate, rv.ld_proj, out, ld_out, rv.b.part,
-                      kPrefillSplits, rv.L, 0, 0, nullptr, {}, sw);
+                      kPrefillSplits, rv.L, 0, 0, nullptr, {}, sw, a.sinks);
       sw.first = false;
       ++launches;
     };
@@ -728,6 +842,7 @@ void attn_windows(const Pass& ps, const AttnBlock& a, const KvBuf& kb, int windo
   if (!rv.b.attn_state) throw std::logic_error("cuda: prefill window state buffer missing");
   FlashWindow w;
   w.state = rv.b.attn_state;
+  w.sinks = a.sinks;
   auto run = [&](const KvRef& kv, int k_lo, int k_hi, bool last) {
     w.k_lo = k_lo;
     w.k_hi = k_hi;
@@ -863,9 +978,15 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
   const KvBuf& kb = s->kv[size_t(a.kv)];
   KvRef kv = kb.ref();
   const TreeRows* tree = tree_of(ps);
+  if (a.kv_shared) {  // Gemma 4's E2B / E4B: q alone, over the K/V its source layer wrote this pass
+    attn_prep(rv.b.proj, rv.ld_proj, 0, a.q_width(), a.q_width(), a.q_norm.w, nullptr, a.q_norm.offset, a.q_norm.eps,
+              a.theta, a.rot, nh, 0, hd, R, s->P, kPosPosition, false, rv.b.qbuf, KvRef{}, st, 0, tree, 0,
+              CanvasKeys{}, a.mrope(ps.pos_3d), a.rope);
+    kv = {};
+  }
   // Stage aligned 16-row prefill Strata writes in dead device memory (rv.b.act) and flush contiguously
   // via cudaMemcpyAsync instead of scattering 4-byte writes across PCIe into host-pinned Strata buffers.
-  const bool stage_strata =
+  const bool stage_strata = !a.kv_shared &&
       !ps.round && !tree && rv.b.act && kb.kq && kb.kq_host && kb.kq == kb.kq_host && kb.ring == 0 &&
       R >= 16 && (R & 15) == 0 && (s->position & 15) == 0;
   const bool stage_grids = kb.copy_slot >= 0;  // copy_slot < 0 keeps kqs/vqs directly on device
@@ -892,9 +1013,10 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
       kv.vqs = kb.vqs + goff;
     }
   }
-  attn_prep(rv.b.proj, rv.ld_proj, 0, a.q_width(), a.q_width() + nkv * hd, a.q_norm.w, a.k_norm.w, a.q_norm.offset,
-            a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, R, s->P, kPosPosition, false, rv.b.qbuf, kv, st, 0, tree,
-            use_stage ? s->position : 0, CanvasKeys{}, a.mrope(ps.pos_3d));
+  if (!a.kv_shared)
+    attn_prep(rv.b.proj, rv.ld_proj, 0, a.q_width(), a.v_off(), a.q_norm.w, a.k_norm.w, a.q_norm.offset,
+              a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, R, s->P, kPosPosition, false, rv.b.qbuf, kv, st, 0, tree,
+              use_stage ? s->position : 0, CanvasKeys{}, a.mrope(ps.pos_3d), a.rope, a.qkv_b, a.v_eps);
   if (use_stage) {
     const size_t woff = strata_words_at(s->position, 0, nkv, kb.words);
     CK(cudaMemcpyAsync(kb.kq + woff, stg_kq, q_words * sizeof(uint32_t), cudaMemcpyDefault, st));
@@ -904,8 +1026,9 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
       CK(cudaMemcpyAsync(kb.vqs + goff, stg_vqs, grid_cnt * sizeof(__half2), cudaMemcpyDefault, st));
     }
   }
-  // The attention writes the out projection's input itself, but not in 8 bits: for such weights it stays float32.
-  const bool split = fused && !a.w_out.q8_inputs() && !a.lora;
+  // The attention writes the out projection's input itself, but not in 8 bits: for such weights it stays float32;
+  // nor a prefill pass of a head dim without tensor-core kernels (512: its rounds' kernel, 16 rows at a time).
+  const bool split = fused && !a.w_out.q8_inputs() && !a.lora && (R <= FLYX_MAX_ROWS || attention_head_dim(hd));
   if (ps.reads_cache(kb)) {
     if (const int windows = ps.round ? 0 : s->windows(kb, R)) {
       attn_windows(ps, a, kb, windows, split ? nullptr : rv.b.act, nh * hd);
@@ -914,18 +1037,21 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
       // pass past them, where they are (0074).
       const bool direct = s->reads_direct(kb, R, ps.round);
       if (!direct) s->stage_before(kb, 0, R, st);
-      attention(rv.b.qbuf, direct ? kb.ref() : kb.staged(), nh, nkv, hd, R, true, 0, 1.f / std::sqrt(float(hd)), s->P,
+      attention(rv.b.qbuf, direct ? kb.ref() : kb.staged(), nh, nkv, hd, R, true, 0, a.scale, s->P,
                 a.gate ? rv.b.proj + nh * hd : nullptr, rv.ld_proj, split ? nullptr : rv.b.act, nh * hd, rv.b.part,
-                ps.round ? kRoundSplits : kPrefillSplits, L, 0, 0, tree);
+                ps.round ? kRoundSplits : kPrefillSplits, L, 0, a.window, tree, CanvasKeys{}, a.sinks);
       if (!direct) s->stage_after(kb, st);
     }
   }
   // A round reads the low-bit copy, a few positions the cache; about the switch, its rows replace
   // exact attention's at the switch and past it.
   if (ps.reads_copy(kb)) {
+    // the copy's attention takes none of these (alloc_state keeps such caches exact)
+    if (a.sinks || a.window || a.rope)
+      throw std::logic_error("cuda: the low-bit copy of an attention with sinks, a window or YaRN");
     const bool only = ps.reads_copy_only(kb);
     const cudaEvent_t full = only ? s->copy_before(kb, R, st, true) : nullptr;
-    const float scale = 1.f / std::sqrt(float(hd));
+    const float scale = a.scale;
     const int from = ps.strata == kStrataBoth ? s->strata_from : 0;
     if (R <= FLYX_MAX_ROWS) {
       attention_strata(rv.b.qbuf, kb.copy_read(only), s->strata, nh, nkv, hd, R, scale, s->P,
@@ -946,8 +1072,15 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
   }
   if (a.lora) lora_begin(rv, a.lora.a_out, a.lora.rank, rv.b.act, nh * hd, nh * hd, R, ldu, L);
   if (x16) {
+    if (a.o_b) throw std::logic_error("cuda: a bf16 residual's out projection with a bias");
     if (!split || !gemm_staged_bf16(a.w_out.q, a.w_out.s, a.w_out.rs, H, nh * hd, x16_of(rv), H, R, L, true))
       throw std::logic_error("cuda: a bf16 residual's out projection is a W4A4 GEMM");
+  } else if (a.post_norm.w) {  // Gemma's: o's output (and bias) into h, free here, normed and added to x
+    if (a.lora) throw std::logic_error("cuda: an out projection's adapter beside a norm after it");
+    if (split) gemm_presplit(a.w_out, H, nh * hd, rv.b.h, H, R, false, L);
+    else gemm(rv.b.act, nh * hd, a.w_out, H, nh * hd, rv.b.h, H, R, false, L);
+    if (a.o_b) add_bias(rv.b.h, H, a.o_b, R, H, st);
+    norm_add(rv.b.x, H, rv.b.h, H, a.post_norm.w, a.post_norm.offset, a.post_norm.eps, nullptr, R, H, st);
   } else if (split) {
     gemm_presplit(a.w_out, H, nh * hd, rv.b.x, H, R, true, L);
   } else if (residual16_pass(ps)) {  // fusion=0: as gemm_staged_bf16 adds it; h (H wide; qbuf in a pass) is free here
@@ -956,7 +1089,22 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
   } else {
     gemm(rv.b.act, nh * hd, a.w_out, H, nh * hd, rv.b.x, H, R, true, L);
   }
+  if (a.o_b && !a.post_norm.w) add_bias(rv.b.x, H, a.o_b, R, H, st);
   if (a.lora) lora_out_end(rv, a.lora, FLYX_LIN_O, rv.b.act, nh * hd, nh * hd, H, R, ldu, L);
+}
+
+// Every layer's input of its own (Gemma 4's E2B / E4B): the tokens' table rows into pli, the embedded rows' projection
+// (proj, free here) scaled, normed a layer's slice at a time and mixed in.
+void per_layer_input_layer(const Pass& ps, const PerLayerInputBlock& q) {
+  const RowView& rv = ps.v;
+  const int R = ps.rows, W = q.width(), ld = ps.s->m->need.per_layer, H = ps.s->m->hidden;
+  cudaStream_t st = rv.L.st;
+  if (q.table.blk.data) embed_blocks(rv.b.tokens, q.table.blk, W, rv.b.pli, R, st);
+  else embed(rv.b.tokens, q.table.table, W, rv.b.pli, R, st);
+  gemm(rv.b.x, H, q.w_proj, W, H, rv.b.proj, rv.ld_proj, R, false, rv.L);
+  scale_rows(rv.b.proj, rv.ld_proj, W, q.proj_scale, R, st);
+  per_layer_inputs(rv.b.proj, rv.ld_proj, rv.b.pli, ld, q.layers, q.dim, q.norm.w, q.norm.offset, q.norm.eps,
+                   q.table_scale, q.mix, R, st);
 }
 
 void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused) {
@@ -972,7 +1120,7 @@ void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused) {
   }
   if (!f.lora) {
     mlp_body(rv.b.x, f, ps.rows, rv.b.h, rv.b.proj, rv.ld_proj, rv.b.act, rv.ld_act, rv.L, fused,
-             residual16_pass(ps));
+             residual16_pass(ps), nullptr, rv.b.pli, ps.s->m->need.per_layer);
     return;
   }
   // The block's own adapters (ABI 43): the gate and up rows take their products before the SwiGLU, so the gate|up GEMM
@@ -1639,27 +1787,37 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     }
   }
 
+  // Gemma 4's MLP beside the experts, first: its normed output into post_raw (free: no ShortConv after these
+  // experts), its scratch (h, proj, act) theirs after it
+  float* const shared_y = f.shared >= 0 ? rv.b.post_raw : nullptr;
+  if (shared_y)
+    mlp_body(const_cast<float*>(cur), block<MlpBlock>(s->m, f.shared), R, rv.b.h, rv.b.proj, rv.ld_proj, rv.b.act,
+             rv.ld_act, L, fused, false, shared_y);
   if (!norm_done) {
     if (round_q8)
       rmsnorm_moe_q8(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, *msc, moe_q8_mins(f.gate_up), st);
     else
       rmsnorm(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, st);
   }
-  gemm(rv.b.h, H, f.router, E, H, rv.b.proj, E, R, false, L);
+  if (f.router_in) {  // the router's own input (act: free here)
+    rmsnorm(cur, H, f.router_in, 0.f, f.router_eps, rv.b.act, H, R, H, st);
+    gemm(rv.b.act, H, f.router, E, H, rv.b.proj, E, R, false, L);
+  } else {
+    gemm(rv.b.h, H, f.router, E, H, rv.b.proj, E, R, false, L);
+  }
   moe_route(rv.b.proj, f.router_bias, R, E, K, f.gating_sigmoid, f.norm_weights, f.norm_eps, f.route_scale,
-            rv.b.moe_idx, rv.b.moe_w, L);
+            rv.b.moe_idx, rv.b.moe_w, L, f.router_logit_b, f.expert_scale);
 
   bf16* act_bf16 =
       round_q8 && moe_round_bf16_down(f.down, R, K, I, msc, L) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
   // The grouping of the rows by expert that the gate|up GEMM leaves in the scratch, which the down GEMM takes over.
   int grouped = 0;
   if (fused) {
-    grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, true,
-                          rv.b.moe_act, I, msc, L, round_q8, act_bf16);
+    grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.act, true, rv.b.moe_act, I, msc, L,
+                          round_q8, act_bf16);
   } else {
-    grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.situ_beta, f.situ_linear_beta, false,
-                          rv.b.moe_gu, 2 * I, msc, L);
-    situ_rows(rv.b.moe_gu, 2 * I, I, f.situ_beta, f.situ_linear_beta, rv.b.moe_act, I, R * K, st);
+    grouped = moe_gate_up(rv.b.h, H, f.gate_up, rv.b.moe_idx, R, K, I, H, f.act, false, rv.b.moe_gu, 2 * I, msc, L);
+    moe_act_rows(rv.b.moe_gu, 2 * I, I, f.act, rv.b.moe_idx, rv.b.moe_act, I, R * K, st);
   }
   if (f.post_conv) {
     moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.post_raw, H, false, msc, L, act_bf16,
@@ -1677,10 +1835,17 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
     shortconv_pass(rv.b.post_raw, H, f.post_conv, nullptr, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep,
                    rep_stride, kSlotCur, f.sconv_offset, sc.channels, H, f.conv, 0, s->P, R, x_cur, H, st, true);
+  } else if (shared_y) {
+    // Gemma 4's: the experts' output into h (free past the gate|up GEMM), normed and added to the MLP's, the sum
+    // normed and added to x, x then times the layer's scalar
+    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.h, H, false, msc, L, act_bf16,
+             grouped);
+    norm_add(shared_y, H, rv.b.h, H, f.post_norm.w, f.post_norm.offset, f.post_norm.eps, nullptr, R, H, st);
+    norm_add(rv.b.x, H, shared_y, H, f.out_norm.w, f.out_norm.offset, f.out_norm.eps, f.out_scale, R, H, st);
   } else {
     float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
     moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, x_cur, H, true, msc, L, act_bf16,
-             grouped);
+             grouped, f.down_b);
   }
 }
 

@@ -2,6 +2,7 @@
 // Pointwise activations.
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 
 #include "flyx/backend_abi.h"
@@ -20,6 +21,12 @@ inline double situ(double gate, double up, double beta, double linear_beta) {
 }
 
 // Exact Gaussian Error Linear Unit (PyTorch nn.GELU(approximate='none')).
+// gpt-oss's expert activation (flyx_moe_act FLYX_MOE_SWIGLU_OAI): g = min(gate, limit), u = clamp(up, -limit,
+// limit), (u + 1) * g * sigmoid(alpha * g).
+inline double swiglu_oai(double gate, double up, double alpha, double limit) {
+  const double g = std::min(gate, limit), u = std::clamp(up, -limit, limit);
+  return (u + 1.0) * g * sigmoid(alpha * g);
+}
 inline double gelu(double v) { return 0.5 * v * (1.0 + std::erf(v * 0.70710678118654752440)); }
 
 // Tanh-approximated GELU (PyTorch nn.GELU(approximate='tanh') / gelu_pytorch_tanh).

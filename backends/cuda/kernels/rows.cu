@@ -237,7 +237,7 @@ __device__ __forceinline__ float lora_dot(const float* u, const bf16* b, int ran
 // them to the rows (y + its sum).
 template <int G>
 __device__ __forceinline__ void swiglu_row(const float* gu, int ld, int I, const Out& o, int ld_out, const LoraGlu& lg,
-                                           int row, int i) {
+                                           int row, int i, int act) {
   const float* r = gu + size_t(row) * ld;
   auto adapt = [&](float& g, float& u, int at) {
     if constexpr (G > 0) {
@@ -249,7 +249,7 @@ __device__ __forceinline__ void swiglu_row(const float* gu, int ld, int I, const
   if (i + 1 >= I) {
     float g = r[i], u = r[I + i];
     adapt(g, u, i);
-    put<true>(o, size_t(row) * ld_out + i, size_t(row) * I + i, silu(g) * u);
+    put<true>(o, size_t(row) * ld_out + i, size_t(row) * I + i, glu_act(act, g) * u);
     return;
   }
   float g0, g1, u0, u1;
@@ -262,8 +262,8 @@ __device__ __forceinline__ void swiglu_row(const float* gu, int ld, int I, const
   }
   adapt(g0, u0, i);
   adapt(g1, u1, i + 1);
-  const float a = silu(g0) * u0;
-  const float b = silu(g1) * u1;
+  const float a = glu_act(act, g0) * u0;
+  const float b = glu_act(act, g1) * u1;
   if (o.also && !o.q8) {  // (put_q8_pairs writes its own)
     o.also[size_t(row) * I + i] = a;
     o.also[size_t(row) * I + i + 1] = b;
@@ -289,15 +289,74 @@ __device__ __forceinline__ void swiglu_row(const float* gu, int ld, int I, const
 // grid (ceil(rows / RT), pairs / 256): RT rows a block (an adapter's b rows read once for them, from L1 after), one
 // pair of values a thread a row.
 template <int G = 0, int RT = 1>
-__global__ void k_swiglu(const float* gu, int ld, int I, Out o, int ld_out, int rows, LoraGlu lg = {}) {
+__global__ void k_swiglu(const float* gu, int ld, int I, Out o, int ld_out, int rows, LoraGlu lg = {}, int act = 0) {
   pdl_trigger();
   const int i = 2 * (blockIdx.y * blockDim.x + threadIdx.x);
   if (i >= I) return;
   for (int t = 0; t < RT; ++t) {
     const int row = int(blockIdx.x) * RT + t;
     if (row >= rows) break;
-    swiglu_row<G>(gu, ld, I, o, ld_out, lg, row, i);
+    swiglu_row<G>(gu, ld, I, o, ld_out, lg, row, i, act);
   }
+}
+
+// x = (x + rmsnorm(y) (offset + w)) * scale, scale null: 1 (Gemma's norms after attention and the MLP, its layer
+// scalar).  A block of 512 a row, rms_inv's order: a row's bits whatever the rows; the sum and product not
+// contracted (rule 2).
+__global__ void __launch_bounds__(512, 2) k_norm_add(float* x, int ldx, const float* y, int ldy, const float* w,
+                                                     float offset, float eps, const float* scale, int n) {
+  pdl_trigger();
+  const float* yr = y + size_t(blockIdx.x) * ldy;
+  float* xr = x + size_t(blockIdx.x) * ldx;
+  float yv[kNormCache], wv[kNormCache];
+  const float inv = rms_inv(yr, w, n, eps, yv, wv);
+  const float s = scale ? *scale : 1.f;
+  auto put_one = [&](int i, float v) {
+    const float sum = __fadd_rn(xr[i], v);
+    xr[i] = scale ? __fmul_rn(sum, s) : sum;
+  };
+#pragma unroll
+  for (int u = 0; u < kNormCache; ++u) {
+    const int i = threadIdx.x + u * 512;
+    if (i < n) put_one(i, rms_value<true>(yv[u], inv, offset, wv[u]));
+  }
+  for (int i = threadIdx.x + kNormCache * 512; i < n; i += 512)
+    put_one(i, rms_value<true>(yr[i], inv, offset, w[i]));
+}
+
+// Gemma 4's per-layer inputs (E2B, E4B): pli = (rmsnorm(y) (offset + w) + pli * table_scale) * mix over each of a
+// row's dim-wide slices (blockIdx.y), y the scaled projection of the row, pli its table row.  A block of 512 a slice,
+// rms_inv's order: a row's bits whatever the rows.
+__global__ void __launch_bounds__(512, 2) k_per_layer_inputs(const float* y, int ldy, float* pli, int ldp, int dim,
+                                                             const float* w, float offset, float eps,
+                                                             float table_scale, float mix) {
+  pdl_trigger();
+  const float* yr = y + size_t(blockIdx.x) * ldy + size_t(blockIdx.y) * dim;
+  float* pr = pli + size_t(blockIdx.x) * ldp + size_t(blockIdx.y) * dim;
+  float yv[kNormCache], wv[kNormCache];
+  const float inv = rms_inv(yr, w, dim, eps, yv, wv);
+  auto put = [&](int i, float v) { pr[i] = __fmul_rn(__fadd_rn(v, __fmul_rn(pr[i], table_scale)), mix); };
+#pragma unroll
+  for (int u = 0; u < kNormCache; ++u) {
+    const int i = threadIdx.x + u * 512;
+    if (i < dim) put(i, rms_value<true>(yv[u], inv, offset, wv[u]));
+  }
+  for (int i = threadIdx.x + kNormCache * 512; i < dim; i += 512) put(i, rms_value<true>(yr[i], inv, offset, w[i]));
+}
+
+// g = act(g) * p, dim values a row (Gemma 4's per-layer gate; act flyx_mlp_act)
+__global__ void k_per_layer_gate(float* g, int ldg, const float* p, int ldp, int dim, int act) {
+  pdl_trigger();
+  float* gr = g + size_t(blockIdx.y) * ldg;
+  const float* pr = p + size_t(blockIdx.y) * ldp;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < dim; i += gridDim.x * blockDim.x)
+    gr[i] = __fmul_rn(glu_act(act, gr[i]), pr[i]);
+}
+
+__global__ void k_scale_rows(float* x, int ld, int n, float s) {
+  pdl_trigger();
+  float* r = x + size_t(blockIdx.y) * ld;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) r[i] = __fmul_rn(r[i], s);
 }
 
 __global__ void k_round_rows_bf16(float* x, int ld, int n, const float* y, int ldy) {
@@ -371,8 +430,29 @@ void build_rows(const DevParams* P, const int* drafts, int fill, int* tokens, in
   k_build_rows<<<1, 32, 0, st>>>(P, drafts, fill, tokens, rows);
 }
 
-void swiglu(const float* gu, int ld, int I, float* out, int ld_out, int rows, cudaStream_t st) {
-  k_swiglu<0><<<dim3(rows, ceil_div(I, 512)), 256, 0, st>>>(gu, ld, I, Out{out, nullptr, nullptr}, ld_out, rows);
+void swiglu(const float* gu, int ld, int I, float* out, int ld_out, int rows, cudaStream_t st, int act) {
+  k_swiglu<0><<<dim3(rows, ceil_div(I, 512)), 256, 0, st>>>(gu, ld, I, Out{out, nullptr, nullptr}, ld_out, rows,
+                                                            LoraGlu{}, act);
+}
+
+void norm_add(float* x, int ldx, const float* y, int ldy, const float* w, float offset, float eps,
+              const float* scale, int rows, int n, cudaStream_t st) {
+  if (rows > 0 && n > 0) k_norm_add<<<rows, 512, 0, st>>>(x, ldx, y, ldy, w, offset, eps, scale, n);
+}
+
+void per_layer_inputs(const float* y, int ldy, float* pli, int ldp, int layers, int dim, const float* w, float offset,
+                      float eps, float table_scale, float mix, int rows, cudaStream_t st) {
+  if (rows > 0 && layers > 0 && dim > 0)
+    k_per_layer_inputs<<<dim3(rows, layers), 512, 0, st>>>(y, ldy, pli, ldp, dim, w, offset, eps, table_scale, mix);
+}
+
+void per_layer_gate(float* g, int ldg, const float* p, int ldp, int dim, int act, int rows, cudaStream_t st) {
+  if (rows > 0 && dim > 0) k_per_layer_gate<<<dim3((dim + 255) / 256, rows), 256, 0, st>>>(g, ldg, p, ldp, dim, act);
+}
+
+void scale_rows(float* x, int ld, int n, float s, int rows, cudaStream_t st) {
+  if (rows > 0 && n > 0 && s != 1.f)
+    k_scale_rows<<<dim3(std::min(ceil_div(n, 256), 32), rows), 256, 0, st>>>(x, ld, n, s);
 }
 
 void round_rows_bf16(float* x, int ld, int n, int rows, cudaStream_t st) {
@@ -386,13 +466,14 @@ void add_rows_bf16(float* x, int ld, const float* y, int ldy, int n, int rows, c
 }
 
 void swiglu_split(const float* gu, int ld, int I, int rows, const Launch& L, bool q8, float* also,
-                  const LoraGlu& lora) {
+                  const LoraGlu& lora, int act) {
   Out o = split_out(L, rows, I, q8);
   o.also = also;
   if (!lora.rank) {
-    k_swiglu<0><<<dim3(rows, ceil_div(I, 512)), 256, 0, L.st>>>(gu, ld, I, o, I, rows);
+    k_swiglu<0><<<dim3(rows, ceil_div(I, 512)), 256, 0, L.st>>>(gu, ld, I, o, I, rows, LoraGlu{}, act);
     return;
   }
+  if (act) throw std::logic_error("swiglu_split: an adapter's products beside another activation than SiLU");
   if (lora.rank % 8 || lora.ldu % 4 || reinterpret_cast<uintptr_t>(lora.u) % 16)
     throw std::logic_error("swiglu_split: an adapter's rank no multiple of 8, or u rows not on 16 bytes");
   // a round's rows a block each; a prefill pass's 16 a block (b's rows reused from L1)

@@ -390,18 +390,23 @@ void test_gemm_glu(int M, int I, int K) {
   float* drs = up(rsv);
   float *dy = dev<float>(size_t(M) * N), *dz1 = dev<float>(size_t(M) * H), *dz2 = dev<float>(size_t(M) * H);
   const size_t n = size_t(M) * I;
-  auto run = [&](const char* what, bool fp4, int cfg, const Launch& L) {
-    stage();
-    gemm_glu_staged(fp4 ? nullptr : dw, fp4 ? dq : nullptr, ds, drs, I, K, M, L, cfg);
-    const Vec fused = down_bf16(sc.glu, n);
-    stage();
-    if (fp4) gemm_fp4_presplit(dq, ds, drs, N, K, dy, N, M, false, L);
-    else gemm_presplit(dw, N, K, dy, N, M, false, L);
-    swiglu_split(dy, N, I, M, L);  // into abuf
-    expect(std::string(what) + ": same bits as the GEMM and swiglu_split", fused, down_bf16(sc.abuf, n), 0);
-    gemm_on_glu(dw2, nullptr, nullptr, nullptr, H, I, dz1, H, M, false, L);  // glu rows
-    gemm_presplit(dw2, H, I, dz2, H, M, false, L);                          // abuf rows, the same values
-    expect(std::string(what) + ", next GEMM: same bits", down(dz1, size_t(M) * H), down(dz2, size_t(M) * H), 0);
+  auto run = [&](const char* what0, bool fp4, int cfg, const Launch& L0) {
+    for (int act : {0, 1}) {  // SiLU, GELU's tanh form (Gemma's): Launch::glu_act
+      const std::string what = std::string(what0) + (act ? ", GELU" : "");
+      Launch L = L0;
+      L.glu_act = act;
+      stage();
+      gemm_glu_staged(fp4 ? nullptr : dw, fp4 ? dq : nullptr, ds, drs, I, K, M, L, cfg);
+      const Vec fused = down_bf16(sc.glu, n);
+      stage();
+      if (fp4) gemm_fp4_presplit(dq, ds, drs, N, K, dy, N, M, false, L);
+      else gemm_presplit(dw, N, K, dy, N, M, false, L);
+      swiglu_split(dy, N, I, M, L, false, nullptr, {}, act);  // into abuf
+      expect(what + ": same bits as the GEMM and swiglu_split", fused, down_bf16(sc.abuf, n), 0);
+      gemm_on_glu(dw2, nullptr, nullptr, nullptr, H, I, dz1, H, M, false, L);  // glu rows
+      gemm_presplit(dw2, H, I, dz2, H, M, false, L);                          // abuf rows, the same values
+      expect(what + ", next GEMM: same bits", down(dz1, size_t(M) * H), down(dz2, size_t(M) * H), 0);
+    }
   };
   for (int c = 0; c < kTcConfigs; ++c) {
     run(("bf16 weights, configuration " + std::to_string(c)).c_str(), false, c, TL);

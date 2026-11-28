@@ -11,7 +11,8 @@ namespace {
 // Decode and verification attention against the reference: the float32 sums over the keys; with q and p as one
 // binary16 (the tensor-core kernel's default where llama.cpp rounds them so) prefill attention's.
 double rows_tolerance(bool mma, int parts, int nh, int nkv, int hd, int ctx) {
-  const bool one = mma && (parts == 1 || (parts == 0 && nh / nkv > 4 && hd >= 256));
+  // one binary16 part of q and p: asked for, where llama.cpp rounds them so, and always at head dim 512
+  const bool one = mma && (parts == 1 || hd > 256 || (parts == 0 && nh / nkv > 4 && hd >= 256));
   return one ? 3e-3 : ctx > 1000 ? 1e-4 : 2e-5;
 }
 
@@ -40,7 +41,7 @@ __global__ void k_check_e4m3_sw(uint16_t* sw_bits, uint16_t* ref_bits, float* sw
 template <class T>
 void expect_windows(const std::string& what, const float* dq, const T* dK, const T* dV, const float* dKs,
                     const float* dVs, int nh, int nkv, int hd, int rows, int total, const DevParams* P,
-                    const float* gate, int ld, const Vec& whole, int hb = 0) {
+                    const float* gate, int ld, const Vec& whole, int hb) {
   const size_t row = size_t(nkv) * hd;  // values a position
   const int W = kFlashWindowAlign, first = 2 * W;
   float* state = dev<float>(size_t(rows) * nh * kFlashStateFloats(hd));
@@ -104,6 +105,9 @@ void expect_windows(const std::string& what, const float* dq, const T* dK, const
   if (!same) ++g_fail;
   for (void* x : std::initializer_list<void*>{state, dw, sk, sv, scale_buf}) CK(cudaFree(x));
 }
+template void expect_windows<kv16>(const std::string&, const float*, const kv16*, const kv16*, const float*,
+                                   const float*, int, int, int, int, int, const DevParams*, const float*, int,
+                                   const Vec&, int);
 
 // A block drafter's binary16 K/V cache holds 65504 for what is past it, an infinity included (kv16_of,
 // ops/dtype/ref.h round_kv16): attn_prep's k and v (no q/k norms: k rotated as projected) and draft_ctx_kv's v, each
@@ -283,7 +287,8 @@ void test_attention(int hd, int rot, int nh, int nkv, int rows, int ctx, bool ca
         for (int d = 0; d < hd; ++d) o[d] *= ops::sigmoid(qkv[size_t(r) * ld + nh * hd + h * hd + d]);
       }
   }
-  expect("attention " + tag, down(dout, out.size()), out, ctx > 1000 ? 1e-4 : 2e-5);  // float32 sums over the keys
+  // float32 sums over the keys; head dim 512: the tensor-core rows kernel, one binary16 part of q and p, every row
+  expect("attention " + tag, down(dout, out.size()), out, hd > 256 ? 3e-3 : ctx > 1000 ? 1e-4 : 2e-5);
   if (window > 0) {  // sliding-window ring buffer (KvRef::ring > 0): bit-identical to flat cache across ring wraps
     const int ring = window + rows + 7;
     const size_t stride = size_t(nkv) * hd;

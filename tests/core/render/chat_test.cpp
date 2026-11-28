@@ -71,7 +71,10 @@ ojson defused(const ojson& j) {
 }
 
 // A reply with one call to get_weather(location="Paris"), in the format's own words.
-std::string reply_with_call(const std::string& format) {
+std::string reply_with_call(const std::string& format, bool in_reasoning) {
+  if (format == "gemma4")  // its thought reopened by the prompt after tool results, else the reply's own
+    return std::string(in_reasoning ? "" : "<|channel>thought\n") +
+           "Need the weather.\n<channel|><|tool_call>call:get_weather{location:<|\"|>Paris<|\"|>,days:3}<tool_call|>";
   if (format == "qwen35" || format == "qwen3_coder")
     return "Need the weather.\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=location>\nParis\n"
            "</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
@@ -173,7 +176,7 @@ int main(int argc, char** argv) {
     // The reply parser for this format reads a call in the format's own words.
     if (!tools.empty() && c["thinking"].get<bool>()) {
       auto parser = ct->parser(r, &tools);
-      std::vector<OutputEvent> ev = parser->feed(reply_with_call(ct->format()));
+      std::vector<OutputEvent> ev = parser->feed(reply_with_call(ct->format(), r.in_reasoning));
       for (auto& e : parser->finish()) ev.push_back(std::move(e));
       bool reasoning = false, call = false;
       for (const auto& e : ev) {
@@ -181,7 +184,12 @@ int main(int argc, char** argv) {
         call |= e.kind == OutputEvent::kToolCall && e.call.name == "get_weather" &&
                 e.call.arguments == ojson{{"location", "Paris"}, {"days", 3}};
       }
-      check(reasoning && call && parser->tool_calls() == 1, label + ": reply parser reads thinking and the call");
+      std::string got;  // what it read, where it reads otherwise
+      for (const auto& e : ev)
+        got += " [" + std::to_string(int(e.kind)) + " " + (e.kind == OutputEvent::kToolCall ? e.call.name + " " +
+                                                           e.call.arguments.dump() : e.text) + "]";
+      check(reasoning && call && parser->tool_calls() == 1,
+            label + ": reply parser reads thinking and the call" + (reasoning && call ? "" : ":" + got));
     }
   }
   // A cases file that holds none (or none this build renders) compares nothing: that is no pass.
@@ -208,10 +216,11 @@ int main(int argc, char** argv) {
               r2.text.compare(0, r1.boundaries.back(), r1.text, 0, r1.boundaries.back()) == 0,
           c["template"].get<std::string>() + ": the next turn branches where the previous conversation ended " +
               ojson(r1.boundaries).dump() + " -> " + ojson(r2.boundaries).dump());
-    // Where the first user message ends: the same in both, inside the shared text.
-    check(r1.first_user_end > 0 && r1.first_user_end == r2.first_user_end &&
+    // Where the first user message ends: the same in both, inside the shared text, after the turn's end.
+    const std::string turn_end = std::string(ct.format()) == "gemma4" ? "<turn|>\n" : "<|im_end|>\n";
+    check(r1.first_user_end > turn_end.size() && r1.first_user_end == r2.first_user_end &&
               r2.text.compare(0, r1.first_user_end, r1.text, 0, r1.first_user_end) == 0 &&
-              r1.text.compare(r1.first_user_end - 11, 11, "<|im_end|>\n") == 0,
+              r1.text.compare(r1.first_user_end - turn_end.size(), turn_end.size(), turn_end) == 0,
           c["template"].get<std::string>() + ": the first user message ends at " + std::to_string(r1.first_user_end));
   }
   check(loops > 0, std::string(argv[2]) + ": no agent loop with thinking in a template with calls (the branch "

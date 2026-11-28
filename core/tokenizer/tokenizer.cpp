@@ -345,8 +345,9 @@ bool Tokenizer::load(const ModelFile& file, std::string* err) {
   const auto& t = h["tokenizer"];
   const std::string pre = t.contains("pretokenizer") && t["pretokenizer"].is_string() ? t["pretokenizer"].get<std::string>() : "";
   const std::string normalizer = t.contains("normalizer") && t["normalizer"].is_string() ? t["normalizer"].get<std::string>() : "";
-  if ((pre != "qwen35" && pre != "qwen2" && pre != "minicpm5" && pre != "inkling2" && pre != "gpt-4o") ||
-      (normalizer != "nfc" && normalizer != "none")) {
+  if ((pre != "qwen35" && pre != "qwen2" && pre != "minicpm5" && pre != "inkling2" && pre != "gpt-4o" &&
+       pre != "gemma4") ||
+      (normalizer != "nfc" && normalizer != "none") || (pre == "gemma4" && normalizer != "none")) {
     *err = "unsupported tokenizer pipeline (pre-tokenizer '" + pre + "', normalizer '" + normalizer + "')";
     return false;
   }
@@ -356,6 +357,7 @@ bool Tokenizer::load(const ModelFile& file, std::string* err) {
                   : (pre == "inkling2" || pre == "gpt-4o") ? Pretokenizer::kInkling2
                                                            : Pretokenizer::kQwen35;
   normalize_nfc_ = normalizer == "nfc";
+  metaspace_ = pre == "gemma4";
   by_bytes_.clear(); merges_.clear(); added_.clear(); cache_.clear();
   const int64_t n64 = t.contains("n_tokens") && t["n_tokens"].is_number_integer() ? t["n_tokens"].get<int64_t>() : 0;
   auto vb = file.blob("tokenizer.vocab");
@@ -408,16 +410,40 @@ bool Tokenizer::load(const ModelFile& file, std::string* err) {
   std::sort(added_.begin(), added_.end(),
             [](const Added& x, const Added& y) { return x.content.size() > y.content.size(); });
   by_bytes_.reserve(tokens_.size());
-  for (int i = 0; i < n; ++i) {
-    if (is_added[i]) continue;
-    if (!tokens_[i].empty()) by_bytes_.emplace(tokens_[i], i);
-    if (tokens_[i].size() == 1) byte_id_[static_cast<uint8_t>(tokens_[i][0])] = i;
-  }
-  for (int b = 0; b < 256; ++b)
-    if (byte_id_[b] < 0) {
-      *err = "tokenizer has no token for byte " + std::to_string(b);
+  if (metaspace_) {  // the byte tokens <0x00>..<0xFF> by the header, the others by their text, spaces as U+2581
+    const auto& bytes = t.contains("byte_ids") ? t["byte_ids"] : nlohmann::json();
+    if (!bytes.is_array() || bytes.size() != 256) {
+      *err = "tokenizer.byte_ids: not the 256 byte tokens";
       return false;
     }
+    std::vector<bool> is_byte(size_t(n), false);
+    for (int b = 0; b < 256; ++b) {
+      const int64_t id = bytes[size_t(b)].is_number_integer() ? bytes[size_t(b)].get<int64_t>() : -1;
+      if (id < 0 || id >= n || is_added[size_t(id)] || tokens_[size_t(id)] != std::string(1, char(b))) {
+        *err = "tokenizer.byte_ids: " + bytes[size_t(b)].dump() + " is not the token of byte " + std::to_string(b);
+        return false;
+      }
+      byte_id_[b] = int32_t(id);
+      is_byte[size_t(id)] = true;
+    }
+    for (int i = 0; i < n; ++i) {
+      if (is_added[size_t(i)] || is_byte[size_t(i)] || tokens_[size_t(i)].empty()) continue;
+      std::string piece;
+      for (char c : tokens_[size_t(i)]) piece += c == ' ' ? std::string("\xE2\x96\x81") : std::string(1, c);
+      by_bytes_.emplace(std::move(piece), i);
+    }
+  } else {
+    for (int i = 0; i < n; ++i) {
+      if (is_added[i]) continue;
+      if (!tokens_[i].empty()) by_bytes_.emplace(tokens_[i], i);
+      if (tokens_[i].size() == 1) byte_id_[static_cast<uint8_t>(tokens_[i][0])] = i;
+    }
+    for (int b = 0; b < 256; ++b)
+      if (byte_id_[b] < 0) {
+        *err = "tokenizer has no token for byte " + std::to_string(b);
+        return false;
+      }
+  }
   auto mb = file.blob("tokenizer.merges");
   const size_t nm = mb.size() / 12;
   merges_.reserve(nm * 2);
@@ -533,8 +559,39 @@ void Tokenizer::merge(std::vector<int32_t>* sym) const {
   s.resize(kept);
 }
 
+// A metaspace piece's symbols: each UTF-8 character's token by its text, else one byte token for each of its bytes
+// (a byte that begins no character: its byte token).
+void Tokenizer::metaspace_symbols(std::string_view piece, std::vector<int32_t>* sym) const {
+  size_t i = 0;
+  while (i < piece.size()) {
+    const auto c0 = static_cast<unsigned char>(piece[i]);
+    size_t len = c0 < 0x80 ? 1 : (c0 >> 5) == 6 ? 2 : (c0 >> 4) == 14 ? 3 : (c0 >> 3) == 30 ? 4 : 0;
+    if (len == 0 || i + len > piece.size()) len = 0;
+    for (size_t k = 1; k < len; ++k)
+      if ((static_cast<unsigned char>(piece[i + k]) & 0xC0) != 0x80) len = 0;
+    if (len == 0) {  // not a character: the byte alone
+      sym->push_back(byte_id_[c0]);
+      ++i;
+      continue;
+    }
+    const auto it = by_bytes_.find(piece.substr(i, len));
+    if (it != by_bytes_.end()) {
+      sym->push_back(it->second);
+    } else {
+      for (size_t k = 0; k < len; ++k) sym->push_back(byte_id_[static_cast<unsigned char>(piece[i + k])]);
+    }
+    i += len;
+  }
+}
+
 std::vector<int32_t> Tokenizer::encode_uncached(std::string_view piece) const {
   std::vector<int32_t> sym;
+  if (metaspace_) {
+    sym.reserve(piece.size());
+    metaspace_symbols(piece, &sym);
+    merge(&sym);
+    return sym;
+  }
   if (ignore_merges_) {
     auto it = by_bytes_.find(piece);
     if (it != by_bytes_.end()) {
@@ -599,6 +656,24 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, const std::vector<
   auto flush = [&](size_t end) {
     if (end <= seg) return;
     const std::string_view raw = text.substr(seg, end - seg);
+    if (metaspace_) {  // spaces as U+2581, the text cut where newlines begin and end
+      std::string ms;
+      ms.reserve(raw.size() + raw.size() / 4);
+      for (char c : raw) {
+        if (c == ' ') ms += "\xE2\x96\x81";
+        else ms += c;
+      }
+      pieces.clear();
+      for (size_t a = 0; a < ms.size();) {
+        const bool nl = ms[a] == '\n';
+        size_t b = a + 1;
+        while (b < ms.size() && (ms[b] == '\n') == nl) ++b;
+        pieces.push_back(std::string_view(ms).substr(a, b - a));
+        a = b;
+      }
+      encode_pieces(pieces, &out);
+      return;
+    }
     const bool ascii = is_ascii(raw);
     std::string norm_buf;
     std::string_view src = raw;

@@ -42,9 +42,18 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       lora_part(4, g->lora.rank, g->hidden, g->v_width());
       if (g->w_in.q8_inputs() || g->w_out.q8_inputs()) n.q8 = true;
       ks({g->hidden, g->v_width(), g->lora.rank});
+    } else if (const auto* q = std::get_if<PerLayerInputBlock>(&blk)) {
+      n.per_layer = std::max(n.per_layer, q->width());
+      n.proj = std::max(n.proj, q->width());  // the embedded rows' projection
+      if (q->w_proj.q8_inputs()) n.q8 = true;
+      ks({q->table.hidden});
     } else if (const auto* f = std::get_if<MlpBlock>(&blk)) {
       n.proj = std::max(n.proj, 2 * f->inter);
       n.act = std::max(n.act, f->inter);
+      if (f->per_layer >= 0) {
+        if (f->w_pl_gate.q8_inputs() || f->w_pl_proj.q8_inputs()) n.q8 = true;
+        ks({f->per_layer_dim});
+      }
       if (!f->w_gu.packed() && !f->w_down.packed()) n.glu = true;
       if (f->w_gu.q8_inputs() || f->w_down.q8_inputs()) n.q8 = true;
       n.lora = std::max(n.lora, 2 * f->lora.rank);
@@ -71,6 +80,7 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.moe_experts = std::max(n.moe_experts, e->n_experts);
       n.moe_topk = std::max(n.moe_topk, e->top_k);
       n.moe_inter = std::max(n.moe_inter, e->inter);
+      if (e->router_in) n.act = std::max(n.act, e->hidden);  // the router's own input rows (moe_layer)
       n.max_loop_rank = std::max(n.max_loop_rank, e->loop_rank);
       ks({e->hidden, e->inter, 2 * e->hidden, e->loop_rank});
     } else if (const auto* h = std::get_if<HeadBlock>(&blk)) {
@@ -80,6 +90,11 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.mtp = true;
       if (t->fc.q8_inputs()) n.q8 = true;
       ks({2 * m->hidden});
+    } else if (const auto* g = std::get_if<Gemma4MtpBlock>(&blk)) {
+      n.mtp = true;  // MTP's row buffers: its step's input (mcat, 2 target_hidden), its residual (mx), the ring's (mhn)
+      for (const Lin* l : {&g->pre_proj, &g->post_proj})
+        if (l->q8_inputs()) n.q8 = true;
+      ks({2 * g->target_hidden, g->hidden});
     } else if (const auto* e = std::get_if<Eagle4Block>(&blk)) {
       // MTP's row buffers (mcat, mx, mhn), its taps; its context's q|k|v of a prefill pass go to act (mcat and mhn
       // are in proj's slot there: eagle4_context)
@@ -131,8 +146,10 @@ int max_drafts(const Block& drafter) {
     return d->dspine ? d->block - 1 : std::max(d->block, FLYX_MAX_ROWS) - 1;
   if (const auto* ds = std::get_if<DSparkBlock>(&drafter)) return ds->block - 1;
   if (const auto* v = std::get_if<DvBlock>(&drafter)) return v->tree_width;
-  return std::holds_alternative<MtpBlock>(drafter) || std::holds_alternative<Eagle4Block>(drafter) ? FLYX_MAX_ROWS - 1
-                                                                                                  : 0;
+  return std::holds_alternative<MtpBlock>(drafter) || std::holds_alternative<Eagle4Block>(drafter) ||
+                 std::holds_alternative<Gemma4MtpBlock>(drafter)
+             ? FLYX_MAX_ROWS - 1
+             : 0;
 }
 
 // Row buffers for R rows; `prefill`: the prefill set (attention partials for
@@ -172,6 +189,7 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     }
   }
   if (n.feats) b->feats = f(size_t(R) * n.feats);  // DFlash2/DSpark taps survive across layers
+  if (n.per_layer) b->pli = f(size_t(R) * n.per_layer);  // every layer reads its slice
   if (n.max_bank > 0) {
     b->res_bank = f(size_t(n.max_bank) * R * H);
     b->attn_in = f(size_t(3) * R * H);
@@ -206,7 +224,10 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     const size_t gu_or_down = std::max(size_t(2) * size_t(n.moe_inter), size_t(H));
     b->moe_gu = f(size_t(R) * size_t(n.moe_topk) * gu_or_down);
     b->moe_act = f(size_t(R) * size_t(n.moe_topk) * size_t(n.moe_inter));
-    const int chunk = std::min(R, 256);
+    // The whole pass a chunk: each chunk reads every expert it routes to, so a long prompt's pass of thousands of rows
+    // in chunks of 256 read the experts' weights a dozen times over (26B-A4B, a 200K-token prompt on an RTX PRO 6000:
+    // its experts 30 -> 21 s).  The staged rows grow with it (passes of 4096 rows: 46 MB, from 3).
+    const int chunk = R;
     b->moe_sc.pairs = static_cast<int*>(alloc(size_t(chunk) * size_t(n.moe_topk) * sizeof(int)));
     b->moe_sc.tasks = static_cast<MoeTask*>(alloc(size_t(chunk) * size_t(n.moe_topk) * sizeof(MoeTask)));
     b->moe_sc.n_tasks = static_cast<int*>(alloc(sizeof(int)));
@@ -450,7 +471,8 @@ size_t kv_row_bytes(const KvSpec& k) { return size_t(k.nkv) * k.hd * (k.fp8 ? 1 
 // stagings on the device (as large as one's host part): a cache alone of its size would save no device memory.  A
 // drafter's stays on the device: its draft steps read it a row at a time.
 bool tiered_cache(const flyx_bmodel* m, const KvSpec& k) {
-  if (k.layers != 1 || k.draft || k.window > 0) return false;
+  // a head dim without tensor-core kernels (512) has no windowed prefill (attn_windows): on the device
+  if (k.layers != 1 || k.draft || k.window > 0 || !attention_head_dim(k.hd)) return false;
   int n = 0;
   for (const KvSpec& o : m->states.kv)
     n += o.layers == 1 && !o.draft && o.window == 0 && kv_row_bytes(o) == kv_row_bytes(k);
@@ -1440,7 +1462,8 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
   s->drafts = s->alloc<int>(size_t(m->wide_rows));
   if (m->wide_rows > FLYX_MAX_ROWS) s->P_shift = s->alloc<DevParams>(1);
   const int head_rows = std::max({FLYX_MAX_ROWS, d ? d->block : 1, ds ? ds->block : 1});
-  const int logit_cols = std::max(V, (d || ds || m->mtp_block >= 0 || m->eagle4_block >= 0) ? kDraftPickFloats : 0);
+  const int logit_cols = std::max(
+      V, (d || ds || m->mtp_block >= 0 || m->eagle4_block >= 0 || m->gemma4_mtp_block >= 0) ? kDraftPickFloats : 0);
   const int chunks = (V + 4095) / 4096;
   s->argv = s->alloc<float>(size_t(head_rows) * chunks);
   s->argi = s->alloc<int>(size_t(head_rows) * chunks);
@@ -1542,7 +1565,7 @@ void build_seq(flyx_bmodel* m, int32_t max_ctx, flyx_seq* s) {
     s->eval = s->alloc<float>(cands);
     s->eprob = s->alloc<float>(size_t(kEagleBeamMax));
   }
-  if (m->mtp_block >= 0 || m->eagle4_block >= 0) {
+  if (m->mtp_block >= 0 || m->eagle4_block >= 0 || m->gemma4_mtp_block >= 0) {
     s->mg = s->alloc<float>(H);
     s->mtok = s->alloc<int>(FLYX_MAX_ROWS + 1);
     s->mcand = s->alloc<int>(ops::kMtpCands);

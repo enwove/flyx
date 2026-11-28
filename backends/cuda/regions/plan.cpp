@@ -22,6 +22,7 @@ std::string node_name(const flyx_node& n, const Block* b) {
       if (std::holds_alternative<VitMlpBlock>(*b)) return "vit mlp";
       if (std::holds_alternative<VisionMergeBlock>(*b)) return "vision merge";
       if (std::holds_alternative<MoeBlock>(*b)) return "moe";
+      if (std::holds_alternative<PerLayerInputBlock>(*b)) return "per-layer inputs";
       return "head + choose";
     case FLYX_NODE_TAP: return "tap";
     case FLYX_NODE_DRAFT:
@@ -29,12 +30,14 @@ std::string node_name(const flyx_node& n, const Block* b) {
       if (std::holds_alternative<DSparkBlock>(*b)) return "dspark block";
       if (const auto* d = std::get_if<DFlashBlock>(b)) return std::string(d->name()) + " block";
       if (std::holds_alternative<Eagle4Block>(*b)) return "eagle4 draft";
+      if (std::holds_alternative<Gemma4MtpBlock>(*b)) return "gemma4 assistant draft";
       return "mtp draft";
     case FLYX_NODE_CONTEXT:
       if (std::holds_alternative<DvBlock>(*b)) return "dv canvas";
       if (std::holds_alternative<DSparkBlock>(*b)) return "dspark context";
       if (const auto* d = std::get_if<DFlashBlock>(b)) return std::string(d->name()) + " context";
       if (std::holds_alternative<Eagle4Block>(*b)) return "eagle4 context";
+      if (std::holds_alternative<Gemma4MtpBlock>(*b)) return "gemma4 assistant context";
       return "mtp context";
     case FLYX_NODE_ACCEPT: return "accept";
     case FLYX_NODE_COMMIT: return "commit (fold)";
@@ -51,10 +54,12 @@ std::string node_name(const flyx_node& n, const Block* b) {
 bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
   auto no = [&](const std::string& w) { return *why = w, false; };
   if (const auto* a = std::get_if<AttnBlock>(&blk)) {
-    if (!attention_head_dim(a->hd) || a->rot > a->hd || a->rot % 2 || a->nkv < 1 || a->nh % a->nkv)
-      return no("attention dimensions outside what the CUDA kernels take (head dim 32, 64, 128 or 256)");
-    if (!a->q_norm.w != !a->k_norm.w) return no("the attention prep takes q and k norms both or neither");
-    if (a->q_norm.w && (a->q_norm.offset != a->k_norm.offset || a->q_norm.eps != a->k_norm.eps))
+    if (!attention_split_head_dim(a->hd) || a->rot > a->hd || a->rot % 2 || a->nkv < 1 || a->nh % a->nkv)
+      return no("attention dimensions outside what the CUDA kernels take (head dim 32, 64, 128, 256 or 512)");
+    // (a block reading another's K/V preps q alone)
+    if (!a->kv_shared && !a->q_norm.w != !a->k_norm.w)
+      return no("the attention prep takes q and k norms both or neither");
+    if (!a->kv_shared && a->q_norm.w && (a->q_norm.offset != a->k_norm.offset || a->q_norm.eps != a->k_norm.eps))
       return no("the attention prep takes one offset and eps for the q and k norms");
     if (m->states.kv[size_t(a->kv)].fp8 && !kv_fp8_supported(m->opt.kernels, a->nh, a->nkv, a->hd))
       return no(m->opt.kernels.attention == kAttnPerHead
@@ -67,6 +72,11 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
   } else if (const auto* e = std::get_if<MoeBlock>(&blk)) {
     if (e->n_experts < 1 || e->top_k < 1 || e->top_k > e->n_experts || (e->post_conv && (e->conv < 2 || e->conv > 64)))
       return no("MoE dimensions outside what the CUDA kernels support");
+    if (e->shared >= 0) {  // Gemma 4's MLP beside the experts: of their width, its norm after it
+      const auto* sm = e->shared < int(m->blocks.size()) ? std::get_if<MlpBlock>(&m->blocks[size_t(e->shared)]) : nullptr;
+      if (!sm || sm->hidden != e->hidden || !sm->post_norm.w || sm->lora)
+        return no("an MoE block's MLP beside its experts: an MLP of their width with its norm after it");
+    }
     if (e->top_k > kMoeRouteMaxTopK || e->n_experts > kMoeRouteMaxExperts)
       return no("MoE routing outside what the CUDA kernels take (top_k up to " + std::to_string(kMoeRouteMaxTopK) +
                 ", up to " + std::to_string(kMoeRouteMaxExperts) + " experts)");
@@ -103,6 +113,17 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
       return no("the EAGLE-4 gather takes one offset and eps for its two norms");
     if (m->states.ring_width != e->hidden) return no("the EAGLE-4 ring keeps one hidden vector per position");
     if (m->states.kv[size_t(a.kv)].fp8) return no("the EAGLE-4 cache in binary16 (its window's attention reads it)");
+  } else if (const auto* g = std::get_if<Gemma4MtpBlock>(&blk)) {
+    if (m->states.ring_width != g->target_hidden || g->target_hidden != m->hidden)
+      return no("the Gemma 4 assistant's ring keeps its target's hidden vector a position");
+    for (int j = 0; j < g->layers; ++j) {
+      const auto& a = block<AttnBlock>(m, g->first_layer + 2 * j);
+      if (!a.kv_shared || a.hidden != g->hidden || a.gate || a.lora || !a.post_norm.w || a.sinks || a.qkv_b ||
+          (a.window > 0 && a.window < 2))
+        return no("a Gemma 4 assistant layer outside what its draft step runs");
+      if (m->states.kv[size_t(a.kv)].fp8)
+        return no("the Gemma 4 assistant reads binary16 K/V caches only (--kv 16)");
+    }
   } else if (const auto* ds = std::get_if<DSparkBlock>(&blk)) {
     if (!attention_head_dim(ds->hd) || ds->block < 2 || ds->block > FLYX_MAX_ROWS || ds->nkv < 1 || ds->nh % ds->nkv ||
         ds->hidden != m->hidden || ds->markov_rank < 1)
@@ -197,7 +218,7 @@ const Block* block_of(const flyx_bmodel* m, const flyx_node& n, std::string* err
   const Block* b = &m->blocks[size_t(n.block)];
   const bool drafter = std::holds_alternative<MtpBlock>(*b) || std::holds_alternative<DFlashBlock>(*b) ||
                        std::holds_alternative<DvBlock>(*b) || std::holds_alternative<DSparkBlock>(*b) ||
-                       std::holds_alternative<Eagle4Block>(*b);
+                       std::holds_alternative<Eagle4Block>(*b) || std::holds_alternative<Gemma4MtpBlock>(*b);
   bool fits = false;
   switch (n.kind) {
     case FLYX_NODE_RUN:
@@ -206,7 +227,7 @@ const Block* block_of(const flyx_bmodel* m, const flyx_node& n, std::string* err
              std::holds_alternative<HeadBlock>(*b) || std::holds_alternative<VisionStemBlock>(*b) ||
              std::holds_alternative<VitAttnBlock>(*b) || std::holds_alternative<VitMlpBlock>(*b) ||
              std::holds_alternative<VisionMergeBlock>(*b) || std::holds_alternative<RelAttnBlock>(*b) ||
-             std::holds_alternative<MoeBlock>(*b);
+             std::holds_alternative<MoeBlock>(*b) || std::holds_alternative<PerLayerInputBlock>(*b);
       break;
     case FLYX_NODE_TAP: {
       if (const auto* d = std::get_if<DFlashBlock>(b)) fits = n.arg0 >= 0 && n.arg0 < d->n_taps;
@@ -267,6 +288,13 @@ bool fused_eagle4_draft(const flyx_bmodel*, const Block& blk) {
   const auto* e = std::get_if<Eagle4Block>(&blk);
   return e && e->hidden % 64 == 0 && e->mlp.inter % 64 == 0;
 }
+bool fused_gemma4_mtp_draft(const flyx_bmodel* m, const Block& blk) {
+  const auto* g = std::get_if<Gemma4MtpBlock>(&blk);
+  if (!g || g->hidden % 64) return false;
+  for (int j = 0; j < g->layers; ++j)
+    if (block<MlpBlock>(m, g->first_layer + 2 * j + 1).inter % 64) return false;
+  return true;
+}
 bool fused_dspark_draft(const flyx_bmodel*, const Block& blk) {
   const auto* d = std::get_if<DSparkBlock>(&blk);
   return d && d->hidden % 64 == 0 && d->inter % 64 == 0;
@@ -299,6 +327,10 @@ const RegionImpl kOverrides[] = {
      [](const Pass& ps, const flyx_node& n, const Block* b) {
        if (n.arg1 == FLYX_DRAFT_TREE) eagle4_draft_tree(ps.s, std::get<Eagle4Block>(*b), n.arg0, ps.v.L, true);
        else eagle4_draft(ps.s, std::get<Eagle4Block>(*b), n.arg0, ps.v.L, true);
+     }},
+    {FLYX_NODE_DRAFT, "fused producers", 1 << 30, fused_gemma4_mtp_draft,
+     [](const Pass& ps, const flyx_node& n, const Block* b) {
+       gemma4_mtp_draft(ps.s, std::get<Gemma4MtpBlock>(*b), n.arg0, ps.v.L, true);
      }},
     {FLYX_NODE_DRAFT, "fused producers", 1 << 30, fused_dspark_draft,
      [](const Pass& ps, const flyx_node& n, const Block* b) {
@@ -414,7 +446,7 @@ bool sequential_draft(const flyx_plan* p) {
   for (size_t i = 0; i < p->nodes.size(); ++i)
     if (p->nodes[i].kind == FLYX_NODE_DRAFT && p->block[i])
       return std::holds_alternative<MtpBlock>(*p->block[i]) || std::holds_alternative<DSparkBlock>(*p->block[i]) ||
-             std::holds_alternative<Eagle4Block>(*p->block[i]);
+             std::holds_alternative<Eagle4Block>(*p->block[i]) || std::holds_alternative<Gemma4MtpBlock>(*p->block[i]);
   return false;
 }
 
@@ -426,6 +458,8 @@ void draft_step_range(const Pass& ps, int start, int end) {
       mtp_draft(ps.s, *t, end, ps.v.L, fused, start);
     } else if (const auto* e = std::get_if<Eagle4Block>(ps.p->block[i])) {
       eagle4_draft(ps.s, *e, end, ps.v.L, fused, start);
+    } else if (const auto* g = std::get_if<Gemma4MtpBlock>(ps.p->block[i])) {
+      gemma4_mtp_draft(ps.s, *g, end, ps.v.L, fused, start);
     } else if (const auto* d = std::get_if<DFlashBlock>(ps.p->block[i])) {
       draft_block(ps.s, *d, end, ps.v.L, ps.p->nodes[i].arg1 == FLYX_DRAFT_TREE, fused);
     } else if (const auto* ds = std::get_if<DSparkBlock>(ps.p->block[i])) {
@@ -459,6 +493,8 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
             if (residual16_pass(ps)) round_rows_bf16(rv.b.x, e->hidden, e->hidden, ps.rows, st);
           }
         }
+      } else if (const auto* q = std::get_if<PerLayerInputBlock>(b)) {
+        per_layer_input_layer(ps, *q);
       } else if (const auto* g = std::get_if<GdnBlock>(b)) {
         gdn_layer(ps, *g);
       } else if (const auto* a = std::get_if<AttnBlock>(b)) {
@@ -507,6 +543,7 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
       if (const auto* t = std::get_if<MtpBlock>(b)) mtp_draft(s, *t, n.arg0, rv.L);
       else if (const auto* e = std::get_if<Eagle4Block>(b))
         n.arg1 == FLYX_DRAFT_TREE ? eagle4_draft_tree(s, *e, n.arg0, rv.L) : eagle4_draft(s, *e, n.arg0, rv.L);
+      else if (const auto* g = std::get_if<Gemma4MtpBlock>(b)) gemma4_mtp_draft(s, *g, n.arg0, rv.L);
       else if (const auto* v = std::get_if<DvBlock>(b)) dv_draft(s, *v, n.arg0, rv.L);
       else if (const auto* ds = std::get_if<DSparkBlock>(b)) dspark_draft(s, *ds, n.arg0, rv.L);
       else draft_block(s, std::get<DFlashBlock>(*b), n.arg0, rv.L, n.arg1 == FLYX_DRAFT_TREE);
@@ -514,6 +551,7 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
     case FLYX_NODE_CONTEXT:
       if (const auto* t = std::get_if<MtpBlock>(b)) mtp_context(ps, *t);
       else if (const auto* e = std::get_if<Eagle4Block>(b)) eagle4_context(ps, *e);
+      else if (const auto* g = std::get_if<Gemma4MtpBlock>(b)) gemma4_mtp_context(ps, *g);
       else if (const auto* v = std::get_if<DvBlock>(b); v && ps.round) dv_context_unless_noop(ps, *v);
       else if (v) forget_canvas(s, st);  // a prefill's: the canvas starts over
       else if (const auto* ds = std::get_if<DSparkBlock>(b)) dspark_context(ps, *ds);

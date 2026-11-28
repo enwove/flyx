@@ -13,7 +13,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Template fixture -> the chat format the engine should recognise it as (models/formats).  MiniCPM5 writes its calls
 # as <function name=...> with no <tool_call> around them, a format this build does not read: "plain", tools refused.
-TEMPLATES = {"qwen3.5.jinja": "qwen35", "qwen3.jinja": "hermes", "minicpm5.jinja": "plain"}
+TEMPLATES = {"qwen3.5.jinja": "qwen35", "qwen3.jinja": "hermes", "minicpm5.jinja": "plain", "gemma4.jinja": "gemma4",
+             "gemma4_early.jinja": "gemma4"}
 
 WEATHER = {"type": "function", "function": {
     "name": "get_weather", "description": "查询天气 (current weather)",
@@ -26,6 +27,14 @@ SEARCH = {"type": "function", "function": {
     "parameters": {"type": "object", "properties": {
         "query": {"type": "string"}, "filters": {"type": "object"}, "limit": {"type": "number"},
         "fresh": {"type": "boolean"}, "sites": {"type": "array", "items": {"type": "string"}}}}}}
+
+
+# keys in capitals and floats of many digits: templates that sort keys (Gemma 4's dictsort, Jinja2's case-insensitive
+# by default) or print numbers bare (Python's repr) render them as transformers does only so
+GEO = {"type": "function", "function": {
+    "name": "locate", "description": "Find a place",
+    "parameters": {"type": "object", "properties": {
+        "Zone": {"type": "string"}, "lat": {"type": "number"}, "alt": {"type": "number"}}}}}
 
 
 def call(name, args):
@@ -75,6 +84,12 @@ CASES = [
         {"role": "assistant", "content": "", "reasoning_content": "Then flights.",
          "tool_calls": [call("search", {"query": "flights to Rome"})]},
         {"role": "tool", "tool_call_id": "b", "content": "2 flights"}], [WEATHER, SEARCH]),
+    ("keys and floats", [
+        {"role": "user", "content": "Where is it?"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [call("locate", {"Zone": "UTC", "lat": 48.85661234, "alt": 1e-07, "big": 1e20})]},
+        {"role": "tool", "tool_call_id": "g1", "content": "found"},
+        {"role": "user", "content": "Thanks."}], [WEATHER, GEO]),
     # the client's text holds special-token text and an added token: it must stay text
     ("special tokens in content", [
         {"role": "system", "content": "Explain chat formats."},
@@ -131,6 +146,10 @@ def expected(tok, template: str, messages, tools, thinking: bool) -> dict:
     with_gen, without = render(probe, True), render(probe, False)
     gen = with_gen[len(without):] if with_gen.startswith(without) else None
     end = len(full) - len(gen) if gen is not None and full.endswith(gen) else None
+    if end is None and messages[-1]["role"] == "tool":  # a generation prompt of its own after tool results (Gemma 4)
+        before = render(messages, False)
+        if len(full) > len(before) and full.startswith(before):
+            end, gen = len(before), full[len(before):]
     bounds, tried = [], 0
     for k in range(len(messages) - 1, 0, -1):
         if tried == 2:
@@ -148,6 +167,8 @@ def expected(tok, template: str, messages, tools, thinking: bool) -> dict:
     if end is not None and candidate(len(messages)):
         bounds.append(len(full[:end].encode("utf-8")))
     tail = gen if end is not None else full
-    opened = tail.rfind("<think>")
-    in_reasoning = opened >= 0 and tail.find("</think>", opened) < 0
+    # the template's thinking marks: Gemma 4's channel, else <think>
+    opens, closes = ("<|channel>", "<channel|>") if "<|channel>" in template else ("<think>", "</think>")
+    opened = tail.rfind(opens)
+    in_reasoning = opened >= 0 and tail.find(closes, opened) < 0
     return {"text": full, "boundaries": bounds, "in_reasoning": in_reasoning}

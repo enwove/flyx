@@ -144,6 +144,16 @@ void rows_to_bf16(const float* x, int ldx, int rows, int K, bf16* out, cudaStrea
 
 namespace {
 
+// Packed GGML blocks with the inputs the weight takes (flyx_weight::activations).
+BlockMat block_mat(const uint8_t* data, const uint16_t* scales, int dtype, int rows, int activations) {
+  BlockMat b{data, scales, dtype, rows};
+  b.q8 = activations == FLYX_ACT_Q8 || activations == FLYX_ACT_MXFP8_Q8;  // the latter's rounds
+  b.bf16 = activations == FLYX_ACT_BF16;
+  b.mxfp8 = activations == FLYX_ACT_MXFP8;
+  b.mxfp8_q8 = activations == FLYX_ACT_MXFP8_Q8;
+  return b;
+}
+
 // Gives back the certified head's copy (what of it was allocated: null fields were not).  Only the certified head's:
 // the copy option head_fp8 reads changes the logits and is the user's choice.
 void release_cert(flyx_bmodel* m, HeadBlock* h) {
@@ -412,9 +422,16 @@ bool make_sign_head_for(flyx_bmodel* m, const bf16* w, const BlockMat* wb, int N
 // left here are the head copies drafts pick candidates from, for every drafter that reads the target's head (MTP,
 // DFlash2, DSpark).
 void make_draft_weights(flyx_bmodel* m) {
-  if (m->opt.draft_weights == interfaces::DraftWeightsMode::kExact ||
-      (m->mtp_block < 0 && m->dflash_block < 0 && m->dspark_block < 0))
-    return;
+  if (m->opt.draft_weights == interfaces::DraftWeightsMode::kExact) return;
+  // Gemma 4's assistant picks its drafts from a head of its own: its 1-bit copy (a table of bf16 rows)
+  if (m->gemma4_mtp_block >= 0) {
+    auto& h = block<HeadBlock>(m, block<Gemma4MtpBlock>(m, m->gemma4_mtp_block).head);
+    if (!m->opt.full_draft_head && (h.w || h.wb.data) && h.hidden % 128 == 0 && h.vocab >= kDraftPickFloats &&
+        (h.wb.data || h.hidden <= 4096))
+      make_sign_head_for(m, h.wb.data ? nullptr : h.w, h.wb.data ? &h.wb : nullptr, h.vocab, h.hidden, &h.coarse,
+                         "assistant head");
+  }
+  if (m->mtp_block < 0 && m->dflash_block < 0 && m->dspark_block < 0) return;
 
   auto& h = block<HeadBlock>(m, m->head_block);
   const bool want_sign =
@@ -770,31 +787,56 @@ Lin WeightLoader::lin_stack(const std::vector<int>& ws, int* rows_out, const std
   return L;
 }
 
-ExpertMat WeightLoader::expert_mat(int w) {
-  if (auto it = experts_.find(w); it != experts_.end()) return it->second;
+ExpertMat WeightLoader::expert_mat(int w) { return expert_mat(std::vector<int>{w}); }
+
+// Weights [E, N_i, K] of one dtype stacked expert by expert: expert e's rows of the first, then its rows of the
+// next (gpt-oss's gate and up, stored apart, as the fused [E, 2 I, K] the kernels read).
+std::vector<float> WeightLoader::expert_scales(int w) const {
+  const size_t E = size_t(t(w)->shape[0]);
+  std::vector<float> s(E, 1.f);
+  if (const auto* s2 = weights_[w].scale2) {
+    const size_t n = numel(s2);
+    if (n != E && n != 1) throw std::runtime_error(std::string(t(w)->name) + ": unexpected per-expert scale length");
+    for (size_t e = 0; e < E; ++e) s[e] = static_cast<float>(flyx::ops::load(s2, n == 1 ? 0 : e));
+  }
+  return s;
+}
+
+ExpertMat WeightLoader::expert_mat(const std::vector<int>& ws, bool first_scales) {
+  if (auto it = experts_.find(ws); it != experts_.end()) return it->second;
+  const int w = ws.front();
   const auto* v = t(w);
-  const auto layout = expert_layout(weights_[w], m_->opt.packed_blocks);
-  const size_t E = size_t(v->shape[0]), N = size_t(v->shape[1]), K = size_t(v->shape[2]);
+  auto layout = expert_layout(weights_[w], m_->opt.packed_blocks);
+  const size_t E = size_t(v->shape[0]), K = size_t(v->shape[2]);
+  std::vector<size_t> part_rows;  // N_i
+  size_t N = 0;
+  for (int x : ws) {
+    const auto* u = t(x);
+    if (u->ndim != 3 || u->dtype != v->dtype || size_t(u->shape[0]) != E || size_t(u->shape[2]) != K ||
+        bool(weights_[x].scale2) != bool(weights_[w].scale2) || (ws.size() > 1 && weights_[x].scale2 && !first_scales))
+      throw std::runtime_error(std::string(u->name) + ": experts stacked with another dtype, shape or scale");
+    part_rows.push_back(size_t(u->shape[1]));
+    N += part_rows.back();
+  }
+  layout.rows = E * N;
   const size_t total_rows = layout.rows;
+  // The stack's row r: expert r / N, its row r % N of the part that holds it.
+  auto source = [&](size_t r, size_t* row) {
+    const size_t e = r / N;
+    size_t j = r % N, i = 0;
+    while (j >= part_rows[i]) j -= part_rows[i++];
+    *row = e * part_rows[i] + j;
+    return t(ws[i]);
+  };
   ExpertMat em{};
   em.n_experts = int(E);
   em.N = int(N);
 
   // Optional per-expert F32 scale tensor (present on GGML NVFP4 and on requantized MoE experts in Unsloth GGUFs).
   auto upload_expert_scales = [&]() -> float* {
-    const auto* s2 = weights_[w].scale2;
     if (!layout.expert_scales) return nullptr;
     float* rs_dev = m_->alloc<float>(layout.expert_scales);
-    std::vector<float> rs_host(E, 1.f);
-    if (s2) {
-      const size_t sn = numel(s2);
-      if (sn == E)
-        for (size_t i = 0; i < E; ++i) rs_host[i] = static_cast<float>(flyx::ops::load(s2, i));
-      else if (sn == 1)
-        std::fill(rs_host.begin(), rs_host.end(), static_cast<float>(flyx::ops::load(s2, 0)));
-      else
-        throw std::runtime_error(std::string(v->name) + ": unexpected per-expert scale length");
-    }
+    const std::vector<float> rs_host = expert_scales(w);
     CK(cudaMemcpy(rs_dev, rs_host.data(), E * sizeof(float), cudaMemcpyHostToDevice));
     return rs_dev;
   };
@@ -804,7 +846,10 @@ ExpertMat WeightLoader::expert_mat(int w) {
     const size_t q_row = layout.payload_row, s_row = layout.scales_row, file_row = per_row * 36;
     uint8_t* q_dev = m_->alloc<uint8_t>(layout.payload_bytes());
     uint8_t* s_dev = m_->alloc<uint8_t>(layout.scale_bytes());
-    const auto* file = static_cast<const uint8_t*>(v->data);
+    auto file_at = [&](size_t r) {
+      size_t row = 0;
+      return static_cast<const uint8_t*>(source(r, &row)->data) + row * file_row;
+    };
     times_.file_bytes += total_rows * file_row;
     if (!staging_) staging_ = std::make_unique<LoadStaging>();
     LoadStaging& S = *staging_;
@@ -820,7 +865,7 @@ ExpertMat WeightLoader::expert_mat(int w) {
       uint8_t* hs = hq + (nr * q_row + 15) / 16 * 16;
       parallel_rows(nr, [&](size_t a, size_t e) {
         for (size_t r = a; r < e; ++r) {
-          const uint8_t* in = file + (r0 + r) * file_row;
+          const uint8_t* in = file_at(r0 + r);
           uint8_t* qo = hq + r * q_row;
           uint8_t* so = hs + r * s_row;
           for (size_t k = 0; k < per_row; ++k, in += 36) {
@@ -846,7 +891,7 @@ ExpertMat WeightLoader::expert_mat(int w) {
     em.q = q_dev;
     em.s = s_dev;
     em.rs = upload_expert_scales();
-    return experts_[w] = em;
+    return experts_[ws] = em;
   }
 
   if (layout.format == ExpertLayout::ggml_blocks) {
@@ -857,7 +902,10 @@ ExpertMat WeightLoader::expert_mat(int w) {
     const size_t file_row = per_row * size_t(l.bytes);
     uint8_t* data = m_->alloc<uint8_t>(layout.payload_bytes());
     uint16_t* scales = m_->alloc<uint16_t>(layout.scale_bytes() / sizeof(uint16_t));
-    const auto* file = static_cast<const uint8_t*>(v->data);
+    auto file_at = [&](size_t r) {
+      size_t row = 0;
+      return static_cast<const uint8_t*>(source(r, &row)->data) + row * file_row;
+    };
     times_.file_bytes += total_rows * file_row;
     if (!staging_) staging_ = std::make_unique<LoadStaging>();
     LoadStaging& S = *staging_;
@@ -874,7 +922,12 @@ ExpertMat WeightLoader::expert_mat(int w) {
       uint8_t* hp = S.slots[b].buf;
       auto* hs = reinterpret_cast<uint16_t*>(hp + (nr * row_bytes + 15) / 16 * 16);
       parallel_rows(nr, [&](size_t a, size_t e) {
-        blocks_pack(dtype, file + (r0 + a) * file_row, (e - a) * per_row, hp + a * row_bytes, hs + a * row_scales);
+        if (ws.size() == 1) {  // the rows as stored, one run
+          blocks_pack(dtype, file_at(r0 + a), (e - a) * per_row, hp + a * row_bytes, hs + a * row_scales);
+          return;
+        }
+        for (size_t r = a; r < e; ++r)
+          blocks_pack(dtype, file_at(r0 + r), per_row, hp + r * row_bytes, hs + r * row_scales);
       });
       CK(cudaMemcpyAsync(data + r0 * row_bytes, hp, nr * row_bytes, cudaMemcpyHostToDevice, S.st));
       CK(cudaMemcpyAsync(scales + r0 * row_scales, hs, nr * scale_bytes, cudaMemcpyHostToDevice, S.st));
@@ -882,24 +935,26 @@ ExpertMat WeightLoader::expert_mat(int w) {
       times_.copy_s += t1 - t0;
       times_.pack_s += load_clock() - t1;
     }
-    em.blk = BlockMat{data, scales, v->dtype, int(total_rows), weights_[w].activations == FLYX_ACT_Q8};
+    em.blk = block_mat(data, scales, v->dtype, int(total_rows), weights_[w].activations);
     em.rs = upload_expert_scales();
-    return experts_[w] = em;
+    return experts_[ws] = em;
   }
 
   // Fallback: BF16 on device (handles BF16, F16, F32, or blocks=bf16).
   if (!numbers(v)) throw std::runtime_error(std::string(v->name) + ": unsupported expert dtype");
   const size_t bytes = layout.payload_bytes();
   bf16* dst = m_->alloc<bf16>(bytes / sizeof(bf16));
-  if (v->dtype == FLYX_DT_BF16) {
+  if (v->dtype == FLYX_DT_BF16 && ws.size() == 1) {
     upload_staged(dst, v->data, bytes);
   } else {
     const size_t row_bytes = K * sizeof(uint16_t);
     auto conv_rows = [&](size_t r0, size_t count, uint16_t* out) {
       for (size_t i = 0; i < count; ++i) {
-        const size_t from = (r0 + i) * K;
+        size_t row = 0;
+        const auto* u = source(r0 + i, &row);
+        const size_t from = row * K;
         for (size_t k = 0; k < K; ++k)
-          out[i * K + k] = float_to_bf16(static_cast<float>(flyx::ops::load(v, from + k)));
+          out[i * K + k] = float_to_bf16(static_cast<float>(flyx::ops::load(u, from + k)));
       }
     };
     if (bytes < (size_t(1) << 20)) {
@@ -924,7 +979,7 @@ ExpertMat WeightLoader::expert_mat(int w) {
   }
   em.w = dst;
   em.rs = upload_expert_scales();
-  return experts_[w] = em;
+  return experts_[ws] = em;
 }
 
 PackedQuantScratch::~PackedQuantScratch() {
@@ -1361,7 +1416,7 @@ VisionLin WeightLoader::vision_lin_stack(const std::vector<int>& ws, int* rows_o
     for (int w : ws)
       if (weights_[w].activations != weights_[ws[0]].activations)
         throw std::runtime_error(std::string(t(w)->name) + ": mixed activation rounding in vision stack");
-    vl.a4 = weights_[ws[0]].activations == FLYX_ACT_NVFP4;
+    vl.a4 = weights_[ws[0]].activations == FLYX_ACT_NVFP4_BF16;
     if (!host && !disk) {
       vl.w = lin_stack(ws);
       record_bytes(total_rows * K / 2 + total_rows * K / 16 + total_rows * sizeof(float));
@@ -1604,7 +1659,7 @@ BlockMat WeightLoader::pack_run(const std::vector<int>& ws, const std::vector<Ro
               scales + r_first * row_scales, host);
     r_first += size_t(t(ws[i])->shape[0]);
   }
-  return BlockMat{data, scales, first->dtype, int(total), weights_[ws[0]].activations == FLYX_ACT_Q8};
+  return block_mat(data, scales, first->dtype, int(total), weights_[ws[0]].activations);
 }
 
 void parallel_rows(size_t n, const std::function<void(size_t, size_t)>& fn) {

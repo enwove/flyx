@@ -51,7 +51,7 @@ All commands that load a model share the parser in `apps/common/engine_flags.cpp
 | `--no-lookup` | flag | off | Disable prompt-lookup rounds (15 drafts, wider with the `wide` backend option) on repeated text. |
 | `--draft-trees` | flag | off (on with a DSpark drafter on a Qwen3 or Llama target, or an EAGLE-4 drafter) | Enable best-first draft trees (DFlash2, DSpark, EAGLE-4) alongside chains, chosen per round by measured cost and acceptance (also `FLYX_DRAFT_TREES=1`). |
 | `--no-draft-trees` | flag | off | Chains only, even with a DSpark or EAGLE-4 drafter (also `FLYX_DRAFT_TREES=0`). |
-| `--activations` | `exact` \| `nvfp4` | format default | `exact` forces per-format exact activation rounding (`bf16`/`fp16`) everywhere; `nvfp4` forces NVFP4 prefill inputs on NVFP4 weights even if the file declares bf16 (requires `sm_120a` and `K % 128 == 0`). |
+| `--activations` | `PREFILL[/DECODE]`: `q8` \| `bf16` \| `mxfp8` \| `mxfp8/q8` \| `nvfp4/bf16` \| `exact` | as the file has it | The inputs of prefill passes, then of decoding rounds (the same where `/DECODE` is left out): see [models.md, Precision](models.md#precision). `q8`: GGML blocks' 8 bits (their default, llama.cpp's); `bf16`, `mxfp8`, `mxfp8/q8`: gpt-oss's MXFP4 experts as vLLM, as SGLang (sm_120), or SGLang's prefill with llama.cpp's decoding; `nvfp4/bf16`: NVFP4 weights' NVFP4 prefill even where the file declares bf16 (sm_120a, `K % 128 == 0`); `exact`: every format's own rounding everywhere. |
 | `--chat-template` | `FILE` | model's template | Override model Jinja chat template from file. |
 | `-v` | flag | off | Verbose logging (memory budget bill, load timings, per-request metrics, each CUDA round graph a session keeps and the size it is counted at, and as a session ends its rounds from a graph and without one). |
 
@@ -139,7 +139,7 @@ The engine and server register their environment variables in `core/os/env.h`. E
 | `FLYX_BACKEND_DIR` | path | Directory searched for `libflyx-*.so` / `libflyx-*.dll`. |
 | `FLYX_BACKEND_OPTIONS` | `K=V,K2=V2` | Prepended before `--backend-opt` flags. |
 | `FLYX_DRAFTER` | `mtp` \| `dflash2` \| `dflash` \| `dspark` \| `dspine` \| `eagle4` \| `dv` \| `all` \| `none` | Default drafter mode when `--drafter` is unset. |
-| `FLYX_ACTIVATIONS` | `exact` \| `nvfp4` | Default activation mode when `--activations` is unset. |
+| `FLYX_ACTIVATIONS` | as `--activations` | Default activation mode when `--activations` is unset. |
 | `FLYX_LOOKUP` | `0` \| `1` | Enable/disable prompt lookup (`0` = `--no-lookup`). |
 | `FLYX_DRAFT_TREES` | `0` \| `1` | Enable/disable draft trees (`1` = `--draft-trees`, `0` = `--no-draft-trees`; unset: on with a DSpark drafter on a Qwen3 or Llama target, or an EAGLE-4 drafter on a Qwen3, Qwen3.5/3.8 or Llama target, EAGLE-4's under `--kv-method auto` only where the whole context reads exactly). |
 | `FLYX_ADAPTIVE` | `0` \| `1` | Enable/disable intra-round confidence optimal stopping on adaptive drafter plans (`1`, default). Enabled for sequential drafters (MTP) and for drafters (DSpark, with step-wise Markov early stopping and optimal prefix verification, and DFlash2) on targets whose verify cost scales steeply with width (such as sparse MoE `inkling2_loop`, across checkpoints up to the drafter's trained block `{1, 2, 3, 5, 7}`, with sustained high-acceptance runs widening past the trained block when supported); dense targets paired with block drafters (DFlash2) verify the chooser's fixed widths. |

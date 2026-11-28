@@ -29,15 +29,6 @@ constexpr int kMoeWarps = 4;
 constexpr int kMoeKT = 1024;
 constexpr int kRouteThreads = 128, kRouteTop = kMoeRouteMaxTopK;  // threads a row; the most experts a row takes
 
-__device__ __forceinline__ float situ_val(float g, float u, float beta, float linear_beta) {
-  if (beta > 0.f) {
-    const float act = beta * tanhf(g / beta) * sigm(g);
-    const float lin = linear_beta > 0.f ? (linear_beta * tanhf(u / linear_beta)) : u;
-    return act * lin;
-  }
-  return silu(g) * u;
-}
-
 __device__ __forceinline__ float warp_tree_sum(float v) {
 #pragma unroll
   for (int o = 1; o < 32; o <<= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
@@ -56,16 +47,20 @@ const MoeBlockOps* moe_block_ops(int dtype) {
   return nullptr;
 }
 
-// ---- moe_route & situ_rows ----------------------------------------------------------------
+// ---- moe_route & moe_act_rows ------------------------------------------------------------
 __global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* logits,
                                                              const float* __restrict__ bias, int E, int top_k,
                                                              int gating_sigmoid, int norm_weights, float norm_eps,
                                                              float route_scale, int* __restrict__ idx_out,
-                                                             float* __restrict__ w_out) {
+                                                             float* __restrict__ w_out,
+                                                             const float* __restrict__ logit_bias,
+                                                             const float* __restrict__ expert_scale) {
   pdl_trigger();
   pdl_wait();
   const int r = blockIdx.x, tid = threadIdx.x;
   const float* lr = logits + size_t(r) * E;
+  // a logit and its bias where the router has one (gpt-oss: the router linear's own)
+  auto lg = [&](int e) { return lr[e] + (logit_bias ? logit_bias[e] : 0.f); };
   extern __shared__ float sh[];  // probs[E], sel[E]
   float* probs = sh;
   float* sel = sh + E;
@@ -75,17 +70,17 @@ __global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* logits
 
   if (gating_sigmoid) {
     for (int e = tid; e < E; e += kRouteThreads) {
-      const float p = sigm(lr[e]);
+      const float p = sigm(lg(e));
       probs[e] = p;
       sel[e] = p + (bias ? bias[e] : 0.f);
     }
   } else {
     float mx = -INFINITY;
-    for (int e = tid; e < E; e += kRouteThreads) mx = fmaxf(mx, lr[e]);
+    for (int e = tid; e < E; e += kRouteThreads) mx = fmaxf(mx, lg(e));
     mx = block_max(mx);
     float z = 0.f;
     for (int e = tid; e < E; e += kRouteThreads) {
-      const float v = expf(lr[e] - mx);
+      const float v = expf(lg(e) - mx);
       probs[e] = v;
       z += v;
     }
@@ -123,18 +118,39 @@ __global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* logits
   float* out_w = w_out + size_t(r) * top_k;
   for (int k = tid; k < top_k; k += kRouteThreads) {
     out_i[k] = s_top_i[k];
-    out_w[k] = s_top_w[k] * s_norm;
+    out_w[k] = s_top_w[k] * s_norm * (expert_scale ? expert_scale[s_top_i[k]] : 1.f);
   }
 }
 
-__global__ void k_situ_rows(const float* __restrict__ gu, int ld_gu, int I, float beta, float linear_beta,
-                            float* __restrict__ out, int ld_out) {
+// rows of gate | up -> mact's activation, pair r's expert eidx[r] (its biases, where mact has them).
+__global__ void k_moe_act_rows(const float* __restrict__ gu, int ld_gu, int I, MoeAct mact,
+                               const int* __restrict__ eidx, float* __restrict__ out, int ld_out) {
   pdl_trigger();
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   const int r = blockIdx.y;
   if (i >= I) return;
   const float* row = gu + size_t(r) * ld_gu;
-  out[size_t(r) * ld_out + i] = situ_val(row[i], row[I + i], beta, linear_beta);
+  out[size_t(r) * ld_out + i] = moe_act_val(mact, row[i], row[I + i], mact.bias ? eidx[r] : 0, i, I);
+}
+
+// Rows of float32 values as MXFP8 (ops/dtype/ref.h round_mxfp8, FLYX_ACT_MXFP8): per 32 values the exponent field of
+// their largest magnitude less 8, within [1, 254] (q8_s: a byte each), each value's nearest e4m3 of value / 2^(s - 127)
+// with __NV_SATFINITE (its magnitude's code and its sign: the reference's bytes).  A warp a group of 32.
+__global__ void __launch_bounds__(256)
+    k_moe_stage_mxfp8(const float* x, int ldx, int K, uint8_t* __restrict__ q, uint8_t* __restrict__ s) {
+  pdl_trigger();
+  pdl_wait();  // x: the kernel before
+  const int r = blockIdx.x, lane = threadIdx.x & 31, units = K >> 5;
+  for (int grp = threadIdx.x >> 5; grp < units; grp += blockDim.x >> 5) {
+    const float a = x[size_t(r) * ldx + 32 * grp + lane];
+    float m = fabsf(a);
+#pragma unroll
+    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    const int se = min(max(int((__float_as_uint(m) >> 23) & 0xFFu) - 8, 1), 254);
+    const __nv_fp8_storage_t c = __nv_cvt_float_to_fp8(ldexpf(fabsf(a), 127 - se), __NV_SATFINITE, __NV_E4M3);
+    q[size_t(r) * K + 32 * grp + lane] = uint8_t(c) | (a < 0.f ? 0x80u : 0u);
+    if (lane == 0) s[size_t(r) * units + grp] = uint8_t(se);
+  }
 }
 
 // ---- Compacted work-tile grouping & one-pass activation staging ---------------------------
@@ -270,8 +286,9 @@ __global__ void __launch_bounds__(256)
   }
 }
 
+// out[r] (=|+=) sum_k ew[r, k] (down_buf[r, k] + bias[eidx[r, k]]) (bias [E, H], null: none).
 __global__ void k_moe_weighted_sum(const float* down_buf, const float* ew, int top_k, int H, float* out, int ld_out,
-                                   int accumulate) {
+                                   int accumulate, const int* eidx, const float* bias) {
   pdl_trigger();
   pdl_wait();
   const int n = blockIdx.x * blockDim.x + threadIdx.x;
@@ -280,7 +297,11 @@ __global__ void k_moe_weighted_sum(const float* down_buf, const float* ew, int t
   float total = 0.f;
   const float* w = ew + size_t(r) * top_k;
   const float* base = down_buf + size_t(r) * top_k * H + n;
-  for (int k = 0; k < top_k; ++k) total = __fmaf_rn(w[k], base[size_t(k) * H], total);
+  for (int k = 0; k < top_k; ++k) {
+    float v = base[size_t(k) * H];
+    if (bias) v += bias[size_t(eidx[size_t(r) * top_k + k]) * H + n];
+    total = __fmaf_rn(w[k], v, total);
+  }
   float* dst = out + size_t(r) * ld_out + n;
   *dst = accumulate ? (*dst + total) : total;
 }
@@ -292,7 +313,7 @@ __global__ void __launch_bounds__(32 * NW)
     k_moe_nvfp4_mma(const float* x, int ldx, const bf16* bf16_a, const uint8_t* __restrict__ Q,
                     const uint8_t* __restrict__ S, const float* __restrict__ RS, int N_exp, int I_or_H, int K,
                     const int* eidx, const MoeTask* tasks, const int* n_tasks, const int* pairs, int top_k,
-                    float situ_beta, float situ_linear_beta, float* __restrict__ out, int ld_out) {
+                    MoeAct mact, float* __restrict__ out, int ld_out) {
   pdl_trigger();
   pdl_wait();  // x or bf16_a, the experts and the tasks: the kernels before
   static constexpr int VPL = SPAN / 4, WORDS = VPL / 8, BW = VPL / 2;
@@ -501,7 +522,7 @@ __global__ void __launch_bounds__(32 * NW)
             const float gv = acc0[i][e_row + j] * rs;
             if constexpr (FUSE_ACT) {
               const float uv = acc1[i][e_row + j] * rs;
-              out[out_row + col] = situ_val(gv, uv, situ_beta, situ_linear_beta);
+              out[out_row + col] = moe_act_val(mact, gv, uv, e, col, I_or_H);
             } else {
               out[out_row + col] = gv;
             }
@@ -602,7 +623,7 @@ template <bool FUSE_ACT, bool IS_DOWN, int BMAX>
 __global__ void __launch_bounds__(32 * kVecWarps)
     k_moe_nvfp4_vec(const float* x, int ldx, const uint8_t* __restrict__ Q, const uint8_t* __restrict__ S,
                     const float* __restrict__ RS, int N_exp, int I_or_H, int K, const int* eidx, const MoeTask* tasks,
-                    const int* n_tasks, const int* pairs, int top_k, float situ_beta, float situ_linear_beta,
+                    const int* n_tasks, const int* pairs, int top_k, MoeAct mact,
                     float* __restrict__ out, int ld_out) {
   pdl_trigger();
   pdl_wait();  // x, the experts and the tasks: the kernels before
@@ -638,7 +659,7 @@ __global__ void __launch_bounds__(32 * kVecWarps)
       const int col = c0 + c;
       if (col >= N_work) break;
       if constexpr (FUSE_ACT)
-        orow[col] = situ_val(acc[b][2 * c], acc[b][2 * c + 1], situ_beta, situ_linear_beta);
+        orow[col] = moe_act_val(mact, acc[b][2 * c], acc[b][2 * c + 1], e, col, I_or_H);
       else
         orow[col] = acc[b][c];
     }
@@ -648,7 +669,7 @@ __global__ void __launch_bounds__(32 * kVecWarps)
 // With no per-expert output scratch, keep one row's weighted sum in registers.
 __global__ void k_moe_nvfp4_vec_sum(const float* act, int ld, const uint8_t* Q, const uint8_t* S, const float* RS,
                                     const int* ids, const float* weights, int top_k, int H, int K,
-                                    float* out, int ld_out, bool accumulate) {
+                                    float* out, int ld_out, bool accumulate, const float* bias) {
   pdl_trigger();
   pdl_wait();
   const int row = blockIdx.y, lane = threadIdx.x & 31;
@@ -660,8 +681,10 @@ __global__ void k_moe_nvfp4_vec_sum(const float* act, int ld, const uint8_t* Q, 
     float dot[1][kVecRows];
     nvfp4_vec_products<false, true>(act, ld, Q, S, RS, H, H, K, top_k, ids[pid[0]], pid, 1, c0, dot);
     if (lane == 0) {
+      const float* b = bias ? bias + size_t(ids[pid[0]]) * H : nullptr;  // as k_moe_weighted_sum adds it
 #pragma unroll
-      for (int j = 0; j < kVecRows; ++j) sum[j] = __fmaf_rn(weights[pid[0]], dot[0][j], sum[j]);
+      for (int j = 0; j < kVecRows; ++j)
+        sum[j] = __fmaf_rn(weights[pid[0]], b && c0 + j < H ? dot[0][j] + b[c0 + j] : dot[0][j], sum[j]);
     }
   }
   if (lane == 0) {
@@ -685,7 +708,7 @@ __global__ void __launch_bounds__(32 * NW)
     k_moe_nvfp4_down_serial(const float* __restrict__ act, int ld_act, const uint8_t* __restrict__ Q,
                             const uint8_t* __restrict__ S, const float* __restrict__ RS, int H, int K,
                             const int* __restrict__ eidx, const float* __restrict__ ew, int top_k,
-                            float* __restrict__ out, int ld_out, int accumulate) {
+                            float* __restrict__ out, int ld_out, int accumulate, const float* __restrict__ bias) {
   pdl_trigger();
   static constexpr int VPL = SPAN / 4, STEPS = VPL / 4, WORDS = VPL / 8, BW = VPL / 2;
   __shared__ alignas(16) bf16 sm_x[SPAN];
@@ -762,8 +785,12 @@ __global__ void __launch_bounds__(32 * NW)
     if (g == 0 && n_base < H) {
 #pragma unroll
       for (int i = 0; i < NT; ++i) {
-        total[i][0] = __fmaf_rn(w_e, acc[i][0] * rs, total[i][0]);
-        total[i][1] = __fmaf_rn(w_e, acc[i][1] * rs, total[i][1]);
+        const int col = n_base + i * 8 + 2 * t4;  // as k_moe_weighted_sum adds the bias
+        float v0 = acc[i][0] * rs, v1 = acc[i][1] * rs;
+        if (bias && col < H) v0 += bias[size_t(e) * H + col];
+        if (bias && col + 1 < H) v1 += bias[size_t(e) * H + col + 1];
+        total[i][0] = __fmaf_rn(w_e, v0, total[i][0]);
+        total[i][1] = __fmaf_rn(w_e, v1, total[i][1]);
       }
     }
   }
@@ -784,7 +811,7 @@ __global__ void __launch_bounds__(32 * NW)
 
 template <int SPAN>
 int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
-                    float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out,
+                    MoeAct mact, bool fuse_act, float* out, int ld_out,
                     const MoeScratch* sc, const Launch& L) {
   cudaStream_t st = L.st;
   const int N_work = fuse_act ? I : 2 * I;
@@ -804,12 +831,10 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
       if (rc == 1 || !has_sc) {
         if (fuse_act)
           launch_dependent(k_moe_nvfp4_vec<true, false, 1>, dim3(gx, rc * top_k), dim3(32 * kVecWarps), L,
-                           xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k, situ_beta,
-                           situ_linear_beta, oc, ld_out);
+                           xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k, mact, oc, ld_out);
         else
           launch_dependent(k_moe_nvfp4_vec<false, false, 1>, dim3(gx, rc * top_k), dim3(32 * kVecWarps), L,
-                           xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k, situ_beta,
-                           situ_linear_beta, oc, ld_out);
+                           xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k, mact, oc, ld_out);
       } else {
         const int M = rc * top_k;
         const int mt = max_work_tiles(M, W.n_experts, 4);
@@ -818,11 +843,11 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
         if (fuse_act)
           launch_dependent(k_moe_nvfp4_vec<true, false, 4>, dim3(gx, mt), dim3(32 * kVecWarps), L,
                            xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k,
-                           situ_beta, situ_linear_beta, oc, ld_out);
+                           mact, oc, ld_out);
         else
           launch_dependent(k_moe_nvfp4_vec<false, false, 4>, dim3(gx, mt), dim3(32 * kVecWarps), L,
                            xc, ldx, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k,
-                           situ_beta, situ_linear_beta, oc, ld_out);
+                           mact, oc, ld_out);
       }
       continue;
     }
@@ -835,11 +860,11 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
       if (fuse_act)
         launch_dependent(k_moe_nvfp4_mma<SPAN, true, false, true, 4, 1>, dim3(ceil_div(N_work, 32), top_k),
                          dim3(128), L, xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k,
-                         situ_beta, situ_linear_beta, oc, ld_out);
+                         mact, oc, ld_out);
       else
         launch_dependent(k_moe_nvfp4_mma<SPAN, false, false, true, 4, 2>, dim3(ceil_div(N_work, 64), top_k),
                          dim3(128), L, xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, nullptr, nullptr, nullptr, top_k,
-                         situ_beta, situ_linear_beta, oc, ld_out);
+                         mact, oc, ld_out);
     } else if (has_sc) {
       const int M = rc * top_k;
       const int mt = max_work_tiles(M, W.n_experts, 16);
@@ -848,23 +873,23 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
       if (fuse_act)
         launch_dependent(k_moe_nvfp4_mma<SPAN, true, false, false, 4, 1>, dim3(ceil_div(N_work, 32), mt), dim3(128), L,
                          xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k,
-                         situ_beta, situ_linear_beta, oc, ld_out);
+                         mact, oc, ld_out);
       else
         launch_dependent(k_moe_nvfp4_mma<SPAN, false, false, false, 4, 2>, dim3(ceil_div(N_work, 64), mt), dim3(128),
                          L, xc, ldx, bf_a, W.q, W.s, W.rs, W.N, I, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k,
-                         situ_beta, situ_linear_beta, oc, ld_out);
+                         mact, oc, ld_out);
     } else {
       // No-scratch multi-row fallback: 1 row at a time via DIRECT_R1 (exact same bits).
       for (int rr = 0; rr < rc; ++rr) {
         if (fuse_act)
           launch_dependent(k_moe_nvfp4_mma<SPAN, true, false, true, 4, 1>, dim3(ceil_div(N_work, 32), top_k),
                            dim3(128), L, xc + size_t(rr) * ldx, ldx, nullptr, W.q, W.s, W.rs, W.N, I, K,
-                           ec + size_t(rr) * top_k, nullptr, nullptr, nullptr, top_k, situ_beta, situ_linear_beta,
+                           ec + size_t(rr) * top_k, nullptr, nullptr, nullptr, top_k, mact,
                            oc + size_t(rr) * top_k * ld_out, ld_out);
         else
           launch_dependent(k_moe_nvfp4_mma<SPAN, false, false, true, 4, 2>, dim3(ceil_div(N_work, 64), top_k),
                            dim3(128), L, xc + size_t(rr) * ldx, ldx, nullptr, W.q, W.s, W.rs, W.N, I, K,
-                           ec + size_t(rr) * top_k, nullptr, nullptr, nullptr, top_k, situ_beta, situ_linear_beta,
+                           ec + size_t(rr) * top_k, nullptr, nullptr, nullptr, top_k, mact,
                            oc + size_t(rr) * top_k * ld_out, ld_out);
       }
     }
@@ -875,14 +900,14 @@ int launch_nvfp4_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx
 template <int SPAN>
 void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows,
                        int top_k, int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc,
-                       const Launch& L, const bf16* act_bf16, int grouped) {
+                       const Launch& L, const bf16* act_bf16, int grouped, const float* bias) {
   cudaStream_t st = L.st;
   const bool has_down = sc && sc->down_buf && sc->tasks && sc->n_tasks && sc->pairs &&
                         W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
   const bool vec = !act_bf16 && opts(L).moe_vec;
   if (!vec && !has_down) {
     k_moe_nvfp4_down_serial<SPAN, 4, 2><<<dim3(ceil_div(H, 64), rows), 128, 0, st>>>(
-        act, ld_act, W.q, W.s, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate));
+        act, ld_act, W.q, W.s, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate), bias);
     return;
   }
   const int capacity = has_down ? std::max(1, sc->chunk_rows) : rows;
@@ -896,22 +921,23 @@ void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const i
       const int gx = ceil_div(H, kVecWarps * kVecRows);
       if (!has_down) {
         launch_dependent(k_moe_nvfp4_vec_sum, dim3(gx, rc), dim3(32 * kVecWarps), L, ac, ld_act, W.q, W.s, W.rs,
-                         ec, ew + size_t(r0) * top_k, top_k, H, K, out + size_t(r0) * ld_out, ld_out, accumulate);
+                         ec, ew + size_t(r0) * top_k, top_k, H, K, out + size_t(r0) * ld_out, ld_out, accumulate,
+                         bias);
         continue;
       }
       if (rc == 1) {
         launch_dependent(k_moe_nvfp4_vec<false, true, 1>, dim3(gx, top_k), dim3(32 * kVecWarps), L,
-                         ac, ld_act, W.q, W.s, W.rs, H, H, K, ec, nullptr, nullptr, nullptr, top_k, 0.f, 0.f,
+                         ac, ld_act, W.q, W.s, W.rs, H, H, K, ec, nullptr, nullptr, nullptr, top_k, MoeAct{},
                          sc->down_buf, H);
       } else {
         const int mt = max_work_tiles(M, W.n_experts, 4);
         if (rc != rows || !tiles_serve(grouped, 4, rc)) group_tasks(ec, M, W.n_experts, 4, sc, st);
         launch_dependent(k_moe_nvfp4_vec<false, true, 4>, dim3(gx, mt), dim3(32 * kVecWarps), L,
                          ac, ld_act, W.q, W.s, W.rs, H, H, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k,
-                         0.f, 0.f, sc->down_buf, H);
+                         MoeAct{}, sc->down_buf, H);
       }
       launch_dependent(k_moe_weighted_sum, dim3(ceil_div(H, 256), rc), dim3(256), L, sc->down_buf,
-                       ew + size_t(r0) * top_k, top_k, H, out + size_t(r0) * ld_out, ld_out, int(accumulate));
+                       ew + size_t(r0) * top_k, top_k, H, out + size_t(r0) * ld_out, ld_out, int(accumulate), ec, bias);
       continue;
     }
     const bf16* bf_a = act_bf16;
@@ -921,17 +947,17 @@ void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const i
     }
     if (rc == 1) {
       launch_dependent(k_moe_nvfp4_mma<SPAN, false, true, true, 4, 1>, dim3(ceil_div(H, 32), top_k), dim3(128), L,
-                       ac, ld_act, bf_a, W.q, W.s, W.rs, H, H, K, ec, nullptr, nullptr, nullptr, top_k, 0.f, 0.f,
+                       ac, ld_act, bf_a, W.q, W.s, W.rs, H, H, K, ec, nullptr, nullptr, nullptr, top_k, MoeAct{},
                        sc->down_buf, H);
     } else {
       const int mt = max_work_tiles(M, W.n_experts, 16);
       if (rc != rows || !tiles_serve(grouped, 16, rc)) group_tasks(ec, M, W.n_experts, 16, sc, st);
       launch_dependent(k_moe_nvfp4_mma<SPAN, false, true, false, 4, 2>, dim3(ceil_div(H, 64), mt), dim3(128), L,
-                       ac, ld_act, bf_a, W.q, W.s, W.rs, H, H, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k, 0.f,
-                       0.f, sc->down_buf, H);
+                       ac, ld_act, bf_a, W.q, W.s, W.rs, H, H, K, ec, sc->tasks, sc->n_tasks, sc->pairs, top_k,
+                           MoeAct{}, sc->down_buf, H);
     }
     launch_dependent(k_moe_weighted_sum, dim3(ceil_div(H, 256), rc), dim3(256), L, sc->down_buf,
-                     ew + size_t(r0) * top_k, top_k, H, out + size_t(r0) * ld_out, ld_out, int(accumulate));
+                     ew + size_t(r0) * top_k, top_k, H, out + size_t(r0) * ld_out, ld_out, int(accumulate), ec, bias);
   }
 }
 
@@ -945,49 +971,115 @@ __device__ __forceinline__ void stage_f32_tile(const float* __restrict__ x, int 
   }
 }
 
-template <int BT>
-__device__ __forceinline__ void bf16_row_step(const bf16* __restrict__ w_row, int k0, int kt, int lane, int nb,
-                                              const float sm[BT][kMoeKT], float acc[BT]) {
-  for (int j = lane; j < kt; j += 32) {
-    const float wv = __bfloat162float(w_row[k0 + j]);
+// Columns a warp of the bf16 expert kernels takes: a row alone's one (blocks enough for every SM), a grouped pass's
+// gate|up two (two rows each, gate and up, where fused) and down four, whose rows (an expert's inner width) are short.
+// A column's sums are the same at any width.
+constexpr int kBf16RowCols = 1, kBf16GuCols = 2, kBf16DownCols = 4;
+
+// 8 values of a weight row's tile at j: one 16-byte load where aligned and whole, else one at a time (0 past kt).
+__device__ __forceinline__ void bf16_load8(const bf16* __restrict__ w, int j, int kt, bool aligned, float wv[8]) {
+  if (aligned && j + 8 <= kt) {
+    const uint4 raw = __ldg(reinterpret_cast<const uint4*>(w + j));
+    const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&raw);
 #pragma unroll
-    for (int b = 0; b < BT; ++b)
-      if (b < nb) acc[b] = __fmaf_rn(sm[b][j], wv, acc[b]);
+    for (int q = 0; q < 4; ++q) {
+      const float2 f = __bfloat1622float2(h[q]);
+      wv[2 * q] = f.x;
+      wv[2 * q + 1] = f.y;
+    }
+  } else {
+#pragma unroll
+    for (int q = 0; q < 8; ++q) wv[q] = j + q < kt ? __bfloat162float(w[j + q]) : 0.f;
+  }
+}
+
+// NW weight rows' tiles [k0, k0 + kt) against up to BT staged rows: lane l takes the 8 values at 8 l + 256 i of each,
+// ascending, the NW rows' loads issued together; each (row, staged row) sum is the same whatever NW and BT are and
+// whether a load is one of 16 bytes or eight of one value (a row's bits do not depend on the rows taken with it).
+template <int BT, int NW>
+__device__ __forceinline__ void bf16_rows_step(const bf16* const (&w_rows)[NW], int k0, int kt, int lane, int nb,
+                                               const float sm[BT][kMoeKT], float (&acc)[NW][BT]) {
+  const bf16* w[NW];
+  bool aligned[NW];
+#pragma unroll
+  for (int c = 0; c < NW; ++c) {
+    w[c] = w_rows[c] + k0;
+    aligned[c] = (reinterpret_cast<uintptr_t>(w[c]) & 15) == 0;
+  }
+#pragma unroll 2
+  for (int j = 8 * lane; j < kt; j += 256) {
+    float wv[NW][8];
+#pragma unroll
+    for (int c = 0; c < NW; ++c) bf16_load8(w[c], j, kt, aligned[c], wv[c]);
+    if (j + 8 <= kt) {
+#pragma unroll
+      for (int b = 0; b < BT; ++b) {
+        if (b >= nb) break;
+        const float4 x0 = *reinterpret_cast<const float4*>(&sm[b][j]);
+        const float4 x1 = *reinterpret_cast<const float4*>(&sm[b][j + 4]);
+#pragma unroll
+        for (int c = 0; c < NW; ++c) {
+          float a = acc[c][b];
+          a = __fmaf_rn(x0.x, wv[c][0], a);
+          a = __fmaf_rn(x0.y, wv[c][1], a);
+          a = __fmaf_rn(x0.z, wv[c][2], a);
+          a = __fmaf_rn(x0.w, wv[c][3], a);
+          a = __fmaf_rn(x1.x, wv[c][4], a);
+          a = __fmaf_rn(x1.y, wv[c][5], a);
+          a = __fmaf_rn(x1.z, wv[c][6], a);
+          a = __fmaf_rn(x1.w, wv[c][7], a);
+          acc[c][b] = a;
+        }
+      }
+    } else {
+#pragma unroll
+      for (int b = 0; b < BT; ++b) {
+        if (b >= nb) break;
+#pragma unroll
+        for (int c = 0; c < NW; ++c)
+          for (int q = 0; q < 8 && j + q < kt; ++q) acc[c][b] = __fmaf_rn(sm[b][j + q], wv[c][q], acc[c][b]);
+      }
+    }
   }
 }
 
 template <bool FUSE_ACT>
 __global__ void __launch_bounds__(32 * kMoeWarps)
     k_moe_bf16_gu_decode(const float* __restrict__ x, int ldx, const bf16* __restrict__ W, const float* __restrict__ RS,
-                         int N_exp, int I, int K, const int* __restrict__ eidx, int top_k, float situ_beta,
-                         float situ_linear_beta, float* __restrict__ out, int ld_out) {
+                         int N_exp, int I, int K, const int* __restrict__ eidx, int top_k, MoeAct mact,
+                         float* __restrict__ out, int ld_out) {
   pdl_trigger();
-  __shared__ float sm[1][kMoeKT];
+  constexpr int CW = kBf16RowCols, NW = FUSE_ACT ? 2 * CW : CW;
+  __shared__ __align__(16) float sm[1][kMoeKT];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int col = blockIdx.x * kMoeWarps + warp;
+  const int col0 = (blockIdx.x * kMoeWarps + warp) * CW;
   const int N_work = FUSE_ACT ? I : 2 * I;
   const int k_slot = blockIdx.y, r = blockIdx.z;
   const int e = eidx[r * top_k + k_slot];
   const float rs = RS ? RS[e] : 1.f;
-  const bf16* w0 = W + (size_t(e) * N_exp + min(col, N_exp - 1)) * K;
-  const bf16* w1 = FUSE_ACT ? (W + (size_t(e) * N_exp + min(col + I, N_exp - 1)) * K) : nullptr;
-  float ag[1] = {0.f}, au[1] = {0.f};
+  const bf16* rows[NW];
+#pragma unroll
+  for (int c = 0; c < CW; ++c) {
+    rows[c] = W + (size_t(e) * N_exp + min(col0 + c, N_exp - 1)) * K;
+    if constexpr (FUSE_ACT) rows[CW + c] = W + (size_t(e) * N_exp + min(col0 + c + I, N_exp - 1)) * K;
+  }
+  float acc[NW][1] = {};
   const int rids[1] = {r};
   for (int k0 = 0; k0 < K; k0 += kMoeKT) {
     const int kt = min(kMoeKT, K - k0);
     stage_f32_tile<1>(x, ldx, rids, 1, k0, kt, sm);
     __syncthreads();
-    if (col < N_work) {
-      bf16_row_step<1>(w0, k0, kt, lane, 1, sm, ag);
-      if constexpr (FUSE_ACT) bf16_row_step<1>(w1, k0, kt, lane, 1, sm, au);
-    }
+    if (col0 < N_work) bf16_rows_step<1, NW>(rows, k0, kt, lane, 1, sm, acc);
     __syncthreads();
   }
-  if (col < N_work) {
-    const float g = warp_tree_sum(ag[0]) * rs;
+#pragma unroll
+  for (int c = 0; c < CW; ++c) {
+    const int col = col0 + c;
+    if (col >= N_work) break;
+    const float g = warp_tree_sum(acc[c][0]) * rs;
     if constexpr (FUSE_ACT) {
-      const float u = warp_tree_sum(au[0]) * rs;
-      if (lane == 0) out[size_t(r * top_k + k_slot) * ld_out + col] = situ_val(g, u, situ_beta, situ_linear_beta);
+      const float u = warp_tree_sum(acc[CW + c][0]) * rs;
+      if (lane == 0) out[size_t(r * top_k + k_slot) * ld_out + col] = moe_act_val(mact, g, u, e, col, I);
     } else if (lane == 0) {
       out[size_t(r * top_k + k_slot) * ld_out + col] = g;
     }
@@ -998,34 +1090,44 @@ __global__ void __launch_bounds__(32 * kMoeWarps)
     k_moe_bf16_down_decode(const float* __restrict__ act, int ld_act, const bf16* __restrict__ W,
                            const float* __restrict__ RS, int H, int K, const int* __restrict__ eidx,
                            const float* __restrict__ ew, int top_k, float* __restrict__ out, int ld_out,
-                           int accumulate) {
+                           int accumulate, const float* __restrict__ bias) {
   pdl_trigger();
-  __shared__ float sm[1][kMoeKT];
+  constexpr int CW = kBf16RowCols;
+  __shared__ __align__(16) float sm[1][kMoeKT];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int col = blockIdx.x * kMoeWarps + warp;
+  const int col0 = (blockIdx.x * kMoeWarps + warp) * CW;
   const int r = blockIdx.y;
-  float total = 0.f;
+  float total[CW] = {};
   for (int k_slot = 0; k_slot < top_k; ++k_slot) {
     const int e = eidx[r * top_k + k_slot];
     const float rs = RS ? RS[e] : 1.f;
-    const bf16* w0 = W + (size_t(e) * H + min(col, H - 1)) * K;
+    const bf16* rows[CW];
+#pragma unroll
+    for (int c = 0; c < CW; ++c) rows[c] = W + (size_t(e) * H + min(col0 + c, H - 1)) * K;
     const int rids[1] = {r * top_k + k_slot};
-    float acc[1] = {0.f};
+    float acc[CW][1] = {};
     for (int k0 = 0; k0 < K; k0 += kMoeKT) {
       const int kt = min(kMoeKT, K - k0);
       stage_f32_tile<1>(act, ld_act, rids, 1, k0, kt, sm);
       __syncthreads();
-      if (col < H) bf16_row_step<1>(w0, k0, kt, lane, 1, sm, acc);
+      if (col0 < H) bf16_rows_step<1, CW>(rows, k0, kt, lane, 1, sm, acc);
       __syncthreads();
     }
-    if (col < H) {
-      const float v = warp_tree_sum(acc[0]) * rs;
-      if (lane == 0) total = __fmaf_rn(ew[r * top_k + k_slot], v, total);
+#pragma unroll
+    for (int c = 0; c < CW; ++c) {
+      const int col = col0 + c;
+      if (col >= H) break;
+      float v = warp_tree_sum(acc[c][0]) * rs;
+      if (bias) v += bias[size_t(e) * H + col];  // as k_moe_weighted_sum adds it
+      if (lane == 0) total[c] = __fmaf_rn(ew[r * top_k + k_slot], v, total[c]);
     }
   }
-  if (col < H && lane == 0) {
+#pragma unroll
+  for (int c = 0; c < CW; ++c) {
+    const int col = col0 + c;
+    if (col >= H || lane != 0) break;
     float* dst = out + size_t(r) * ld_out + col;
-    *dst = accumulate ? (*dst + total) : total;
+    *dst = accumulate ? (*dst + total[c]) : total[c];
   }
 }
 
@@ -1033,21 +1135,25 @@ template <bool FUSE_ACT, bool IS_DOWN>
 __global__ void __launch_bounds__(32 * kMoeWarps)
     k_moe_bf16_grouped(const float* __restrict__ x, int ldx, const bf16* __restrict__ W, const float* __restrict__ RS,
                        int N_exp, int I_or_H, int K, const MoeTask* __restrict__ tasks, const int* __restrict__ n_tasks,
-                       const int* __restrict__ pairs, int top_k, float situ_beta, float situ_linear_beta,
+                       const int* __restrict__ pairs, int top_k, MoeAct mact,
                        float* __restrict__ out, int ld_out) {
-  constexpr int BT = 8;
+  constexpr int BT = 8, CW = IS_DOWN ? kBf16DownCols : kBf16GuCols, NW = FUSE_ACT ? 2 * CW : CW;
   const int tid_y = int(blockIdx.y);
   if (tid_y >= *n_tasks) return;
   const MoeTask tk = tasks[tid_y];
   const int e = tk.expert, nb = tk.nb;
 
-  __shared__ float sm[BT][kMoeKT];
+  __shared__ __align__(16) float sm[BT][kMoeKT];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-  const int col = blockIdx.x * kMoeWarps + warp;
+  const int col0 = (blockIdx.x * kMoeWarps + warp) * CW;
   const int N_work = FUSE_ACT ? I_or_H : N_exp;
   const float rs = RS ? RS[e] : 1.f;
-  const bf16* w0 = W + (size_t(e) * N_exp + min(col, N_exp - 1)) * K;
-  const bf16* w1 = FUSE_ACT ? (W + (size_t(e) * N_exp + min(col + I_or_H, N_exp - 1)) * K) : nullptr;
+  const bf16* rows[NW];
+#pragma unroll
+  for (int c = 0; c < CW; ++c) {
+    rows[c] = W + (size_t(e) * N_exp + min(col0 + c, N_exp - 1)) * K;
+    if constexpr (FUSE_ACT) rows[CW + c] = W + (size_t(e) * N_exp + min(col0 + c + I_or_H, N_exp - 1)) * K;
+  }
 
   int rids[BT], pids[BT];
 #pragma unroll
@@ -1055,25 +1161,25 @@ __global__ void __launch_bounds__(32 * kMoeWarps)
     pids[b] = b < nb ? pairs[tk.p0 + b] : 0;
     rids[b] = IS_DOWN ? pids[b] : (pids[b] / top_k);
   }
-  float ag[BT] = {}, au[BT] = {};
+  float acc[NW][BT] = {};
   for (int k0 = 0; k0 < K; k0 += kMoeKT) {
     const int kt = min(kMoeKT, K - k0);
     stage_f32_tile<BT>(x, ldx, rids, nb, k0, kt, sm);
     __syncthreads();
-    if (col < N_work) {
-      bf16_row_step<BT>(w0, k0, kt, lane, nb, sm, ag);
-      if constexpr (FUSE_ACT) bf16_row_step<BT>(w1, k0, kt, lane, nb, sm, au);
-    }
+    if (col0 < N_work) bf16_rows_step<BT, NW>(rows, k0, kt, lane, nb, sm, acc);
     __syncthreads();
   }
-  if (col < N_work) {
+#pragma unroll
+  for (int c = 0; c < CW; ++c) {
+    const int col = col0 + c;
+    if (col >= N_work) break;
 #pragma unroll
     for (int b = 0; b < BT; ++b) {
       if (b >= nb) break;
-      const float g = warp_tree_sum(ag[b]) * rs;
+      const float g = warp_tree_sum(acc[c][b]) * rs;
       if constexpr (FUSE_ACT) {
-        const float u = warp_tree_sum(au[b]) * rs;
-        if (lane == 0) out[size_t(pids[b]) * ld_out + col] = situ_val(g, u, situ_beta, situ_linear_beta);
+        const float u = warp_tree_sum(acc[CW + c][b]) * rs;
+        if (lane == 0) out[size_t(pids[b]) * ld_out + col] = moe_act_val(mact, g, u, e, col, I_or_H);
       } else if (lane == 0) {
         out[size_t(pids[b]) * ld_out + col] = g;
       }
@@ -1083,6 +1189,13 @@ __global__ void __launch_bounds__(32 * kMoeWarps)
 
 // Use INT8 MMA (BM=16) only when average rows per expert is at least 2 (prefill); rounds stay on low-reg dp4a (BM=4).
 constexpr bool moe_use_mma(int rc, int M, int n_experts) { return rc > FLYX_MAX_ROWS && M >= 2 * n_experts; }
+// The rows of a tensor-core task: 32 (two tiles a task in the wide kernel, a unit's weights decoded once for both)
+// where K's rows fit the wide kernel twice over and the experts average 32 rows or more (an RTX 5060 Ti, 26B-A4B's
+// Q5_1 down projection in a pass of 4096 rows: 14 -> 19 TOPS), else 16; 0: no tensor cores (moe_use_mma).  The same
+// bits at every height: a row's sums are its own.
+constexpr int moe_mma_rows(int rc, int M, int n_experts, int K) {
+  return !moe_use_mma(rc, M, n_experts) ? 0 : K <= 1536 && M >= 32 * n_experts ? 32 : 16;
+}
 
 bool moe_round_scratch(const ExpertMat& W, int rows, int top_k, const MoeScratch* sc) {
   return rows > 0 && rows <= FLYX_MAX_ROWS && sc && rows <= sc->chunk_rows && W.n_experts <= sc->max_experts &&
@@ -1313,19 +1426,21 @@ void l2_warm(const L2Ranges& r, cudaStream_t st) {
 }
 
 void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
-               bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, const Launch& L) {
+               bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, const Launch& L,
+               const float* logit_bias, const float* expert_scale) {
   if (rows <= 0 || n_experts <= 0 || n_experts > kMoeRouteMaxExperts || top_k <= 0 || top_k > n_experts ||
       top_k > kRouteTop)
     throw std::runtime_error("moe_route: invalid dimensions");
   const size_t smem = size_t(2) * size_t(n_experts) * sizeof(float);
   launch_dependent_smem(k_moe_route, dim3(rows), dim3(kRouteThreads), smem, L, logits, bias, n_experts, top_k,
-                        int(gating_sigmoid), int(norm_weights), norm_eps, route_scale, idx_out, w_out);
+                        int(gating_sigmoid), int(norm_weights), norm_eps, route_scale, idx_out, w_out, logit_bias,
+                        expert_scale);
 }
 
-void situ_rows(const float* gu, int ld_gu, int I, float beta, float linear_beta, float* out, int ld_out, int rows,
-               cudaStream_t st) {
+void moe_act_rows(const float* gu, int ld_gu, int I, const MoeAct& act, const int* eidx, float* out, int ld_out,
+                  int rows, cudaStream_t st) {
   if (rows <= 0 || I <= 0) return;
-  k_situ_rows<<<dim3(ceil_div(I, 256), rows), 256, 0, st>>>(gu, ld_gu, I, beta, linear_beta, out, ld_out);
+  k_moe_act_rows<<<dim3(ceil_div(I, 256), rows), 256, 0, st>>>(gu, ld_gu, I, act, eidx, out, ld_out);
 }
 
 bool moe_q8_mins(const ExpertMat& W) {
@@ -1347,7 +1462,7 @@ bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const M
 }
 
 int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
-                float situ_beta, float situ_linear_beta, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
+                const MoeAct& mact, bool fuse_act, float* out, int ld_out, const MoeScratch* sc,
                 const Launch& L, bool q8_ready, bf16* act_bf16) {
   cudaStream_t st = L.st;
   const int N_work = fuse_act ? I : 2 * I;
@@ -1355,6 +1470,47 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
     throw std::runtime_error("moe_gate_up: pre-staged input and BF16 output require a staged Q8 round");
   if (act_bf16 && (!fuse_act || ld_out != I))
     throw std::runtime_error("moe_gate_up: BF16 output requires contiguous fused activations");
+  // MXFP4 experts with MXFP8 inputs (every pass, or passes of more than FLYX_MAX_ROWS rows): sm_120a's block-scaled
+  // tensor cores
+  if (W.packed() && (W.blk.mxfp8 || (W.blk.mxfp8_q8 && rows > FLYX_MAX_ROWS))) {
+    if (W.blk.dtype != FLYX_DT_GGML_MXFP4 || !sc || !sc->tasks || !sc->pairs || !sc->q8_a || !sc->q8_d ||
+        W.n_experts > sc->max_experts || top_k > sc->max_top_k)
+      throw std::runtime_error("moe_gate_up: MXFP8 inputs on MXFP4 experts with the MoE scratch alone");
+    const int chunk = std::max(1, sc->chunk_rows), N_work = fuse_act ? I : 2 * I;
+    int grouped = 0;
+    for (int r0 = 0; r0 < rows; r0 += chunk) {
+      const int rc = std::min(chunk, rows - r0), M = rc * top_k;
+      if (sc->stage_elems < size_t(rc) * size_t(K)) throw std::runtime_error("moe_gate_up: MXFP8 rows past the scratch");
+      auto* xa = reinterpret_cast<uint8_t*>(sc->q8_a);
+      auto* xs = reinterpret_cast<uint8_t*>(sc->q8_d);
+      launch_dependent(k_moe_stage_mxfp8, dim3(rc), dim3(256), L, x + size_t(r0) * ldx, ldx, K, xa, xs);
+      const int* ec = eidx + size_t(r0) * top_k;
+      const int bm = moe_mxfp4_bm(M, W.n_experts);
+      group_tasks(ec, M, W.n_experts, bm, sc, st);
+      grouped = rc == rows ? bm : 0;
+      moe_mxfp4_mxfp8_mma(fuse_act, false, bm, xa, xs, W, N_work, I, K, *sc, max_work_tiles(M, W.n_experts, bm), top_k,
+                    mact, out + size_t(r0) * top_k * ld_out, ld_out, L);
+    }
+    return grouped;
+  }
+  if (W.packed() && W.blk.bf16) {  // MXFP4 experts with bf16 inputs: the bf16 tensor cores (moe_mxfp4_bf16.cu)
+    if (W.blk.dtype != FLYX_DT_GGML_MXFP4 || !sc || !sc->tasks || !sc->pairs || !sc->bf16_a ||
+        W.n_experts > sc->max_experts || top_k > sc->max_top_k)
+      throw std::runtime_error("moe_gate_up: bf16 inputs on MXFP4 experts with the MoE scratch alone");
+    const int chunk = std::max(1, sc->chunk_rows);
+    int grouped = 0;
+    for (int r0 = 0; r0 < rows; r0 += chunk) {
+      const int rc = std::min(chunk, rows - r0), M = rc * top_k;
+      if (sc->stage_elems < size_t(rc) * size_t(K)) throw std::runtime_error("moe_gate_up: bf16 rows past the scratch");
+      const int bm = moe_mxfp4_bm(M, W.n_experts);
+      moe_mxfp4_bf16_stage(x + size_t(r0) * ldx, ldx, K, rc, sc->bf16_a, L);
+      group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, bm, sc, st);
+      grouped = rc == rows ? bm : 0;
+      moe_mxfp4_bf16_mma(fuse_act, false, bm, sc->bf16_a, W, N_work, I, K, *sc, max_work_tiles(M, W.n_experts, bm),
+                         top_k, mact, out + size_t(r0) * top_k * ld_out, ld_out, L);
+    }
+    return grouped;
+  }
   if (W.packed()) {
     blocks_init();
     const MoeBlockOps* ops = moe_block_ops(W.blk.dtype);
@@ -1370,38 +1526,38 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
       const bool can_q8 = W.blk.q8 && sc && sc->q8_a && sc->stage_elems >= size_t(rc) * size_t(K);
       if (can_q8 && !q8_ready) moe_stage_q8(xc, ldx, K, rc, *sc, ops->mins, st);
       const int M = rc * top_k;
-      const bool use_mma = can_q8 && has_sc && moe_use_mma(rc, M, W.n_experts);
+      const int mma_rows = can_q8 && has_sc ? moe_mma_rows(rc, M, W.n_experts, K) : 0;
       int mt = 0;
       if (rc > 1 && has_sc) {
-        const int bm = use_mma ? 16 : 4;
+        const int bm = mma_rows ? mma_rows : 4;
         mt = max_work_tiles(M, W.n_experts, bm);
         group_tasks(ec, M, W.n_experts, bm, sc, st);
         grouped = rc == rows ? bm : 0;
       }
-      ops->gu(xc, ldx, W, ec, rc, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, oc, ld_out, sc, mt, use_mma,
+      ops->gu(xc, ldx, W, ec, rc, top_k, I, K, mact, fuse_act, oc, ld_out, sc, mt, mma_rows,
               moe_dp4a_cfg(opts(L), W.blk.dtype, rc, fuse_act), st, act_bf16);
     }
     return grouped;
   }
   if (W.q) {
     if (K % 128 == 0)
-      return launch_nvfp4_gu<128>(x, ldx, W, eidx, rows, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, out,
+      return launch_nvfp4_gu<128>(x, ldx, W, eidx, rows, top_k, I, K, mact, fuse_act, out,
                                   ld_out, sc, L);
     if (K % 64 == 0)
-      return launch_nvfp4_gu<64>(x, ldx, W, eidx, rows, top_k, I, K, situ_beta, situ_linear_beta, fuse_act, out,
+      return launch_nvfp4_gu<64>(x, ldx, W, eidx, rows, top_k, I, K, mact, fuse_act, out,
                                  ld_out, sc, L);
     throw std::runtime_error("moe_gate_up: NVFP4 requires K multiple of 64 (got " + std::to_string(K) + ")");
   }
   const bool tiled = rows > 1 && sc && sc->tasks && sc->pairs && W.n_experts <= sc->max_experts &&
                      top_k <= sc->max_top_k;
   if (!tiled) {
-    const dim3 grid(ceil_div(N_work, kMoeWarps), top_k, rows);
+    const dim3 grid(ceil_div(N_work, kMoeWarps * kBf16RowCols), top_k, rows);
     if (fuse_act)
       k_moe_bf16_gu_decode<true><<<grid, 32 * kMoeWarps, 0, st>>>(
-          x, ldx, W.w, W.rs, W.N, I, K, eidx, top_k, situ_beta, situ_linear_beta, out, ld_out);
+          x, ldx, W.w, W.rs, W.N, I, K, eidx, top_k, mact, out, ld_out);
     else
       k_moe_bf16_gu_decode<false><<<grid, 32 * kMoeWarps, 0, st>>>(
-          x, ldx, W.w, W.rs, W.N, I, K, eidx, top_k, situ_beta, situ_linear_beta, out, ld_out);
+          x, ldx, W.w, W.rs, W.N, I, K, eidx, top_k, mact, out, ld_out);
     return 0;
   }
   const int chunk = std::max(1, sc->chunk_rows);
@@ -1410,16 +1566,16 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
     const int M = rc * top_k;
     const int mt = max_work_tiles(M, W.n_experts, 8);
     group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, 8, sc, st);
-    const dim3 grid(ceil_div(N_work, kMoeWarps), mt);
+    const dim3 grid(ceil_div(N_work, kMoeWarps * kBf16GuCols), mt);
     const float* xc = x + size_t(r0) * ldx;
     float* oc = out + size_t(r0) * top_k * ld_out;
     if (fuse_act)
       k_moe_bf16_grouped<true, false><<<grid, 32 * kMoeWarps, 0, st>>>(
-          xc, ldx, W.w, W.rs, W.N, I, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, oc,
+          xc, ldx, W.w, W.rs, W.N, I, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, mact, oc,
           ld_out);
     else
       k_moe_bf16_grouped<false, false><<<grid, 32 * kMoeWarps, 0, st>>>(
-          xc, ldx, W.w, W.rs, W.N, I, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, situ_beta, situ_linear_beta, oc,
+          xc, ldx, W.w, W.rs, W.N, I, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, mact, oc,
           ld_out);
   }
   return rows <= chunk ? 8 : 0;
@@ -1427,10 +1583,54 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
 
 void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
               int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, const Launch& L,
-              const bf16* act_bf16, int grouped) {
+              const bf16* act_bf16, int grouped, const float* bias) {
   cudaStream_t st = L.st;
   if (act_bf16 && !moe_round_bf16_down(W, rows, top_k, K, sc, L))
     throw std::runtime_error("moe_down: pre-staged BF16 input requires an NVFP4 round");
+  if (W.packed() && (W.blk.mxfp8 || (W.blk.mxfp8_q8 && rows > FLYX_MAX_ROWS))) {  // MXFP8 inputs (moe_gate_up)
+    const bool has_down = sc && sc->down_buf && sc->tasks && sc->pairs && sc->q8_a && sc->q8_d &&
+                          W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
+    if (W.blk.dtype != FLYX_DT_GGML_MXFP4 || !has_down)
+      throw std::runtime_error("moe_down: MXFP8 inputs on MXFP4 experts with the MoE scratch alone");
+    const int chunk = std::max(1, sc->chunk_rows);
+    for (int r0 = 0; r0 < rows; r0 += chunk) {
+      const int rc = std::min(chunk, rows - r0), M = rc * top_k;
+      if (sc->stage_elems < size_t(M) * size_t(K)) throw std::runtime_error("moe_down: MXFP8 rows past the scratch");
+      const int* ec = eidx + size_t(r0) * top_k;
+      auto* xa = reinterpret_cast<uint8_t*>(sc->q8_a);
+      auto* xs = reinterpret_cast<uint8_t*>(sc->q8_d);
+      launch_dependent(k_moe_stage_mxfp8, dim3(M), dim3(256), L, act + size_t(r0) * top_k * ld_act, ld_act, K, xa, xs);
+      const int bm = moe_mxfp4_bm(M, W.n_experts);
+      if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st);
+      moe_mxfp4_mxfp8_mma(false, true, bm, xa, xs, W, H, H, K, *sc, max_work_tiles(M, W.n_experts, bm), top_k, MoeAct{},
+                    sc->down_buf, H, L);
+      k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
+                                                                     out + size_t(r0) * ld_out, ld_out,
+                                                                     int(accumulate), ec, bias);
+    }
+    return;
+  }
+  if (W.packed() && W.blk.bf16) {  // MXFP4 experts with bf16 inputs (moe_gate_up)
+    const bool has_down = sc && sc->down_buf && sc->tasks && sc->pairs && sc->bf16_a &&
+                          W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
+    if (W.blk.dtype != FLYX_DT_GGML_MXFP4 || !has_down)
+      throw std::runtime_error("moe_down: bf16 inputs on MXFP4 experts with the MoE scratch alone");
+    const int chunk = std::max(1, sc->chunk_rows);
+    for (int r0 = 0; r0 < rows; r0 += chunk) {
+      const int rc = std::min(chunk, rows - r0), M = rc * top_k;
+      if (sc->stage_elems < size_t(M) * size_t(K)) throw std::runtime_error("moe_down: bf16 rows past the scratch");
+      const int* ec = eidx + size_t(r0) * top_k;
+      const int bm = moe_mxfp4_bm(M, W.n_experts);
+      moe_mxfp4_bf16_stage(act + size_t(r0) * top_k * ld_act, ld_act, K, M, sc->bf16_a, L);
+      if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st);
+      moe_mxfp4_bf16_mma(false, true, bm, sc->bf16_a, W, H, H, K, *sc, max_work_tiles(M, W.n_experts, bm), top_k,
+                     MoeAct{}, sc->down_buf, H, L);
+      k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
+                                                                     out + size_t(r0) * ld_out, ld_out,
+                                                                     int(accumulate), ec, bias);
+    }
+    return;
+  }
   if (W.packed()) {
     blocks_init();
     const MoeBlockOps* ops = moe_block_ops(W.blk.dtype);
@@ -1447,28 +1647,28 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
       const int M = rc * top_k;
       const bool can_q8 = W.blk.q8 && sc && sc->q8_a && sc->down_buf && sc->stage_elems >= size_t(M) * size_t(K);
       if (can_q8) moe_stage_q8(ac, ld_act, K, M, *sc, ops->mins, st);
-      const bool use_mma = can_q8 && has_sc && moe_use_mma(rc, M, W.n_experts);
+      const int mma_rows = can_q8 && has_sc ? moe_mma_rows(rc, M, W.n_experts, K) : 0;
       int mt = 0;
       if (rc > 1 && has_sc) {
-        const int bm = use_mma ? 16 : 4;
+        const int bm = mma_rows ? mma_rows : 4;
         mt = max_work_tiles(M, W.n_experts, bm);
         if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st);
       }
       const bool wrote_buf = ops->down(ac, ld_act, W, ec, ewc, rc, top_k, H, K, oc, ld_out, accumulate, sc, mt,
-                                       use_mma, moe_dp4a_cfg(opts(L), W.blk.dtype, rc, false), st);
+                                       mma_rows, moe_dp4a_cfg(opts(L), W.blk.dtype, rc, false), st, bias);
       if (wrote_buf)
         k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ewc, top_k, H, oc, ld_out,
-                                                                       int(accumulate));
+                                                                       int(accumulate), ec, bias);
     }
     return;
   }
   if (W.q) {
     if (K % 128 == 0)
       launch_nvfp4_down<128>(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, L, act_bf16,
-                             grouped);
+                             grouped, bias);
     else if (K % 64 == 0)
       launch_nvfp4_down<64>(act, ld_act, W, eidx, ew, rows, top_k, H, K, out, ld_out, accumulate, sc, L, act_bf16,
-                            grouped);
+                            grouped, bias);
     else
       throw std::runtime_error("moe_down: NVFP4 requires K multiple of 64 (got " + std::to_string(K) + ")");
     return;
@@ -1476,8 +1676,8 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
   const bool tiled = rows > 1 && sc && sc->tasks && sc->pairs && sc->down_buf && W.n_experts <= sc->max_experts &&
                      top_k <= sc->max_top_k;
   if (!tiled) {
-    k_moe_bf16_down_decode<<<dim3(ceil_div(H, kMoeWarps), rows), 32 * kMoeWarps, 0, st>>>(
-        act, ld_act, W.w, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate));
+    k_moe_bf16_down_decode<<<dim3(ceil_div(H, kMoeWarps * kBf16RowCols), rows), 32 * kMoeWarps, 0, st>>>(
+        act, ld_act, W.w, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate), bias);
     return;
   }
   const int chunk = std::max(1, sc->chunk_rows);
@@ -1486,12 +1686,13 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
     const int M = rc * top_k;
     const int mt = max_work_tiles(M, W.n_experts, 8);
     if (rc != rows || !tiles_serve(grouped, 8, rc)) group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, 8, sc, st);
-    const dim3 grid(ceil_div(H, kMoeWarps), mt);
+    const dim3 grid(ceil_div(H, kMoeWarps * kBf16DownCols), mt);
     k_moe_bf16_grouped<false, true><<<grid, 32 * kMoeWarps, 0, st>>>(
-        act + size_t(r0) * top_k * ld_act, ld_act, W.w, W.rs, H, H, K, sc->tasks, sc->n_tasks, sc->pairs, top_k, 0.f,
-        0.f, sc->down_buf, H);
+        act + size_t(r0) * top_k * ld_act, ld_act, W.w, W.rs, H, H, K, sc->tasks, sc->n_tasks, sc->pairs, top_k,
+                     MoeAct{}, sc->down_buf, H);
     k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
-                                                                   out + size_t(r0) * ld_out, ld_out, int(accumulate));
+                                                                   out + size_t(r0) * ld_out, ld_out, int(accumulate),
+                                                                   eidx + size_t(r0) * top_k, bias);
   }
 }
 

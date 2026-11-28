@@ -871,7 +871,7 @@ def make_core(out: str):
     make_target(wdir, vocab, gen, gdn_dims=(32, 32), hidden=128, inter=256)
     make_nvfp4_dir(wdir, wq)
     convert(wq, os.path.join(out, "tiny_w4a4.flyx"), None, log=lambda *_: None, activations="nvfp4")
-    # The same weights in a file that says bf16 inputs: --activations nvfp4 gives it the first file's NVFP4 ones.
+    # The same weights in a file that says bf16 inputs: --activations nvfp4/bf16 gives it the first file's NVFP4 ones.
     convert(wq, os.path.join(out, "tiny_w4a4_a16.flyx"), None, log=lambda *_: None, activations="bf16")
     # Llama's attention without q/k norms (MiniCPM5's layers), with MiniCPM5's pre-tokenizer: no
     # drafter, golden from transformers.  Made last, so the random weights above stay what they were.
@@ -1433,8 +1433,13 @@ def write_chat_cases(tok_dir: str, out_json: str) -> int:
         src = open(os.path.join(chat_cases.HERE, "templates", name), encoding="utf-8").read()
         for case, msgs, tools in chat_cases.CASES:
             for thinking in (True, False):
+                try:
+                    want = chat_cases.expected(tok, src, msgs, tools, thinking)
+                except Exception as e:  # a case the template itself cannot render (Jinja2 raises): none to compare
+                    print(f"chat_cases: {name} {case!r} thinking={thinking}: left out ({type(e).__name__}: {e})")
+                    continue
                 rows.append({"template": name, "format": fmt, "case": case, "messages": msgs, "tools": tools,
-                             "thinking": thinking, **chat_cases.expected(tok, src, msgs, tools, thinking)})
+                             "thinking": thinking, **want})
     json.dump(rows, open(out_json, "w", encoding="utf-8"), ensure_ascii=False, indent=0)
     return len(rows)
 

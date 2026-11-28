@@ -216,6 +216,8 @@ flyx_add_unit_test(hub_test core/hub/hub_test.cpp Threads::Threads)
 flyx_add_unit_test(chat_test core/render/chat_test.cpp)
 flyx_add_unit_test(tags_test models/formats/tags_test.cpp)
 flyx_add_unit_test(qwen35_format_test models/formats/qwen35_test.cpp)
+flyx_add_unit_test(harmony_format_test models/formats/harmony_test.cpp)
+flyx_add_unit_test(gemma4_format_test models/formats/gemma4_test.cpp)
 flyx_add_unit_test(grammar_test models/formats/grammar_test.cpp)
 flyx_add_unit_test(xgrammar_local_changes_test third_party/xgrammar/local_changes_test.cpp flyx_xgrammar)
 flyx_add_unit_test(telemetry_test core/exec/telemetry_test.cpp)
@@ -337,6 +339,8 @@ add_test(NAME dflash2_models COMMAND dflash2_models_test ${ASSETS})
 # Qwen2's pre-tokenizer split (the published Qwen3 checkpoints), from GGUF vocabularies, against tokenizers.
 add_test(NAME gguf_qwen2_nfc COMMAND tokenizer_test ${ASSETS}/qwen2_nfc.gguf ${ASSETS}/qwen2_nfc.json)
 add_test(NAME gguf_qwen2_none COMMAND tokenizer_test ${ASSETS}/qwen2_none.gguf ${ASSETS}/qwen2_none.json)
+# Gemma 4's kind of tokenizer (SentencePiece's BPE, tokenizer.ggml.model gemma4), against tokenizers.
+add_test(NAME gguf_gemma4_tok COMMAND tokenizer_test ${ASSETS}/gemma4_tok.gguf ${ASSETS}/gemma4_tok.json)
 # The tiny models from their GGUF files: the golden outputs, drafting, sampling, reuse.
 add_test(NAME gguf_cpu_ref COMMAND gguf_e2e_test ${ASSETS} cpu_ref)
 flyx_add_golden_test(golden_cpu_ref_qwen3_gguf ARGS cpu_ref qwen3 ${ASSETS}/tiny_qwen3_gguf.gguf FIXTURES gguf_assets)
@@ -347,7 +351,8 @@ flyx_add_golden_test(golden_cpu_ref_qwen35_gguf_lora ARGS cpu_ref qwen35_lora ${
 # The same GGUF file with a PEFT LoRA adapter beside it (--lora), against transformers with it merged.
 flyx_add_golden_test(golden_cpu_ref_qwen3_gguf_lora ARGS cpu_ref qwen3_lora ${ASSETS}/tiny_qwen3_gguf.gguf
                      ${ASSETS}/peft_qwen3 FIXTURES gguf_assets)
-set_tests_properties(gguf_reader ggml_blocks gguf_models dflash2_models gguf_qwen2_nfc gguf_qwen2_none gguf_cpu_ref
+set_tests_properties(gguf_reader ggml_blocks gguf_models dflash2_models gguf_qwen2_nfc gguf_qwen2_none gguf_gemma4_tok
+                     gguf_cpu_ref
                      PROPERTIES FIXTURES_REQUIRED gguf_assets)
 
 flyx_add_py_test(dspine_reference ${CMAKE_SOURCE_DIR}/tests/python/reference/dspine_test.py ARGS ${ASSETS} FIXTURES assets)
@@ -429,6 +434,8 @@ add_test(NAME drafter_speeds COMMAND drafter_speeds_test)
 # GET /v1/hub/search's pages for a query: GGUF repositories and safetensors drafters paged together (a stand-in Hub).
 add_test(NAME hub_search COMMAND hub_search_test)
 add_test(NAME chat_replies COMMAND tags_test)
+add_test(NAME chat_harmony COMMAND harmony_format_test)
+add_test(NAME chat_gemma4 COMMAND gemma4_format_test)
 # Qwen3.5's own renderer against the Jinja engine on generated conversations, and its calls read back.
 add_test(NAME chat_qwen35 COMMAND qwen35_format_test ${ASSETS}/tiny.flyx
                                   ${CMAKE_SOURCE_DIR}/tests/core/render/templates/qwen3.5.jinja)
@@ -642,7 +649,9 @@ if(TARGET flyx-cuda)
                  backends/cuda/op_test_attention.cu backends/cuda/op_test_gdn.cu backends/cuda/op_test_nvfp4.cu
                  backends/cuda/op_test_head.cu backends/cuda/op_test_sampling.cu backends/cuda/op_test_layers.cu
                  backends/cuda/op_test_dv.cu backends/cuda/op_test_vision.cu
-                 backends/cuda/op_test_inkling2.cu backends/cuda/op_test_dspine.cu)
+                 backends/cuda/op_test_inkling2.cu backends/cuda/op_test_dspine.cu
+                 backends/cuda/op_test_gpt_oss.cu
+                 backends/cuda/op_test_gemma4.cu)
   if(MSVC)
     # The MSVC INFINITY macro triggers nvcc's overflow warning at every use, as in flyx_cuda_kernels.
     target_compile_options(cuda_op_test PRIVATE --diag-suppress=221)

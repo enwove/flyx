@@ -37,6 +37,8 @@ constexpr std::pair<std::string_view, std::string_view> kDrafterArchitectures[] 
     {"Qwen3DSparkModel", "dspark"},
     {"DSpineDraftModel", "dspine"},
     {"LlamaForCausalLMEagle4", "eagle4"},
+    {"Gemma4AssistantForCausalLM", "gemma4_mtp"},
+    {"Gemma4UnifiedAssistantForCausalLM", "gemma4_mtp"},
 };
 
 std::string architectures_kind(const std::vector<std::string>& architectures) {
@@ -121,6 +123,12 @@ bool read_drafter_dir(const std::string& dir, std::vector<std::unique_ptr<os::Ma
     if (speculators) {
       for (const auto [key, field] : {std::pair{"target_hidden_size", "hidden"}, {"draft_vocab_size", "vocab"}})
         if (sc.contains(key) && sc[key].is_number_integer() && sc[key] != 0) target[field] = sc[key];
+    }
+    if (kind == "gemma4_mtp") {  // Gemma 4's assistant: its target's width and vocabulary
+      target = json::object();
+      if (sc.contains("backbone_hidden_size")) target["hidden"] = sc["backbone_hidden_size"];
+      const json& tc = sc.value("text_config", json::object());
+      if (tc.is_object() && tc.contains("vocab_size")) target["vocab"] = tc["vocab_size"];
     }
     *out = {};
     out->arch = "drafter";

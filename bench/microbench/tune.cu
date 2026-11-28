@@ -958,7 +958,8 @@ Costs time_moe(const std::vector<MoeMat>& mats) {
         cudaGraphExec_t exec;
         CK(cudaStreamBeginCapture(st, cudaStreamCaptureModeGlobal));
         for (int i = 0; i < kMoeRouteSets; ++i)
-          moe_gate_up(x, a.K, W, indices + size_t(i) * rows * a.top_k, rows, a.top_k, I, a.K, 6.f, 8.f, true,
+          moe_gate_up(x, a.K, W, indices + size_t(i) * rows * a.top_k, rows, a.top_k, I, a.K, MoeAct{FLYX_MOE_SITU,
+                      6.f, 8.f}, true,
                       nullptr, I, &sc, L, true, act);
         CK(cudaStreamEndCapture(st, &graph));
         CK(cudaGraphInstantiate(&exec, graph, 0));

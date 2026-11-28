@@ -1751,13 +1751,15 @@ void test_moe_dp4a_variants() {
     for (bool fused : {false, true}) {
       const int ld = (fused ? I : 2 * I) + 5;
       check(fused ? "SiTU" : "gate|up", fused, top_k * ld, [&](int r, int rows, const Launch& L, float* out) {
-        moe_gate_up(x + r * ldx, ldx, gu, eidx + r * top_k, rows, top_k, I, K, 6.f, 8.f, fused, out, ld, &sc, L);
+        moe_gate_up(x + r * ldx, ldx, gu, eidx + r * top_k, rows, top_k, I, K, MoeAct{FLYX_MOE_SITU, 6.f, 8.f}, fused,
+                    out, ld, &sc, L);
       });
     }
     // Two BF16 expert slots per row occupy exactly I 32-bit words, so this compares the stored BF16 bits directly.
     check("BF16 SiTU", true, I, [&](int r, int rows, const Launch& L, float* out) {
       moe_stage_q8(x + r * ldx, ldx, K, rows, sc, moe_q8_mins(gu), L.st);
-      moe_gate_up(x + r * ldx, ldx, gu, eidx + r * top_k, rows, top_k, I, K, 6.f, 8.f, true, nullptr, I, &sc, L,
+      moe_gate_up(x + r * ldx, ldx, gu, eidx + r * top_k, rows, top_k, I, K, MoeAct{FLYX_MOE_SITU, 6.f, 8.f}, true,
+                  nullptr, I, &sc, L,
                   true, reinterpret_cast<bf16*>(out));
     });
     // Inspect individual projections as well: rounding in the weighted sum can hide a difference in a single expert.
@@ -1782,10 +1784,84 @@ void test_moe_dp4a_variants() {
 
 }  // namespace
 
+// BF16 experts whose rows do not all start on 16 bytes and whose widths end inside a load (K of 100 and 52): the
+// one-value loads sum as the 16-byte ones do; against float64, and each row alone as in a grouped pass, bit for bit.
+void test_moe_bf16_unaligned() {
+  const int R = 5, E = 4, top_k = 2, H = 100, I = 52;
+  seed("moe_bf16_unaligned", R, E, top_k, H, I);
+  Vec gu = randv(size_t(E) * 2 * I * H, 0.1), dn = randv(size_t(E) * H * I, 0.1), x = randv(size_t(R) * H, 1.0);
+  round_bf16(gu);
+  round_bf16(dn);
+  std::vector<int> eidx(size_t(R) * top_k);
+  Vec ew(size_t(R) * top_k);
+  for (int r = 0; r < R; ++r)
+    for (int k = 0; k < top_k; ++k) {
+      eidx[size_t(r) * top_k + k] = (r + 3 * k) % E;
+      ew[size_t(r) * top_k + k] = 0.25 + 0.5 * k;
+    }
+  ExpertMat w_gu{}, w_dn{};
+  w_gu.n_experts = w_dn.n_experts = E;
+  w_gu.N = 2 * I;
+  w_gu.w = up_bf16(gu);
+  w_dn.N = H;
+  w_dn.w = up_bf16(dn);
+  float* d_x = up(x);
+  int* d_eidx = dev<int>(eidx.size());
+  CK(cudaMemcpy(d_eidx, eidx.data(), eidx.size() * 4, cudaMemcpyHostToDevice));
+  float* d_ew = up(ew);
+  MoeScratch msc{};
+  msc.pairs = dev<int>(size_t(R) * top_k);
+  msc.tasks = dev<MoeTask>(size_t(R) * top_k);
+  msc.n_tasks = dev<int>(1);
+  msc.down_buf = dev<float>(size_t(R) * top_k * H);
+  msc.chunk_rows = R;
+  msc.max_experts = E;
+  msc.max_top_k = top_k;
+  const MoeAct act{FLYX_MOE_SWIGLU, 0.f, 0.f, nullptr};
+
+  Vec want_act(size_t(R) * top_k * I), want_y(size_t(R) * H, 0.0);
+  for (int r = 0; r < R; ++r)
+    for (int k = 0; k < top_k; ++k) {
+      const int slot = r * top_k + k, e = eidx[size_t(slot)];
+      Vec g(size_t(2) * I), d(static_cast<size_t>(H));
+      ops::linear_expert_f64(x.data() + size_t(r) * H, H, gu.data(), e, 2 * I, g.data());
+      for (int i = 0; i < I; ++i) want_act[size_t(slot) * I + i] = g[i] / (1.0 + std::exp(-g[i])) * g[I + i];
+      ops::linear_expert_f64(want_act.data() + size_t(slot) * I, I, dn.data(), e, H, d.data());
+      for (int c = 0; c < H; ++c) want_y[size_t(r) * H + c] += ew[size_t(slot)] * d[c];
+    }
+
+  float* d_act = dev<float>(size_t(R) * top_k * I);
+  float* d_y = dev<float>(size_t(R) * H);
+  const int grouped = moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, act, true, d_act, I, &msc, TL);
+  const Vec act_grouped = down(d_act, size_t(R) * top_k * I);
+  moe_down(d_act, I, w_dn, d_eidx, d_ew, R, top_k, H, I, d_y, H, false, &msc, TL, nullptr, grouped);
+  const Vec y_grouped = down(d_y, size_t(R) * H);
+  expect("moe_gate_up bf16 unaligned", act_grouped, want_act, 3e-5);
+  expect("moe_down bf16 unaligned", y_grouped, want_y, 3e-5);
+  for (int r = 0; r < R; ++r) {
+    moe_gate_up(d_x + size_t(r) * H, H, w_gu, d_eidx + size_t(r) * top_k, 1, top_k, I, H, act, true, d_act, I, &msc,
+                TL);
+    const Vec a1 = down(d_act, size_t(top_k) * I);
+    moe_down(d_act, I, w_dn, d_eidx + size_t(r) * top_k, d_ew + size_t(r) * top_k, 1, top_k, H, I, d_y, H, false,
+             &msc, TL);
+    const std::string row = " row " + std::to_string(r);
+    expect_bits("moe_gate_up bf16 unaligned, R=1 == R=5" + row, a1,
+                Vec(act_grouped.begin() + ptrdiff_t(r) * top_k * I, act_grouped.begin() + ptrdiff_t(r + 1) * top_k * I));
+    expect_bits("moe_down bf16 unaligned, R=1 == R=5" + row, down(d_y, size_t(H)),
+                Vec(y_grouped.begin() + ptrdiff_t(r) * H, y_grouped.begin() + ptrdiff_t(r + 1) * H));
+  }
+  for (void* p : {static_cast<void*>(const_cast<bf16*>(w_gu.w)), static_cast<void*>(const_cast<bf16*>(w_dn.w)),
+                  static_cast<void*>(d_x), static_cast<void*>(d_eidx), static_cast<void*>(d_ew),
+                  static_cast<void*>(msc.pairs), static_cast<void*>(msc.tasks), static_cast<void*>(msc.n_tasks),
+                  static_cast<void*>(msc.down_buf), static_cast<void*>(d_act), static_cast<void*>(d_y)})
+    cudaFree(p);
+}
+
 void test_inkling2_moe() {
   test_inkling2_moe_norm();
   test_moe_gate_up_rules();
   test_moe_dp4a_variants();
+  test_moe_bf16_unaligned();
   std::printf("inkling2 moe (route, situ, gate_up, down)\n");
   // 1. moe_route: sigmoid+bias and softmax.
   for (int sig : {1, 0}) {
@@ -1825,7 +1901,7 @@ void test_inkling2_moe() {
     float* d_out = dev<float>(size_t(R) * I);
     for (float beta : {6.f, 0.f}) {
       const float lb = beta > 0.f ? 8.f : 0.f;
-      situ_rows(d_gu, 2 * I, I, beta, lb, d_out, I, R, 0);
+      moe_act_rows(d_gu, 2 * I, I, MoeAct{FLYX_MOE_SITU, beta, lb}, nullptr, d_out, I, R, 0);
       Vec got = down(d_out, size_t(R) * I);
       Vec want(size_t(R) * I);
       for (int r = 0; r < R; ++r)
@@ -1921,9 +1997,10 @@ void test_inkling2_moe() {
     float* d_y_grouped = dev<float>(size_t(R) * H);
     float* d_y_direct = dev<float>(size_t(R) * H);
 
-    moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, beta, lb, true, d_act_fused, I, &msc, TL);
-    moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, beta, lb, false, d_gu_raw, 2 * I, &msc, TL);
-    situ_rows(d_gu_raw, 2 * I, I, beta, lb, d_act_unfused, I, R * top_k, 0);
+    moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, MoeAct{FLYX_MOE_SITU, beta, lb}, true, d_act_fused, I, &msc, TL);
+    moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, MoeAct{FLYX_MOE_SITU, beta, lb}, false, d_gu_raw, 2 * I, &msc,
+                TL);
+    moe_act_rows(d_gu_raw, 2 * I, I, MoeAct{FLYX_MOE_SITU, beta, lb}, nullptr, d_act_unfused, I, R * top_k, 0);
     Vec got_gu = down(d_gu_raw, size_t(R) * top_k * 2 * I);
     Vec got_act_f = down(d_act_fused, size_t(R) * top_k * I);
     Vec got_act_u = down(d_act_unfused, size_t(R) * top_k * I);
@@ -1942,8 +2019,10 @@ void test_inkling2_moe() {
       for (int rows : {1, 8, 16}) {
         const std::string tag = label + " R=" + std::to_string(rows);
         const size_t elems = size_t(rows) * top_k * I;
-        moe_gate_up(d_x, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, false, d_gu_raw, 2 * I, &msc, TL);
-        situ_rows(d_gu_raw, 2 * I, I, beta, lb, d_act_unfused, I, rows * top_k, TL.st);
+        moe_gate_up(d_x, H, scaled_gu, d_eidx, rows, top_k, I, H, MoeAct{FLYX_MOE_SITU, beta, lb}, false, d_gu_raw,
+                    2 * I, &msc, TL);
+        moe_act_rows(d_gu_raw, 2 * I, I, MoeAct{FLYX_MOE_SITU, beta, lb}, nullptr, d_act_unfused, I, rows * top_k,
+                     TL.st);
         moe_down(d_act_unfused, I, nvfp4_down, d_eidx, d_ew, rows, top_k, H, I, d_y_direct, H, false, &msc, TL);
         Vec staged = down(d_act_unfused, elems);
         const Vec y = down(d_y_direct, size_t(rows) * H);
@@ -1957,7 +2036,7 @@ void test_inkling2_moe() {
         moe_stage_q8(d_x, H, H, rows, msc, moe_q8_mins(scaled_gu), TL.st);
         CK(cudaMemset(d_y_direct, 0, size_t(rows) * H * sizeof(float)));  // an accidental restage sees zeros
         CK(cudaMemset(d_act_unfused, 0xFF, elems * sizeof(float)));
-        moe_gate_up(d_y_direct, H, scaled_gu, d_eidx, rows, top_k, I, H, beta, lb, true,
+        moe_gate_up(d_y_direct, H, scaled_gu, d_eidx, rows, top_k, I, H, MoeAct{FLYX_MOE_SITU, beta, lb}, true,
                     bf16_down ? nullptr : d_act_unfused, I, &msc, TL, true, bf16_down ? packed_act : nullptr);
         const Vec got = bf16_down ? down_bf16(packed_act, elems) : down(d_act_unfused, elems);
         expect_bits("mixed MoE fused SiTU == generic " + tag, got, staged);
@@ -2003,7 +2082,8 @@ void test_inkling2_moe() {
     const int rr = 19;
     float* d_act_1 = dev<float>(size_t(top_k) * I);
     float* d_y_1 = dev<float>(size_t(H));
-    moe_gate_up(d_x + size_t(rr) * H, H, w_gu, d_eidx + size_t(rr) * top_k, 1, top_k, I, H, beta, lb, true, d_act_1, I,
+    moe_gate_up(d_x + size_t(rr) * H, H, w_gu, d_eidx + size_t(rr) * top_k, 1, top_k, I, H, MoeAct{FLYX_MOE_SITU,
+                beta, lb}, true, d_act_1, I,
                 nullptr, TL);
     moe_down(d_act_1, I, w_dn, d_eidx + size_t(rr) * top_k, d_ew + size_t(rr) * top_k, 1, top_k, H, I, d_y_1, H, false,
              nullptr, TL);
@@ -2011,7 +2091,8 @@ void test_inkling2_moe() {
     Vec got_ygrp_rr(got_y_grp.begin() + ptrdiff_t(rr) * H, got_y_grp.begin() + ptrdiff_t(rr + 1) * H);
     expect_bits("moe R=1 direct == R=37 grouped " + label, got_y1, got_ygrp_rr);
 
-    moe_gate_up(d_x + size_t(rr) * H, H, w_gu, d_eidx + size_t(rr) * top_k, 1, top_k, I, H, beta, lb, true, d_act_1, I,
+    moe_gate_up(d_x + size_t(rr) * H, H, w_gu, d_eidx + size_t(rr) * top_k, 1, top_k, I, H, MoeAct{FLYX_MOE_SITU,
+                beta, lb}, true, d_act_1, I,
                 &msc, TL);
     moe_down(d_act_1, I, w_dn, d_eidx + size_t(rr) * top_k, d_ew + size_t(rr) * top_k, 1, top_k, H, I, d_y_1, H, false,
              &msc, TL);
@@ -2021,7 +2102,8 @@ void test_inkling2_moe() {
     const int r8_0 = 16;  // covers rr = 19 at offset 3
     float* d_act_8 = dev<float>(size_t(16) * top_k * I);  // 16 rows: the grouping checks below
     float* d_y_8 = dev<float>(size_t(16) * H);
-    moe_gate_up(d_x + size_t(r8_0) * H, H, w_gu, d_eidx + size_t(r8_0) * top_k, 8, top_k, I, H, beta, lb, true, d_act_8,
+    moe_gate_up(d_x + size_t(r8_0) * H, H, w_gu, d_eidx + size_t(r8_0) * top_k, 8, top_k, I, H, MoeAct{FLYX_MOE_SITU,
+                beta, lb}, true, d_act_8,
                 I, &msc, TL);
     moe_down(d_act_8, I, w_dn, d_eidx + size_t(r8_0) * top_k, d_ew + size_t(r8_0) * top_k, 8, top_k, H, I, d_y_8, H,
              false, &msc, TL);
@@ -2061,7 +2143,8 @@ void test_inkling2_moe() {
       const MoeScratch* scratch_modes[] = {&msc, nullptr};
       for (const MoeScratch* scratch : scratch_modes) {
         for (int nr : {1, 8, 16, 17, 37, 256, 257}) {
-          const int grouped = moe_gate_up(input + 1, stride, w_gu, expert, nr, top_k, I, H, beta, lb, true,
+          const int grouped = moe_gate_up(input + 1, stride, w_gu, expert, nr, top_k, I, H, MoeAct{FLYX_MOE_SITU,
+                                          beta, lb}, true,
                                           activation + 1, I, scratch, TL);
           moe_down(activation + 1, I, w_dn, expert, weight, nr, top_k, H, I, output, H, false, scratch, TL,
                    nullptr, grouped);
@@ -2083,7 +2166,8 @@ void test_inkling2_moe() {
     // GEMMs' tiles are alike and where they are not.
     for (int rows : {2, 4, 8, 16}) {
       const std::string tag = label + " R=" + std::to_string(rows);
-      const int grouped = moe_gate_up(d_x, H, w_gu, d_eidx, rows, top_k, I, H, beta, lb, true, d_act_8, I, &msc, TL);
+      const int grouped = moe_gate_up(d_x, H, w_gu, d_eidx, rows, top_k, I, H, MoeAct{FLYX_MOE_SITU, beta, lb}, true,
+                                      d_act_8, I, &msc, TL);
       moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TL, nullptr, grouped);
       const Vec taken = down(d_y_8, size_t(rows) * H);
       moe_down(d_act_8, I, w_dn, d_eidx, d_ew, rows, top_k, H, I, d_y_8, H, false, &msc, TL);
@@ -2245,9 +2329,10 @@ void test_inkling2_moe() {
   cudaFree(const_cast<uint8_t*>(nvfp4_down.s));
   cudaFree(const_cast<float*>(nvfp4_down.rs));
 
-  // (d) Multi-span non-power-of-2 K (Inkling-2 dimensions: H = 2304 -> 3 spans tail 8; I = 1152 -> 2 spans tail 4).
-  {
-    const int RM = 19, EM = 4, KM = 2, HM = 2304, IM = 1152;
+  // (d) Multi-span non-power-of-2 K (Inkling-2 dimensions: H = 2304 -> 3 spans tail 8; I = 1152 -> 2 spans tail 4);
+  // 70 rows: 35 an expert, the down projection's tasks of 32 rows (moe_mma_rows), the last of each 3 rows.
+  for (const int RM : {19, 70}) {
+    const int EM = 4, KM = 2, HM = 2304, IM = 1152;
     seed("inkling2_moe_multispan", RM, EM, KM, HM, IM);
     Vec xm = randv(size_t(RM) * HM, 0.5);
     Vec rlm = randv(size_t(RM) * EM, 1.0);
@@ -2297,21 +2382,24 @@ void test_inkling2_moe() {
       wdn.N = HM;
       wdn.blk = up_blocks(FLYX_DT_GGML_IQ4_NL, draw, EM * HM);
       wdn.blk.q8 = true;
-      moe_gate_up(dxm, HM, wgu, deim, RM, KM, IM, HM, beta, lb, true, d_act_m, IM, &sm, TL);
+      moe_gate_up(dxm, HM, wgu, deim, RM, KM, IM, HM, MoeAct{FLYX_MOE_SITU, beta, lb}, true, d_act_m, IM, &sm, TL);
       moe_down(d_act_m, IM, wdn, deim, dewm, RM, KM, HM, IM, d_y_m, HM, false, &sm, TL);
       Vec ym = down(d_y_m, size_t(RM) * HM);
       const int rr = 11;
       Vec yref(ym.begin() + ptrdiff_t(rr) * HM, ym.begin() + ptrdiff_t(rr + 1) * HM);
-      moe_gate_up(dxm + size_t(rr) * HM, HM, wgu, deim + size_t(rr) * KM, 1, KM, IM, HM, beta, lb, true, d_act_1, IM,
+      moe_gate_up(dxm + size_t(rr) * HM, HM, wgu, deim + size_t(rr) * KM, 1, KM, IM, HM, MoeAct{FLYX_MOE_SITU, beta,
+                  lb}, true, d_act_1, IM,
                   &sm, TL);
       moe_down(d_act_1, IM, wdn, deim + size_t(rr) * KM, dewm + size_t(rr) * KM, 1, KM, HM, IM, d_y_1, HM, false, &sm,
                TL);
-      expect_bits(std::string("moe multispan 2304x1152 R=1==R=19 ") + gbt.name, down(d_y_1, size_t(HM)), yref);
-      moe_gate_up(dxm + size_t(8) * HM, HM, wgu, deim + size_t(8) * KM, 8, KM, IM, HM, beta, lb, true, d_act_8, IM, &sm,
+      const std::string pass = "R=" + std::to_string(RM) + " ";
+      expect_bits("moe multispan 2304x1152 R=1==" + pass + gbt.name, down(d_y_1, size_t(HM)), yref);
+      moe_gate_up(dxm + size_t(8) * HM, HM, wgu, deim + size_t(8) * KM, 8, KM, IM, HM, MoeAct{FLYX_MOE_SITU, beta,
+                  lb}, true, d_act_8, IM, &sm,
                   TL);
       moe_down(d_act_8, IM, wdn, deim + size_t(8) * KM, dewm + size_t(8) * KM, 8, KM, HM, IM, d_y_8, HM, false, &sm, TL);
       Vec y8 = down(d_y_8, size_t(8) * HM);
-      expect_bits(std::string("moe multispan 2304x1152 R=8==R=19 ") + gbt.name,
+      expect_bits("moe multispan 2304x1152 R=8==" + pass + gbt.name,
                   Vec(y8.begin() + ptrdiff_t(rr - 8) * HM, y8.begin() + ptrdiff_t(rr - 7) * HM), yref);
       cudaFree(const_cast<uint8_t*>(wgu.blk.data));
       cudaFree(const_cast<uint16_t*>(wgu.blk.scales));
@@ -2392,12 +2480,14 @@ void test_inkling2_moe() {
         wdn.w = up_bf16(dn);
       }
       const char* name = packed ? "Q8_0" : "bf16";
-      const int grouped = moe_gate_up(dxg, HG, wgu, deig, RG, KG, IG, HG, beta, lb, true, d_act_g, IG, &sg, TL);
+      const int grouped = moe_gate_up(dxg, HG, wgu, deig, RG, KG, IG, HG, MoeAct{FLYX_MOE_SITU, beta, lb}, true,
+                                      d_act_g, IG, &sg, TL);
       moe_down(d_act_g, IG, wdn, deig, dewg, RG, KG, HG, IG, d_y_g, HG, false, &sg, TL, nullptr, grouped);
       const Vec yg = down(d_y_g, size_t(RG) * HG);
       bool same = true;
       for (int rr : {0, 1, 33, 68, 69}) {
-        moe_gate_up(dxg + size_t(rr) * HG, HG, wgu, deig + size_t(rr) * KG, 1, KG, IG, HG, beta, lb, true, d_act_1, IG,
+        moe_gate_up(dxg + size_t(rr) * HG, HG, wgu, deig + size_t(rr) * KG, 1, KG, IG, HG, MoeAct{FLYX_MOE_SITU, beta,
+                    lb}, true, d_act_1, IG,
                     &sg, TL);
         moe_down(d_act_1, IG, wdn, deig + size_t(rr) * KG, dewg + size_t(rr) * KG, 1, KG, HG, IG, d_y_1, HG, false,
                  &sg, TL);

@@ -272,6 +272,11 @@ void test_attention(int hd, int rot, int nh, int nkv, int rows, int ctx, bool ca
 void test_attention_fp8(int hd, int rot, int nh, int nkv, int rows, int ctx, double theta, bool qk_norm = true);
 void test_attention_tree(int hd, int nh, int nkv, int ctx);
 void test_kv16_saturation();
+// The tensor-core prefill over windows of keys (op_test_attention.cu): the bits of the one pass `whole`.
+template <class T>
+void expect_windows(const std::string& what, const float* dq, const T* dK, const T* dV, const float* dKs,
+                    const float* dVs, int nh, int nkv, int hd, int rows, int total, const DevParams* P,
+                    const float* gate, int ld, const Vec& whole, int hb = 0);
 void test_strata(int hd, int nh, int nkv, int rows, int ctx, int bits, bool fp8);
 void test_pageable_kv_ops();
 void test_ring_publish();
@@ -329,5 +334,7 @@ void test_inkling2_rel_attn();
 void test_inkling2_rel_strata();
 void test_inkling2_moe();
 void test_dspark();
+void test_gpt_oss();
+void test_gemma4();
 
 }  // namespace flyx::optest

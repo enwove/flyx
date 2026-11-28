@@ -86,6 +86,7 @@ struct EmbedBlock {
   BlockMat blk;           // the table as packed GGML blocks (data null: bf16)
   bool has_norm = false;
   Norm norm{};            // optional post-embedding RMSNorm (Inkling-2)
+  float scale = 1.f;      // each row times it (Gemma's sqrt(hidden), ABI 58)
 };
 
 // norm -> q (| output gate) | k | v -> q/k norms, rotary on the first `rot`
@@ -101,8 +102,23 @@ struct AttnBlock {
   Lin w_in, w_out;             // w_in: the projections stacked as above
   Adapters lora;               // its own adapters on q, k, v and o (never with a gate)
   int kv = -1;                 // its cache (StateTable::kv)
+  // gpt-oss (ABI 56): q|k|v's biases stacked as w_in's rows ([n_in()]) and o's ([hidden]), null: none; sinks [nh] (a
+  // logit per head in its softmax's denominator), null: none; window (0: every position); its rotary's factors
+  // (YaRN's; null: rope_table's for theta), and the softmax's scale (1 / sqrt(hd), times YaRN's mscale squared: q
+  // and k each scaled by it after the rotary).
+  float *qkv_b = nullptr, *o_b = nullptr, *sinks = nullptr;
+  int window = 0;
+  const double* rope = nullptr;
+  float scale = 0.f;
+  // Gemma 4 (ABI 58): v is k's projection (w_in q|k only), v_eps > 0: each head's v RMS-normed without a weight at
+  // that eps before it is cached; post_norm (w null: none): o's output normed before the residual add.
+  bool v_from_k = false;
+  bool kv_shared = false;      // its K/V another block's, which writes it: w_in is q's alone (ABI 58)
+  float v_eps = 0.f;
+  Norm post_norm;
   int q_width() const { return (gate ? 2 : 1) * nh * hd; }
-  int n_in() const { return q_width() + 2 * nkv * hd; }
+  int n_in() const { return q_width() + (kv_shared ? 0 : v_from_k ? 1 : 2) * nkv * hd; }
+  int v_off() const { return q_width() + (v_from_k ? 0 : nkv * hd); }  // v's rows in w_in's output (k's: v_from_k)
   MRoPE mrope(const int32_t* pos_3d = nullptr) const {
     return MRoPE{{mrope_section[0], mrope_section[1], mrope_section[2]}, mrope_interleaved, pos_3d};
   }
@@ -122,12 +138,35 @@ struct GdnBlock {
   int n_in() const { return gd.C() + v_width() + 2 * gd.nv; }
 };
 
-// norm -> gate | up -> silu(gate) * up -> down, added to the residual.
+// norm -> gate | up -> act(gate) * up -> down (-> post_norm), added to the residual (then times out_scale).
 struct MlpBlock {
   int hidden = 0, inter = 0;
   Norm norm;
   Lin w_gu, w_down;
   Adapters lora;               // its own adapters on gate, up and down
+  // Gemma 4 (ABI 58): the activation (flyx_mlp_act), post_norm (w null: none) on down's output before the add, and
+  // out_scale ([1] on the device, null: none) multiplying the residual after it.
+  int act = 0;
+  Norm post_norm;
+  const float* out_scale = nullptr;
+  // Gemma 4's E2B / E4B (ABI 58): after the residual add, x += pl_norm(w_pl_proj(act(w_pl_gate(x)) * pli)), pli
+  // slice per_layer (per_layer_dim wide) of the pass's per-layer inputs (RowBufs::pli; per_layer < 0: none)
+  int per_layer = -1, per_layer_dim = 0;
+  Lin w_pl_gate, w_pl_proj;
+  Norm pl_norm;
+  bool plain() const { return act == 0 && !post_norm.w && !out_scale && per_layer < 0; }  // SwiGLU added as it is
+};
+
+// Every layer's input of its own (ABI 58, Gemma 4's E2B / E4B), into RowBufs::pli: its table's rows (as an
+// embedding's table: bf16 or packed GGML blocks, on the GPU or in host memory), the projection of the embedded rows,
+// each layer's slice normed alone.
+struct PerLayerInputBlock {
+  int layers = 0, dim = 0;
+  EmbedBlock table;  // [vocab, layers * dim]
+  Lin w_proj;        // [layers * dim, hidden]
+  Norm norm;         // [dim]
+  float table_scale = 1.f, proj_scale = 1.f, mix = 1.f;
+  int width() const { return layers * dim; }
 };
 
 // Final norm -> logits -> the token choice per row.
@@ -171,6 +210,22 @@ struct Eagle4Block {
   Norm fc_norm[FLYX_EAGLE4_MAX_TAPS], in_norm, hidden_norm, norm;
   Lin fc, cand_down, cand_up;                      // [hidden, n_taps target_hidden], [rank, hidden], [rows, rank]
   const bf16* head = nullptr;                      // [rows, hidden], bf16
+};
+
+// Gemma 4's assistant (flyx_gemma4_mtp_block; regions/layers.cpp gemma4_mtp_draft): its layers (blocks first_layer
+// + 2 i: an AttnBlock reading the target's K/V, kv_shared; + 2 i + 1: an MlpBlock) a step a draft at the anchor's
+// position, from [embed(t) | h] through pre_proj; its own head (a HeadBlock of its width), whose norm's output
+// post_proj takes to the next step's h.  Its ring (MTP's) keeps the target's final-normed hidden.
+struct Gemma4MtpBlock {
+  int hidden = 0, target_hidden = 0, vocab = 0;
+  int embed = -1, head = -1, target_head = -1;  // blocks: the target's embedding, its own head, the target's head
+  int first_layer = -1, layers = 0;
+  Lin pre_proj, post_proj;                      // [hidden, 2 target_hidden], [target_hidden, hidden]
+  // its clustered head (E2B / E4B; n_centroids 0: every token scored): the centroids' logits, then the tokens of the
+  // top_k best clusters (token_order: vocab / n_centroids a cluster, int32 on the device) scored by its head
+  Lin centroids;
+  int* token_order = nullptr;
+  int n_centroids = 0, top_k = 0;
 };
 
 // DFlash2: a block of `block` rows (the anchor, then mask tokens) through its
@@ -292,7 +347,7 @@ struct VisionLin {
   int N = 0, K = 0, K_pad = 0;
   bool on_host = false;
   bool on_disk = false;
-  bool a4 = false;  // pre-quantized NVFP4 weight calibrated for W4A4 prefill activations (FLYX_ACT_NVFP4)
+  bool a4 = false;  // pre-quantized NVFP4 weight calibrated for W4A4 prefill activations (FLYX_ACT_NVFP4_BF16)
   DiskKind disk_kind = kDiskNone;
   uint64_t disk_off = 0;
   size_t disk_bytes = 0;
@@ -399,11 +454,15 @@ struct RelAttnBlock {
   int kv = -1, sconv = -1;
 };
 
-// Inkling-2 sparse MoE block with AttnRes, optional cross-pass loop control, SiTU activation, and post ShortConv.
+// Sparse MoE block (Inkling-2's with AttnRes, optional cross-pass loop control, SiTU activation and post ShortConv;
+// gpt-oss's with biases and its own activation).
 struct MoeBlock {
   int hidden = 0, inter = 0, n_experts = 0, top_k = 0, conv = 0;
   bool gating_sigmoid = true, norm_weights = true;
-  float route_scale = 1.f, norm_eps = 1e-20f, situ_beta = 0.f, situ_linear_beta = 0.f;
+  float route_scale = 1.f, norm_eps = 1e-20f;
+  MoeAct act;  // its bias: an expert's gate then up biases [E, 2 I] (either zeros where the block has none)
+  float* down_b = nullptr;     // [E, H]
+  float* router_logit_b = nullptr;  // [E], added to the router's logits
   Norm norm;
   Lin router;
   float* router_bias = nullptr;
@@ -412,6 +471,16 @@ struct MoeBlock {
   int loop_rank = 0;
   LoopWeights loop_ctrl;
   int sconv = -1, sconv_offset = 0;
+  // Gemma 4's (ABI 58): the router's own input rmsnorm(x) * router_in (router_in: its scale times router_mul times
+  // the norm's weight, null: the router reads the experts' normed rows); the routed weights times expert_scale [E];
+  // the MLP block `shared` beside the experts (-1: none); the experts' output normed (post_norm), the sum normed
+  // (out_norm) before the residual add, x then times out_scale.
+  float* router_in = nullptr;
+  float router_eps = 0.f;
+  float* expert_scale = nullptr;
+  int shared = -1;
+  Norm post_norm, out_norm;
+  const float* out_scale = nullptr;
 };
 
 // DSpark companion drafter (Inkling-2): 3-layer DFlash with block-uniform SWA/Full + Markov RNN head.
@@ -449,7 +518,8 @@ struct DSparkBlock {
 
 using Block = std::variant<EmbedBlock, AttnBlock, GdnBlock, MlpBlock, HeadBlock, MtpBlock, DFlashBlock, DFlashLayer,
                            DvBlock, DvLayer, VisionStemBlock, VitAttnBlock, VitMlpBlock, VisionMergeBlock,
-                           RelAttnBlock, MoeBlock, DSparkBlock, DSparkLayer, Eagle4Block>;
+                           RelAttnBlock, MoeBlock, DSparkBlock, DSparkLayer, Eagle4Block, Gemma4MtpBlock,
+                           PerLayerInputBlock>;
 
 // ---- a sequence's state, as the table declares it -------------------------------------------
 struct KvBuf {

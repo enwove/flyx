@@ -2,7 +2,7 @@
 """The bf16 prefill residual's decision, as each backend reports it at load (-v), held on runs that end well: every
 file is run through a prompt of 40 tokens (prefill passes of more than 16 rows, where the decision is taken), and a
 run must exit 0 with tokens.  A stack whose every residual add is a W4A4 GEMM keeps a prefill pass's residual in bf16
-(tiny_llama_nvfp4.flyx, tiny_nvfp4.flyx and tiny_w4a4.flyx with --activations nvfp4); the same stack with the
+(tiny_llama_nvfp4.flyx, tiny_nvfp4.flyx and tiny_w4a4.flyx with --activations nvfp4/bf16); the same stack with the
 target's own adapters (ABI 43, tiny_llama_nvfp4_lora.flyx) or a PEFT adapter on its gated delta nets alone (--lora)
 keeps it in float32, as its adapters add float32 products to float32 rows.
 
@@ -53,7 +53,8 @@ def bench(flyx, model, backend, lora, prompts, n, tmp):
     asked, record = tmp / f"{tag}.jsonl", tmp / f"{tag}.json"
     asked.write_text("".join(json.dumps({"ids": p}) + "\n" for p in prompts), encoding="utf-8")
     run = subprocess.run([flyx, "bench", str(model), "--prompts", str(asked), "-n", str(n), "--ignore-eos",
-                          "--backend", backend, "--activations", "nvfp4", "--ctx", "256", "--no-spec", "--no-lookup",
+                          "--backend", backend, "--activations", "nvfp4/bf16", "--ctx", "256", "--no-spec",
+                          "--no-lookup",
                           "-v", "--json", str(record)] + (["--lora", str(lora)] if lora else []),
                          capture_output=True, text=True, encoding="utf-8", errors="replace")
     said = [line.split(LINE, 1)[1].strip() for line in run.stderr.splitlines() if LINE in line]

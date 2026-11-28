@@ -158,7 +158,7 @@ print(reply["content"])
 
 | 维度 | 支持范围 | 说明 |
 |---|---|---|
-| 模型架构 | Qwen3.5 / Qwen3.8（`qwen35`）、Qwen3（`qwen3`）、Inkling-2-Mini（`inkling2_loop`，稀疏 MoE）、Llama（MiniCPM5-1B） | Llama 仅支持 `.flyx` |
+| 模型架构 | Qwen3.5 / Qwen3.8（`qwen35`）、Qwen3（`qwen3`）、Inkling-2-Mini（`inkling2_loop`，稀疏 MoE）、gpt-oss-20b / 120b（`gpt-oss`，稀疏 MoE，GGUF）、Llama（MiniCPM5-1B） | Llama 仅支持 `.flyx` |
 | 投机草稿器 | MTP、DFlash2、DSpark、提示查找 | MTP 与 DSpark 自动挂载；DFlash2 为配套文件（`--drafter-file`，或控制台中的 **Draft with it**）；DSpark 配合 Inkling-2-Mini 使用 |
 | 视觉 | 配合 `mmproj` 投影器输入图像，投影器自动从模型所在的 Hub 仓库下载 | 目前支持 Qwen3.5 / Qwen3.8；Inkling-2-Mini 仅支持文本 |
 | 模型格式 | GGUF（`F32`、`F16`、`BF16`、`Q4_0–Q8_0`、`Q2_K–Q6_K`、`IQ1–IQ4`、`MXFP4`, `Q2_0`, GGML NVFP4）；`.flyx`（BF16、NVFP4；格式 2 可带目标模型自带的 LoRA 适配器（V-LoRA，不合并运行）；DV 草稿器，仅在指定时起草：`--drafter dv`，[设计](../design/dv.md)） | 分片 GGUF 的所有文件须放在同一目录。 |

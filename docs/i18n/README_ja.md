@@ -158,7 +158,7 @@ print(reply["content"])
 
 | 項目 | 対応範囲 | 備考 |
 |---|---|---|
-| アーキテクチャ | Qwen3.5 / Qwen3.8（`qwen35`）、Qwen3（`qwen3`）、Inkling-2-Mini（`inkling2_loop`、疎な MoE）、Llama（MiniCPM5-1B） | Llama は `.flyx` のみ |
+| アーキテクチャ | Qwen3.5 / Qwen3.8（`qwen35`）、Qwen3（`qwen3`）、Inkling-2-Mini（`inkling2_loop`、疎な MoE）、gpt-oss-20b / 120b（`gpt-oss`、疎な MoE、GGUF）、Llama（MiniCPM5-1B） | Llama は `.flyx` のみ |
 | 投機ドラフター | MTP、DFlash2、DSpark、プロンプト検索 | MTP と DSpark は自動で接続。DFlash2 は付属ファイル（`--drafter-file`、またはダッシュボードの **Draft with it**）。DSpark は Inkling-2-Mini 用 |
 | ビジョン | `mmproj` プロジェクターによる画像入力（モデルの Hub リポジトリから自動取得） | 現在は Qwen3.5 / Qwen3.8 に対応。Inkling-2-Mini はテキストのみ |
 | モデル形式 | GGUF（`F32`, `F16`, `BF16`, `Q4_0–Q8_0`, `Q2_K–Q6_K`, `IQ1–IQ4`, `MXFP4`, `Q2_0`, GGML NVFP4）；`.flyx`（BF16, NVFP4；フォーマット 2 では対象モデル付属の LoRA アダプター V-LoRA を未マージのまま実行可能。DV ドラフターは `--drafter dv` 指定時のみ有効、[設計](../design/dv.md)） | 分割 GGUF の全ファイルは同じフォルダーに置きます。 |

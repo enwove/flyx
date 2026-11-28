@@ -22,6 +22,45 @@ namespace flyx {
 
 namespace {
 
+// The inputs each kind of quantized weight takes, PREFILL/DECODE as --activations names them (one name: the same in
+// both), e.g. "GGML blocks q8, MXFP4 experts mxfp8/q8"; empty for a model of floating-point weights alone.
+std::string activations_summary(const flyx_model_desc& d) {
+  std::vector<std::pair<std::string, std::string>> kinds;  // kind, mode, in the order first met
+  auto add = [&](const std::string& kind, const std::string& mode) {
+    for (const auto& k : kinds)
+      if (k.first == kind && k.second == mode) return;
+    kinds.emplace_back(kind, mode);
+  };
+  for (int i = 0; i < d.n_weights; ++i) {
+    const flyx_weight& w = d.weights[i];
+    if (!w.t) continue;
+    const int32_t dt = w.t->dtype;
+    const bool nvfp4 = dt == FLYX_DT_NVFP4 || dt == FLYX_DT_GGML_NVFP4;
+    if (nvfp4) {
+      add(w.t->ndim == 3 ? "NVFP4 experts" : "NVFP4", w.activations == FLYX_ACT_NVFP4_BF16 ? "nvfp4/bf16" : "bf16");
+    } else if (flyx_block_values(dt)) {
+      const char* mode = w.activations == FLYX_ACT_Q8         ? "q8"
+                         : w.activations == FLYX_ACT_BF16     ? "bf16"
+                         : w.activations == FLYX_ACT_MXFP8    ? "mxfp8"
+                         : w.activations == FLYX_ACT_MXFP8_Q8 ? "mxfp8/q8"
+                                                              : "exact";
+      add(dt == FLYX_DT_GGML_MXFP4 ? "MXFP4" : "GGML blocks", mode);
+    }
+  }
+  // MXFP4 weights taking what the other GGML blocks take are told among them
+  auto blocks_take = [&](const std::string& mode) {
+    for (const auto& k : kinds)
+      if (k.first == "GGML blocks" && k.second == mode) return true;
+    return false;
+  };
+  std::string out;
+  for (const auto& [kind, mode] : kinds) {
+    if (kind == "MXFP4" && blocks_take(mode)) continue;
+    out += (out.empty() ? "" : ", ") + (kind == "MXFP4" ? std::string("MXFP4 experts") : kind) + " " + mode;
+  }
+  return out;
+}
+
 int32_t to_abi_vision_device(interfaces::VisionDeviceMode m) {
   switch (m) {
     case interfaces::VisionDeviceMode::kDisk: return FLYX_VISION_DEV_DISK;
@@ -413,6 +452,19 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
   } else {
     spec::warm_rounds(api_, bm_, plans_.prefill, plans_.rounds, prompt);
   }
+  // Prefill passes past the rounds' rows (these prefilled the prompt's 64), where the device loads kernels on their
+  // first launch (a GPU): 256 rows, then twice as many up to the longest pass, the kernels' configurations changing
+  // with the rows (gpt-oss-20b: its router's bf16 GEMM past 384).
+  if (device_.sm_major > 0) {
+    std::vector<int> lengths;
+    for (int n = 256; n < 2 * prefill_chunk_; n *= 2) {
+      const int len = std::min(n, prefill_chunk_) / prefill_align_ * prefill_align_;
+      if (len > 64 && (lengths.empty() || len > lengths.back())) lengths.push_back(len);
+    }
+    if (const std::string why = spec::warm_prefill(api_, bm_, plans_.prefill, lengths, prompt);
+        !why.empty() && opt_.verbose)
+      log::info("flyx: prefill warm-up stopped at %s", why.c_str());
+  }
   // The costs the controller chooses by from here: these timings, then what the rounds read teach (RoundCosts),
   // where they choose (one plan and no lookup: nothing timed, nothing to learn).  A drafter's wider chain costs no
   // less than its next narrower one; so does a lookup round of more drafts (given_widths ascend).
@@ -694,15 +746,11 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   const bool requested_trees = opt_.draft_trees;
   if (opt_.vision && !opt_.mmproj_file.empty() && !model_->vision())
     return *err = "--mmproj " + opt_.mmproj_file + ": file is not a supported vision projector (mmproj)", false;
-  if (opt_.verbose && device_.fp4_inputs == 0 && opt_.activations.empty()) {
-    int nvfp4 = 0;
-    for (int i = 0; i < model_->desc().n_weights; ++i) {
-      const flyx_tensor_view* w = model_->desc().weights[i].t;
-      nvfp4 += w && (w->dtype == FLYX_DT_NVFP4 || w->dtype == FLYX_DT_GGML_NVFP4);
-    }
-    if (nvfp4)
-      log::info("flyx: %d NVFP4 weights take bf16 inputs on this GPU (no FP4 tensor cores)", nvfp4);
-  }
+  if (const std::string modes = activations_summary(model_->desc()); !modes.empty())
+    log::info("flyx: activations (prefill/decode): %s%s", modes.c_str(),
+              device_.fp4_inputs == 0 && modes.find("NVFP4 bf16") != std::string::npos
+                  ? " (no FP4 tensor cores on this GPU)"
+                  : "");
   eos_ = file_.eos_ids();
   model_max_new_ = file_.max_new_tokens();
 

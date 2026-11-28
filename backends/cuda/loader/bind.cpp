@@ -6,8 +6,11 @@
 // context k|v, DV's adapters on one input), norms as float.  Knows block
 // kinds, not models.
 #include "backends/cuda/loader/loader.h"
+#include "ops/rope/ref.h"
+#include "ops/sampling/sampling.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <optional>
 
@@ -285,7 +288,37 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
   a.mrope_section[1] = b.mrope_section[1];
   a.mrope_section[2] = b.mrope_section[2];
   a.mrope_interleaved = b.mrope_interleaved;
-  rope_register(a.theta, a.rot);  // attn_prep's rotary factors, once
+  a.scale = 1.f / std::sqrt(float(b.head_dim));
+  if (b.rope.kind == FLYX_ROPE_YARN) {  // its factors from the float64 reference's formula, q and k's mscale in scale
+    expect(b.rot_dim == b.head_dim && b.mrope_section[0] == 0 && b.mrope_section[1] == 0 && b.mrope_section[2] == 0,
+           "YaRN rotary on part of a head or with 3D sections");
+    std::vector<double> inv(size_t(b.rot_dim / 2));
+    flyx::ops::yarn_inv_freq(b.theta, b.rot_dim, b.rope.factor, b.rope.orig_ctx, b.rope.beta_fast, b.rope.beta_slow,
+                             b.rope.truncate != 0, inv.data());
+    double* tab = L.model()->alloc<double>(inv.size());
+    CK(cudaMemcpy(tab, inv.data(), inv.size() * sizeof(double), cudaMemcpyHostToDevice));
+    a.rope = tab;
+    const double ms = flyx::ops::yarn_mscale(b.rope.factor);
+    a.scale = float(ms * ms / std::sqrt(double(b.head_dim)));
+  } else if (b.rope.kind == FLYX_ROPE_PROPORTIONAL) {  // the whole head's pairs, those past rot_dim / 2 at 0 (still)
+    expect(b.rot_dim > 0 && b.rot_dim <= b.head_dim && b.rot_dim % 2 == 0 && b.mrope_section[0] == 0 &&
+               b.mrope_section[1] == 0 && b.mrope_section[2] == 0,
+           "proportional rotary over more dims than the head's, or with 3D sections");
+    std::vector<double> inv(size_t(b.head_dim / 2));
+    flyx::ops::proportional_inv_freq(b.theta, b.head_dim, b.rot_dim, inv.data());
+    double* tab = L.model()->alloc<double>(inv.size());
+    CK(cudaMemcpy(tab, inv.data(), inv.size() * sizeof(double), cudaMemcpyHostToDevice));
+    a.rope = tab;
+    a.rot = b.head_dim;  // attn_prep turns the whole head's pairs, by the table
+  } else {
+    expect(b.rope.kind == FLYX_ROPE_PLAIN, "unknown rotary scaling");
+    rope_register(a.theta, a.rot);  // attn_prep's rotary factors, once
+  }
+  if (b.scale > 0.f) a.scale = b.scale;  // Gemma 4's q.k, unscaled (ABI 58)
+  a.v_from_k = b.v_from_k != 0;
+  if (b.v_norm) a.v_eps = float(b.k_norm.eps);
+  expect(!b.v_norm || (b.k_norm.w >= 0 && b.k_norm.eps > 0), "a weightless v norm without k's norm (its eps)");
+  if (b.has_post_norm) a.post_norm = norm(L, b.post_norm);
   a.gate = b.gate != FLYX_GATE_NONE;
   a.norm = norm(L, b.norm);
   // The kernels read every head's q, then every head's gate: a file that keeps
@@ -300,12 +333,42 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
   };
   const WeightLoader::RowOrder q_rows = gate_rows(b.gate);
   int rows = 0;
-  a.w_in = L.lin_stack_quant({b.q, b.k, b.v}, dq, &rows, {q_rows});
+  expect(!a.v_from_k || (b.v < 0 && b.v_b < 0 && b.lora[FLYX_LIN_V].rank <= 0 && b.lora[FLYX_LIN_K].rank <= 0),
+         "v from k's projection beside a v weight, bias or adapter (or an adapter on k)");
+  a.kv_shared = b.kv_shared != 0;
+  expect(!a.kv_shared || (b.k < 0 && b.v < 0 && b.k_norm.w < 0 && !b.v_norm && !a.v_from_k && b.q_b < 0 &&
+                          !a.gate && b.sinks < 0 && block_rank(b.lora, 4) == 0),
+         "an attention block reading another's K/V with a k or v (or biases, a gate, sinks, adapters) of its own");
+  a.w_in = a.kv_shared ? L.lin_stack_quant({b.q}, dq, &rows, {q_rows})
+           : a.v_from_k ? L.lin_stack_quant({b.q, b.k}, dq, &rows, {q_rows})
+                        : L.lin_stack_quant({b.q, b.k, b.v}, dq, &rows, {q_rows});
   expect(rows == a.n_in(), "attention q|k|v rows do not match its dimensions");
   a.w_out = L.lin_quant(b.o, dq);
   a.q_norm = head_norm(L, b.q_norm);
   a.k_norm = head_norm(L, b.k_norm);
   a.kv = state_of(sm.kv, b.kv, "K/V");
+  expect((b.q_b >= 0) == (b.k_b >= 0) && (b.k_b >= 0) == (b.v_b >= 0) && (b.q_b < 0 || !a.gate),
+         "an attention block's q, k and v biases: all three or none, never with an output gate");
+  if (b.q_b >= 0) {  // stacked as w_in's rows
+    std::vector<float> qkv;
+    for (int w : {b.q_b, b.k_b, b.v_b}) {
+      const std::vector<float> v = L.host_f32(w);
+      qkv.insert(qkv.end(), v.begin(), v.end());
+    }
+    expect(int(qkv.size()) == a.n_in(), "an attention block's q|k|v biases do not match its rows");
+    a.qkv_b = L.model()->alloc<float>(qkv.size());
+    CK(cudaMemcpy(a.qkv_b, qkv.data(), qkv.size() * sizeof(float), cudaMemcpyHostToDevice));
+  }
+  if (b.o_b >= 0) a.o_b = L.vec(b.o_b);
+  if (b.sinks >= 0) {
+    expect(L.t(b.sinks)->ndim == 1 && L.t(b.sinks)->shape[0] == b.n_heads, "an attention block's sinks are not [nh]");
+    a.sinks = L.vec(b.sinks);
+  }
+  expect(b.window >= 0 && b.window == L.model()->states.kv[size_t(a.kv)].window,
+         "an attention block's window is not its cache's");
+  a.window = b.window;
+  // a window's attention takes the per-head kernel, which reads binary16 caches
+  if (b.window > 0) L.model()->states.kv[size_t(a.kv)].fp8 = false;
   int in[4], out[4];
   attn_dims(b, in, out);
   expect(!a.gate || b.lora[FLYX_LIN_Q].rank <= 0 || b.lora_gate == FLYX_GATE_AFTER_Q ||
@@ -370,7 +433,8 @@ GdnBlock gdn(WeightLoader& L, const flyx_gdn_block& b, const StateMap& sm, Adapt
   return g;
 }
 
-MlpBlock mlp(WeightLoader& L, const flyx_mlp_block& b, AdapterCarve& carve, DraftQuant dq = DraftQuant::kNone) {
+MlpBlock mlp(WeightLoader& L, const flyx_mlp_block& b, AdapterCarve& carve, DraftQuant dq = DraftQuant::kNone,
+             const flyx_model_desc* d = nullptr) {
   MlpBlock f;
   f.hidden = b.hidden;
   f.inter = b.inter;
@@ -379,6 +443,28 @@ MlpBlock mlp(WeightLoader& L, const flyx_mlp_block& b, AdapterCarve& carve, Draf
   f.w_gu = L.lin_stack_quant({b.gate, b.up}, dq, &rows);
   expect(rows == 2 * f.inter, "MLP gate|up rows do not match its dimensions");
   f.w_down = L.lin_quant(b.down, dq);
+  expect(b.act == FLYX_MLP_SILU || b.act == FLYX_MLP_GELU_TANH, "an MLP block's activation is not known");
+  f.act = b.act;
+  if (b.has_post_norm) f.post_norm = norm(L, b.post_norm);
+  if (b.has_out_scale) {
+    expect(L.t(b.out_scale)->ndim >= 1 && L.t(b.out_scale)->shape[0] == 1, "an MLP block's out scale is not [1]");
+    f.out_scale = L.vec(b.out_scale);
+  }
+  if (b.has_per_layer) {  // Gemma 4's E2B / E4B: its layer's input of its own
+    expect(d && b.per_layer_input >= 0 && b.per_layer_input < d->n_blocks &&
+               d->blocks[b.per_layer_input].kind == FLYX_BLOCK_PER_LAYER_INPUT && b.has_post_norm && dq == DraftQuant::kNone,
+           "an MLP block's per-layer stage without a per-layer input block (or a norm after down)");
+    const auto& q = d->blocks[b.per_layer_input].per_layer_input;
+    expect(b.per_layer_index >= 0 && b.per_layer_index < q.layers && q.hidden == b.hidden,
+           "an MLP block's per-layer slice outside its per-layer inputs");
+    f.per_layer = b.per_layer_index;
+    f.per_layer_dim = q.dim;
+    f.w_pl_gate = L.lin(b.per_layer_gate);
+    f.w_pl_proj = L.lin(b.per_layer_proj);
+    f.pl_norm = norm(L, b.per_layer_norm);
+  }
+  expect(f.plain() || (!b.lora[0].rank && !b.lora[1].rank && !b.lora[2].rank),
+         "adapters on an MLP block of another activation, a post-norm or an out scale");
   int in[3], out[3];
   mlp_dims(b, in, out);
   f.lora = block_lora(L, b.lora, 3, in, out, carve);
@@ -762,13 +848,54 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   f.norm_weights = b.norm_weights != 0;
   f.route_scale = b.route_scale;
   f.norm_eps = b.norm_eps;
-  f.situ_beta = b.situ_beta;
-  f.situ_linear_beta = b.situ_linear_beta;
+  expect(b.act == FLYX_MOE_SWIGLU || (b.act == FLYX_MOE_SITU && b.situ_beta > 0.f) ||
+             (b.act == FLYX_MOE_SWIGLU_OAI && b.act_limit > 0.f) || b.act == FLYX_MOE_GELU_TANH,
+         "an MoE block's activation out of range");
+  const bool oai = b.act == FLYX_MOE_SWIGLU_OAI;
+  f.act = MoeAct{b.act, oai ? b.act_alpha : b.situ_beta, oai ? b.act_limit : b.situ_linear_beta, nullptr};
   f.norm = norm(L, b.norm);
   f.router = L.lin_f32(b.router);
   if (b.router_bias >= 0) f.router_bias = L.vec(b.router_bias);
-  f.gate_up = L.expert_mat(b.gate_up);
+  if (b.router_logit_b >= 0) f.router_logit_b = L.vec(b.router_logit_b);
+  expect((b.gate_up >= 0) != (b.gate >= 0) && (b.gate >= 0) == (b.up >= 0),
+         "an MoE block names its gate and up fused or apart, one way");
+  const size_t E = size_t(b.n_experts), I = size_t(b.inter), H = size_t(b.hidden);
+  // Gate and up apart with per-expert scales of their own (GGML's NVFP4 experts): stacked under gate's, each expert's
+  // weight times up's over gate's, as SiLU(gate) up and GELU(gate) up are linear in up.
+  std::vector<float> up_over_gate;
+  if (b.gate_up < 0) {
+    const std::vector<float> sg = L.expert_scales(b.gate), su = L.expert_scales(b.up);
+    if (sg != su) {
+      expect((b.act == FLYX_MOE_SWIGLU || b.act == FLYX_MOE_GELU_TANH) && b.gate_b < 0 && b.up_b < 0,
+             "an MoE block's gate and up with scales apart, under an activation not linear in up");
+      up_over_gate.resize(E);
+      for (size_t e = 0; e < E; ++e) {
+        expect(sg[e] > 0.f && std::isfinite(su[e] / sg[e]), "an MoE block's gate scale is not positive");
+        up_over_gate[e] = su[e] / sg[e];
+      }
+    }
+  }
+  f.gate_up = b.gate_up >= 0 ? L.expert_mat(b.gate_up) : L.expert_mat(std::vector<int>{b.gate, b.up}, true);
   f.down = L.expert_mat(b.down);
+  if (b.gate_b >= 0 || b.up_b >= 0) {  // an expert's gate then up biases, as its fused rows
+    expect(b.gate_up < 0, "biases on an MoE block's fused gate|up");
+    std::vector<float> gu(E * 2 * I, 0.f);
+    for (auto [w, off] : {std::pair{b.gate_b, size_t(0)}, {b.up_b, I}}) {
+      if (w < 0) continue;
+      const std::vector<float> v = L.host_f32(w);
+      expect(v.size() == E * I, "an MoE block's gate or up biases are not [E, I]");
+      for (size_t e = 0; e < E; ++e) std::copy_n(v.data() + e * I, I, gu.data() + e * 2 * I + off);
+    }
+    float* bias = L.model()->alloc<float>(gu.size());
+    CK(cudaMemcpy(bias, gu.data(), gu.size() * sizeof(float), cudaMemcpyHostToDevice));
+    f.act.bias = bias;
+  }
+  if (b.down_b >= 0) {
+    expect(b.post_conv < 0, "down biases on an MoE block with a post-FFN ShortConv");
+    expect(L.t(b.down_b)->ndim == 2 && size_t(L.t(b.down_b)->shape[0]) == E && size_t(L.t(b.down_b)->shape[1]) == H,
+           "an MoE block's down biases are not [E, H]");
+    f.down_b = L.vec(b.down_b);
+  }
   if (b.post_conv >= 0) f.post_conv = L.vec(b.post_conv);
   if (b.res_query >= 0) f.res_query = L.vec(b.res_query);
   f.loop_rank = b.loop_rank;
@@ -777,6 +904,45 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   if (b.sconv >= 0) {
     f.sconv = state_of(sm.sconv, b.sconv, "ShortConv");
     f.sconv_offset = b.sconv_offset;
+  }
+  // Gemma 4's (ABI 58): its MLP beside the experts, the norms after both and after their sum, together
+  const bool gemma = b.has_shared || b.has_post_norm || b.has_out_norm;
+  expect(!gemma || (b.has_shared && b.has_post_norm && b.has_out_norm && b.post_conv < 0 && b.res_query < 0 &&
+                    b.loop_rank == 0 && b.down_b < 0),
+         "an MoE block with some of Gemma 4's MLP beside its experts and norms after them, not all");
+  if (gemma) {
+    f.shared = b.shared;
+    f.post_norm = norm(L, b.post_norm);
+    f.out_norm = norm(L, b.out_norm);
+    if (b.out_scale >= 0) f.out_scale = L.vec(b.out_scale);
+  }
+  if (b.has_router_norm) {  // its norm's weight, its scale and router_mul in one weight of the router's norm
+    expect(b.router_norm.w >= 0 || b.router_norm.offset == 0.0, "a weightless router norm with an offset");
+    std::vector<float> w(H, 1.f);
+    if (b.router_norm.w >= 0) {
+      const std::vector<float> v = L.host_f32(b.router_norm.w);
+      expect(v.size() == H, "an MoE block's router norm is not [H]");
+      for (size_t c = 0; c < H; ++c) w[c] = float(b.router_norm.offset) + v[c];
+    }
+    if (b.router_in >= 0) {
+      const std::vector<float> v = L.host_f32(b.router_in);
+      expect(v.size() == H, "an MoE block's router scale is not [H]");
+      for (size_t c = 0; c < H; ++c) w[c] *= v[c];
+    }
+    if (b.router_mul != 0.f)
+      for (float& x : w) x *= b.router_mul;
+    f.router_in = L.model()->alloc<float>(H);
+    CK(cudaMemcpy(f.router_in, w.data(), H * sizeof(float), cudaMemcpyHostToDevice));
+    f.router_eps = float(b.router_norm.eps);
+  }
+  if (b.has_expert_scale || !up_over_gate.empty()) {
+    std::vector<float> s(E, 1.f);
+    if (b.has_expert_scale) {
+      s = L.host_f32(b.expert_scale);
+      expect(s.size() == E, "an MoE block's expert scales are not [E]");
+    }
+    for (size_t e = 0; e < up_over_gate.size(); ++e) s[e] *= up_over_gate[e];
+    f.expert_scale = L.put(s);
   }
   return f;
 }
@@ -1108,6 +1274,13 @@ std::vector<const Lin*> drafter_lins(const flyx_bmodel* m, int block) {
     }
   } else if (const auto* e = std::get_if<Eagle4Block>(&m->blocks[size_t(block)])) {
     out = {&e->fc, &e->attn.w_in, &e->attn.w_out, &e->mlp.w_gu, &e->mlp.w_down};
+  } else if (const auto* g = std::get_if<Gemma4MtpBlock>(&m->blocks[size_t(block)])) {
+    out = {&g->pre_proj, &g->post_proj};
+    for (int j = 0; j < g->layers; ++j) {
+      const auto& a = std::get<AttnBlock>(m->blocks[size_t(g->first_layer + 2 * j)]);
+      const auto& f = std::get<MlpBlock>(m->blocks[size_t(g->first_layer + 2 * j + 1)]);
+      for (const Lin* x : {&a.w_in, &a.w_out, &f.w_gu, &f.w_down}) out.push_back(x);
+    }
   } else if (const auto* d = std::get_if<DSparkBlock>(&m->blocks[size_t(block)])) {
     for (int j = 0; j < d->layers(); ++j) {
       const auto& l = std::get<DSparkLayer>(m->blocks[size_t(d->first_layer + j)]);
@@ -1167,6 +1340,15 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       is_dspark[size_t(i)] = 1;
     } else if (b.kind == FLYX_BLOCK_EAGLE4) {
       is_dflash[size_t(i)] = 1;  // bound beside the block drafters, after the target
+    } else if (b.kind == FLYX_BLOCK_GEMMA4_MTP) {  // its layers beside MTP's; its head with the target's (Pass 1)
+      is_mtp[size_t(i)] = 1;
+      const auto& g = b.gemma4_mtp;
+      expect(g.layers >= 1 && g.first_layer >= 0 && g.first_layer + 2 * g.layers <= d.n_blocks,
+             "Gemma 4's assistant names layers past the blocks");
+      for (int j = 0; j < g.layers; ++j) {
+        is_mtp[size_t(ref(i, g.first_layer + 2 * j, FLYX_BLOCK_ATTN, "attention"))] = 1;
+        is_mtp[size_t(ref(i, g.first_layer + 2 * j + 1, FLYX_BLOCK_MLP, "MLP"))] = 1;
+      }
     }
   }
   std::vector<char> is_draft(size_t(d.n_blocks), 0);
@@ -1197,6 +1379,8 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         e.vocab = b.embed.vocab;
         e.has_norm = b.embed.has_norm != 0;
         if (e.has_norm) e.norm = norm(L, b.embed.norm);
+        if (b.embed.scale > 0.f) e.scale = b.embed.scale;
+        expect(e.scale == 1.f || !e.has_norm, "an embedding scaled and normed");
         // Every kernel that reads the table gathers the rows of a pass's tokens, a few kilobytes: a table no head
         // reads stays in host memory and frees its size on the GPU, unless the GPU has room (embed=auto, open_model).
         const bool host = m->opt.embed == 1 && !head_reads(d, b.embed.table);
@@ -1230,7 +1414,27 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       }
       case FLYX_BLOCK_ATTN: put_block(m, i, attention(L, b.attn, sm, carve)); break;
       case FLYX_BLOCK_GDN: put_block(m, i, gdn(L, b.gdn, sm, carve)); break;
-      case FLYX_BLOCK_MLP: put_block(m, i, mlp(L, b.mlp, carve)); break;
+      case FLYX_BLOCK_MLP: put_block(m, i, mlp(L, b.mlp, carve, DraftQuant::kNone, &d)); break;
+      case FLYX_BLOCK_PER_LAYER_INPUT: {  // Gemma 4's E2B / E4B
+        const auto& q = b.per_layer_input;
+        PerLayerInputBlock p;
+        p.layers = q.layers;
+        p.dim = q.dim;
+        p.table.hidden = q.layers * q.dim;
+        p.table.vocab = q.vocab;
+        // its rows gathered as an embedding's: in host memory under embed=host, as the embedding (no head reads it)
+        const bool host = m->opt.embed == 1;
+        if (L.packable(q.table)) p.table.blk = host ? L.pack_host(q.table) : L.pack(q.table);
+        else p.table.table = host ? L.mat_host(q.table) : L.mat(q.table);
+        p.w_proj = L.lin(q.proj);
+        p.norm = norm(L, q.norm);
+        p.table_scale = q.table_scale;
+        p.proj_scale = q.proj_scale;
+        p.mix = q.mix;
+        expect(q.dim > 0 && q.layers > 0 && q.hidden == d.hidden, "a per-layer input block's dimensions");
+        put_block(m, i, std::move(p));
+        break;
+      }
       case FLYX_BLOCK_REL_ATTN: put_block(m, i, rel_attn(L, b.rel_attn, sm)); break;
       case FLYX_BLOCK_MOE: put_block(m, i, moe(L, b.moe, sm)); break;
       case FLYX_BLOCK_DV: {
@@ -1330,6 +1534,57 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         put_block(m, i, eagle4(L, d, b.eagle4, sm, q.eagle4));
         break;
       }
+      case FLYX_BLOCK_GEMMA4_MTP: {
+        const auto& g = b.gemma4_mtp;
+        Gemma4MtpBlock t;
+        t.hidden = g.hidden;
+        t.target_hidden = g.target_hidden;
+        t.vocab = g.vocab;
+        t.embed = ref(i, g.embed, FLYX_BLOCK_EMBED, "embedding");
+        t.head = ref(i, g.head, FLYX_BLOCK_HEAD, "head");
+        t.target_head = ref(i, g.target_head, FLYX_BLOCK_HEAD, "head");
+        t.first_layer = g.first_layer;
+        t.layers = g.layers;
+        if (g.centroids >= 0) {  // its clustered head (E2B / E4B)
+          const int V = g.vocab;
+          expect(g.n_centroids > 0 && V % g.n_centroids == 0 && g.top_k > 0 && g.top_k <= std::min(g.n_centroids, kWalkMax) &&
+                     g.n_centroids + 2 * (g.top_k * (V / g.n_centroids) + g.top_k) + ops::kMtpCands <=
+                         std::max(V, kDraftPickFloats),
+                 "Gemma 4's assistant: clusters that do not split its vocabulary, or more than its pick's room");
+          t.centroids = L.lin(g.centroids);
+          t.n_centroids = g.n_centroids;
+          t.top_k = g.top_k;
+          const flyx_tensor_view* o = L.t(g.token_order);
+          expect(o && (o->dtype == FLYX_DT_I32 || o->dtype == FLYX_DT_I64) && WeightLoader::numel(o) == size_t(V),
+                 "Gemma 4's assistant: its token order is not one int32 or int64 a token");
+          std::vector<int> order(static_cast<size_t>(V));
+          for (size_t j = 0; j < order.size(); ++j) {
+            int64_t v = 0;
+            if (o->dtype == FLYX_DT_I32) v = static_cast<const int32_t*>(o->data)[j];
+            else std::memcpy(&v, static_cast<const uint8_t*>(o->data) + 8 * j, 8);
+            expect(v >= 0 && v < V, "Gemma 4's assistant: its token order names a token outside its vocabulary");
+            order[j] = int(v);
+          }
+          t.token_order = m->alloc<int>(order.size());
+          CK(cudaMemcpy(t.token_order, order.data(), order.size() * sizeof(int), cudaMemcpyHostToDevice));
+        }
+        expect(g.target_hidden == d.hidden && d.blocks[t.head].head.hidden == g.hidden &&
+                   d.blocks[t.head].head.vocab == g.vocab,
+               "Gemma 4's assistant: its widths are not its head's and its target's");
+        for (int j = 0; j < g.layers; ++j) {
+          const flyx_attn_block& a = d.blocks[g.first_layer + 2 * j].attn;
+          expect(a.kv_shared && a.hidden == g.hidden && d.blocks[g.first_layer + 2 * j + 1].mlp.hidden == g.hidden,
+                 "Gemma 4's assistant: a layer of another width, or one with K/V of its own");
+        }
+        t.pre_proj = L.lin_quant(g.pre_proj, q.mtp);
+        t.post_proj = L.lin_quant(g.post_proj, q.mtp);
+        expect(g.ring >= 0 && g.ring < d.n_states && sm.ring[size_t(g.ring)], "Gemma 4's assistant names no ring");
+        expect(m->mtp_block < 0 && m->eagle4_block < 0 && m->gemma4_mtp_block < 0,
+               "Gemma 4's assistant beside another drafter of its kind (MTP's, EAGLE-4's)");
+        m->gemma4_mtp_block = i;
+        put_block(m, i, std::move(t));
+        break;
+      }
       default: throw std::runtime_error("unexpected draft block kind " + std::to_string(b.kind));
     }
   }
@@ -1342,12 +1597,15 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
   const std::string dflash_held = held_precision(drafter_lins(m, m->dflash_block));
   const std::string dspark_held = held_precision(drafter_lins(m, m->dspark_block));
   const std::string eagle4_held = held_precision(drafter_lins(m, m->eagle4_block));
-  if (m->eagle4_block >= 0) m->active_draft_weights = eagle4_held;
+  const std::string gemma4_held = held_precision(drafter_lins(m, m->gemma4_mtp_block));
+  if (m->gemma4_mtp_block >= 0) m->active_draft_weights = gemma4_held;
+  else if (m->eagle4_block >= 0) m->active_draft_weights = eagle4_held;
   else if (m->dflash_block >= 0) m->active_draft_weights = dflash_held;
   else if (m->dspark_block >= 0) m->active_draft_weights = dspark_held;
   else if (m->mtp_block >= 0) m->active_draft_weights = mtp_held;
   else if (m->dv_block >= 0) m->active_draft_weights = "exact";
-  if (m->verbose && (m->mtp_block >= 0 || m->dflash_block >= 0 || m->dspark_block >= 0 || m->eagle4_block >= 0)) {
+  if (m->verbose && (m->mtp_block >= 0 || m->dflash_block >= 0 || m->dspark_block >= 0 || m->eagle4_block >= 0 ||
+                     m->gemma4_mtp_block >= 0)) {
     std::string what;
     auto say = [&](const char* name, const std::string& held) {
       what += (what.empty() ? "" : ", ") + std::string(name) + "=" + held;
@@ -1356,6 +1614,7 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
     if (m->dflash_block >= 0) say(block<DFlashBlock>(m, m->dflash_block).name(), dflash_held);
     if (m->dspark_block >= 0) say("dspark", dspark_held);
     if (m->eagle4_block >= 0) say("eagle4", eagle4_held);
+    if (m->gemma4_mtp_block >= 0) say("gemma4 assistant", gemma4_held);
     std::fprintf(stderr, "flyx-cuda: drafter weights %s (%.2f GB on GPU)\n", what.c_str(),
                  double(m->bytes - pre_draft_bytes) / 1e9);
   }
@@ -1561,8 +1820,7 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
         for (int w : {b.mlp.gate, b.mlp.up, b.mlp.down}) mark_linear(w, q.mtp);
       }
     } else if (b.kind == FLYX_BLOCK_MOE) {
-      mark(is_expert, b.moe.gate_up);
-      mark(is_expert, b.moe.down);
+      for (int w : {b.moe.gate_up, b.moe.gate, b.moe.up, b.moe.down}) mark(is_expert, w);
     } else if (b.kind == FLYX_BLOCK_DSPARK) {
       // Its block's norms, vectors, Markov head and joint projection stay as stored (dspark(): not quantized).
       mark_norm(is_drafter, b.dspark.tok_norm), mark_norm(is_drafter, b.dspark.norm),

@@ -182,15 +182,64 @@ def canonical_dense_config(tc: dict) -> dict:
     }
 
 
+def canonical_gemma4_config(tc: dict) -> dict:
+    """Gemma 4's dense layers (models/gemma4): sliding and global layers, each kind its head width, K/V heads,
+    rotary and theta; v from k's projection on the global ones (attention_k_eq_v); GELU (tanh) MLPs; the final logits
+    softcapped; experts beside every layer's MLP (26B-A4B: enable_moe_block); E2B's and E4B's input of its own for
+    every layer (hidden_size_per_layer_input) and last layers reading the K/V of the last of their kind before them
+    (num_kv_shared_layers), their MLPs twice as wide (use_double_wide_mlp)."""
+    if tc.get("attention_bias"):
+        raise ValueError("Gemma 4 with attention biases is not supported yet")
+    if tc.get("hidden_activation", "gelu_pytorch_tanh") != "gelu_pytorch_tanh":
+        raise ValueError(f"activation {tc.get('hidden_activation')!r} is not supported (gelu_pytorch_tanh)")
+    rp = tc.get("rope_parameters") or {}
+    full, swa = rp.get("full_attention") or {}, rp.get("sliding_attention") or {}
+    if full.get("rope_type", "proportional") != "proportional" or swa.get("rope_type", "default") != "default" or \
+            swa.get("partial_rotary_factor", 1.0) != 1.0 or full.get("factor", 1.0) != 1.0:
+        raise ValueError(f"unsupported Gemma 4 rotary: {rp}")
+    lt = tc["layer_types"]
+    if len(lt) != tc["num_hidden_layers"] or any(t not in ("sliding_attention", "full_attention") for t in lt):
+        raise ValueError("Gemma 4 layer_types: sliding_attention or full_attention, one a layer")
+    k_eq_v = bool(tc.get("attention_k_eq_v", False))
+    # The global layers' heads: global_head_dim and num_global_key_value_heads (as Google's configs give them), or a
+    # global layer's own entries in per_layer_config (as transformers writes them since)
+    plc = tc.get("per_layer_config") or {}
+    full_own = next((plc.get(str(i)) or {} for i, t in enumerate(lt) if t == "full_attention"), {})
+    hd = tc["head_dim"]
+    hd_full = full_own.get("head_dim") or tc.get("global_head_dim") or hd
+    n_kv_full = full_own.get("num_key_value_heads") or (tc.get("num_global_key_value_heads") if k_eq_v else None)
+    return {
+        "hidden": tc["hidden_size"], "layers": tc["num_hidden_layers"], "vocab": tc["vocab_size"],
+        "inter": tc["intermediate_size"], "n_heads": tc["num_attention_heads"],
+        "n_kv": tc["num_key_value_heads"], "head_dim": hd,
+        "n_kv_full": n_kv_full or tc["num_key_value_heads"], "head_dim_full": hd_full,
+        "layer_types": ["sliding" if t == "sliding_attention" else "full" for t in lt],
+        "window": tc["sliding_window"],
+        "rope_theta": float(full.get("rope_theta", 1000000.0)), "rope_theta_swa": float(swa.get("rope_theta", 10000.0)),
+        "rot_dim_full": 2 * int(full.get("partial_rotary_factor", 0.25) * hd_full // 2),
+        "k_eq_v": k_eq_v, "eps": tc["rms_norm_eps"], "softcap": float(tc.get("final_logit_softcapping") or 0.0),
+        "tie_embed": bool(tc.get("tie_word_embeddings", True)), "max_pos": tc.get("max_position_embeddings", 131072),
+        **({"experts": tc["num_experts"], "top_k": tc["top_k_experts"], "moe_inter": tc["moe_intermediate_size"]}
+           if tc.get("enable_moe_block") else {}),
+        **({"per_layer_dim": tc["hidden_size_per_layer_input"],
+            "per_layer_vocab": tc.get("vocab_size_per_layer_input") or tc["vocab_size"]}
+           if tc.get("hidden_size_per_layer_input") else {}),
+        **({"kv_shared_layers": tc["num_kv_shared_layers"], "double_wide_mlp": bool(tc.get("use_double_wide_mlp"))}
+           if tc.get("num_kv_shared_layers") else {}),
+    }
+
+
 def arch_of(hf_cfg: dict) -> str:
     t = _text_config(hf_cfg).get("model_type") or hf_cfg.get("model_type", "")
+    if t in ("gemma4_text", "gemma4", "gemma4_unified_text", "gemma4_unified"):
+        return "gemma4"
     if t == "qwen3":
         return "qwen3"
     if t in ("llama", "minicpm5"):  # MiniCPM5 publishes LlamaForCausalLM checkpoints
         return "llama"
     if t.startswith("qwen3_5") or t.startswith("qwen3_next"):
         return "qwen35"
-    raise ValueError(f"model type {t!r} is not supported (qwen3_5, qwen3, llama)")
+    raise ValueError(f"model type {t!r} is not supported (qwen3_5, qwen3, llama, gemma4)")
 
 
 # The head's candidates DSpark's Markov walk takes a step (its greedy walk is over the whole vocabulary): a wide pick
@@ -361,6 +410,41 @@ _T_RULES = [
     (r"layers\.(\d+)\.mlp\.up_proj\.weight", "L{0}.mlp.up"),
     (r"layers\.(\d+)\.mlp\.down_proj\.weight", "L{0}.mlp.down"),
 ]
+# Gemma 4's layer: a norm on either side of attention and of the MLP (its post_attention_layernorm is attention's
+# own, after it; pre_feedforward_layernorm the MLP's input norm, Qwen's post_attention_layernorm), the layer's scalar.
+_G4_RULES = [
+    (r"embed_tokens\.weight", "embed"),
+    (r"norm\.weight", "norm"),
+    (r"layers\.(\d+)\.input_layernorm\.weight", "L{0}.in_norm"),
+    (r"layers\.(\d+)\.post_attention_layernorm\.weight", "L{0}.attn.post_norm"),
+    (r"layers\.(\d+)\.pre_feedforward_layernorm\.weight", "L{0}.post_norm"),
+    (r"layers\.(\d+)\.post_feedforward_layernorm\.weight", "L{0}.mlp.post_norm"),
+    (r"layers\.(\d+)\.layer_scalar", "L{0}.layer_scalar"),
+    (r"layers\.(\d+)\.self_attn\.(q|k|v|o)_proj\.weight", "L{0}.attn.{1}"),
+    (r"layers\.(\d+)\.self_attn\.(q|k)_norm\.weight", "L{0}.attn.{1}_norm"),
+    (r"layers\.(\d+)\.mlp\.(gate|up|down)_proj\.weight", "L{0}.mlp.{1}"),
+    # a layer's experts beside its MLP (26B-A4B)
+    (r"layers\.(\d+)\.post_feedforward_layernorm_1\.weight", "L{0}.mlp.post_norm_1"),
+    (r"layers\.(\d+)\.pre_feedforward_layernorm_2\.weight", "L{0}.moe.norm"),
+    (r"layers\.(\d+)\.post_feedforward_layernorm_2\.weight", "L{0}.moe.post_norm"),
+    (r"layers\.(\d+)\.router\.proj\.weight", "L{0}.moe.router"),
+    (r"layers\.(\d+)\.router\.scale", "L{0}.moe.router_in"),
+    (r"layers\.(\d+)\.router\.per_expert_scale", "L{0}.moe.expert_scale"),
+    (r"layers\.(\d+)\.experts\.gate_up_proj", "L{0}.moe.gate_up"),
+    (r"layers\.(\d+)\.experts\.down_proj", "L{0}.moe.down"),
+    # every layer's input of its own (E2B, E4B)
+    (r"embed_tokens_per_layer\.weight", "per_layer.table"),
+    (r"per_layer_model_projection\.weight", "per_layer.proj"),
+    (r"per_layer_projection_norm\.weight", "per_layer.norm"),
+    (r"layers\.(\d+)\.per_layer_input_gate\.weight", "L{0}.per_layer.gate"),
+    (r"layers\.(\d+)\.per_layer_projection\.weight", "L{0}.per_layer.proj"),
+    (r"layers\.(\d+)\.post_per_layer_input_norm\.weight", "L{0}.per_layer.post_norm"),
+]
+_G4_PER_LAYER_KEYS = ("per_layer.gate", "per_layer.proj", "per_layer.post_norm")
+_G4_MOE_KEYS = ("mlp.post_norm_1", "moe.norm", "moe.post_norm", "moe.router", "moe.router_in", "moe.expert_scale",
+                "moe.gate_up", "moe.down")
+_G4_LAYER_KEYS = ("in_norm", "attn.post_norm", "post_norm", "mlp.post_norm", "layer_scalar", "attn.q", "attn.k",
+                  "attn.o", "attn.q_norm", "attn.k_norm", "mlp.gate", "mlp.up", "mlp.down")
 _D_RULES = DRAFT_LAYER_RULES + [
     (r"layers\.(\d+)\.attention_conv\.base_kernel", "L{0}.attn_conv.base"),
     (r"layers\.(\d+)\.attention_conv\.kernel_projection\.weight", "L{0}.attn_conv.proj"),
@@ -379,7 +463,8 @@ _MTP_RULES = [
     (r"norm\.weight", "norm"),
 ] + [(pat, out) for pat, out in _T_RULES if pat.startswith("layers")]
 # Present in some checkpoints, intentionally not used by the engine.
-_T_SKIP = re.compile(r"^(model\.visual\.|visual\.)")
+_T_SKIP = re.compile(r"^(model\.visual\.|visual\.|model\.vision_tower\.|model\.audio_tower\.|model\.embed_vision\."
+                     r"|model\.embed_audio\.)")
 _MTP_PREFIX = re.compile(r"^(model\.)?mtp\.")
 
 
@@ -470,7 +555,10 @@ def convert(model_dir: str, out: str, draft_dir: str | None = None, log=print, a
     hf_cfg = _read_config(os.path.join(model_dir, "config.json"))
     tc = _text_config(hf_cfg)
     arch = arch_of(hf_cfg)
-    cfg = canonical_target_config(tc) if arch == "qwen35" else canonical_dense_config(tc)
+    cfg = canonical_target_config(tc) if arch == "qwen35" else canonical_gemma4_config(tc) if arch == "gemma4" \
+        else canonical_dense_config(tc)
+    if arch == "gemma4" and (draft_dir or dv_dir or lora_dir):
+        raise ValueError("a drafter or an adapter beside a Gemma 4 model is not supported yet")
     if arch == "llama" and draft_dir:
         raise ValueError("a block drafter goes in a Qwen3.5 or Qwen3 model's file (beside a Llama: --draft alone)")
     if arch != "llama" and dv_dir:
@@ -515,12 +603,15 @@ def convert(model_dir: str, out: str, draft_dir: str | None = None, log=print, a
                 canon = "lm_head"
             else:
                 inner = _strip_target_prefix(mapped)
-                canon = map_name(inner, _T_RULES) if inner is not None else None
+                canon = map_name(inner, _G4_RULES if arch == "gemma4" else _T_RULES) if inner is not None else None
             if canon is None:
                 raise ValueError(f"unknown target tensor {name!r}")
             _add_linear(w, st, name, "target." + canon, cfg, reorder_q=arch == "qwen35")
             seen.add(canon)
-    _check_target(cfg, seen, qk_norm=arch != "llama")
+    if arch == "gemma4":
+        _check_gemma4(cfg, seen)
+    else:
+        _check_target(cfg, seen, qk_norm=arch != "llama")
     mtp = None
     if mtp_seen:
         n_mtp = int(tc.get("mtp_num_hidden_layers", 1))
@@ -702,6 +793,27 @@ def _check_target(cfg, seen, qk_norm=True):
     unread = sorted(n for n in seen - need if n.endswith(("q_norm", "k_norm")))
     if unread:
         raise ValueError(f"q/k norms in a model without them: {unread[:4]}")
+
+
+def _check_gemma4(cfg, seen):
+    """Every tensor Gemma 4's layers read; a global layer's v projection there unless v is k's (k_eq_v); no k or v
+    in a layer reading another's K/V; every layer's input of its own where the config gives one (E2B, E4B)."""
+    need = {"embed", "norm"}
+    if cfg.get("per_layer_dim"):
+        need |= {"per_layer.table", "per_layer.proj", "per_layer.norm"}
+    first_shared = len(cfg["layer_types"]) - cfg.get("kv_shared_layers", 0)
+    for i, t in enumerate(cfg["layer_types"]):
+        need |= {f"L{i}.{n}" for n in _G4_LAYER_KEYS if i < first_shared or n not in ("attn.k", "attn.k_norm")}
+        if cfg.get("experts"):
+            need |= {f"L{i}.{n}" for n in _G4_MOE_KEYS}
+        if cfg.get("per_layer_dim"):
+            need |= {f"L{i}.{n}" for n in _G4_PER_LAYER_KEYS}
+        if i < first_shared and (t == "sliding" or not cfg["k_eq_v"]):
+            need.add(f"L{i}.attn.v")
+    check_tensors("target", need, seen)
+    extra = sorted(seen - need)
+    if extra:
+        raise ValueError(f"Gemma 4 tensors the engine would not read: {extra[:4]}")
 
 
 def _check_mtp(layers, seen):

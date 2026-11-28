@@ -40,10 +40,17 @@ inline void linear_a16h(const double* x, int rows, int K, const flyx_tensor_view
 }
 
 // linear() of inputs rounded as NVFP4 (round_nvfp4): NVFP4 weights whose GEMM takes more than FLYX_MAX_ROWS rows
-// at once (FLYX_ACT_NVFP4).  K % 16 == 0.
+// at once (FLYX_ACT_NVFP4_BF16).  K % 16 == 0.
 inline void linear_a4(const double* x, int rows, int K, const flyx_tensor_view* W, int N, double* y) {
   std::vector<double> xr(x, x + size_t(rows) * K);
   for (int r = 0; r < rows; ++r) round_nvfp4(&xr[size_t(r) * K], K);
+  linear(xr.data(), rows, K, W, N, y);
+}
+
+// linear() of inputs rounded to MXFP8 (round_mxfp8): MXFP4 weights asked for it (FLYX_ACT_MXFP8).  K % 32 == 0.
+inline void linear_amxfp8(const double* x, int rows, int K, const flyx_tensor_view* W, int N, double* y) {
+  std::vector<double> xr(x, x + size_t(rows) * K);
+  for (int r = 0; r < rows; ++r) round_mxfp8(&xr[size_t(r) * K], K);
   linear(xr.data(), rows, K, W, N, y);
 }
 

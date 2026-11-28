@@ -242,6 +242,7 @@ struct RowBufs {
         *ckv = nullptr, *mcat = nullptr, *mx = nullptr, *mhn = nullptr;
   float* lora = nullptr;  // the target's adapters' first products (RowNeeds::lora a row; none without adapters)
   float* lora_part = nullptr;  // their slices' sums (lora_down_rows; RowNeeds::lora_part a row, kLoraEarlyRows rows)
+  float* pli = nullptr;  // the pass's per-layer inputs (RowNeeds::per_layer a row; Gemma 4's E2B / E4B)
   // Inkling-2 pass-local scratch (null for models without RelAttnBlock / MoeBlock).
   float *res_bank = nullptr, *prelude_cur = nullptr, *prelude_blocks = nullptr;
   float *loop_bank = nullptr, *loop_bank_out = nullptr, *loop_msg = nullptr;
@@ -271,6 +272,7 @@ struct RowNeeds {
   int lora = 0;                             // the target's adapters' first products: q|k|v's (3 rank), gate|up's
   int lora_part = 0;                        // their slices' sums a row, the most of any linear (lora_down_rows)
   int feats = 0, cx = 0, ckv = 0;           // DFlash2/DSpark context: tapped features, fc output, K/V projections
+  int per_layer = 0;                        // per-layer inputs: layers x dim floats (Gemma 4's E2B / E4B)
   bool mtp = false;                         // MTP context rows (2 x hidden, hidden, hidden)
   bool glu = false;                         // non-packed MLP weights (prefill gemm_glu_staged)
   int k_max = 0;                            // largest GEMM K: the scratch staging GEMM inputs is sized by it
@@ -510,6 +512,7 @@ struct flyx_bmodel {
   int mtp_block = -1, dflash_block = -1;  // the drafters (at most one of each), -1: none
   int dv_block = -1, dspark_block = -1;   // DV and DSpark drafters, -1: none
   int eagle4_block = -1;                  // the EAGLE-4 drafter (it drafts a step a draft, as MTP), -1: none
+  int gemma4_mtp_block = -1;              // Gemma 4's assistant (a step a draft, as MTP), -1: none
   int head_block = -1;                    // the head they read
   std::unordered_map<int, float*> vec_weights;  // 1D device vectors referenced by FLYX_NODE_RES_MIX (weight index -> GPU)
   flyx::cuda::RowNeeds need;
@@ -517,6 +520,7 @@ struct flyx_bmodel {
   int prefill_rows = 0;  // rows of the widest prefill plan lowered: the shared prefill buffers hold them
   int prefill_align = 1;  // gdn_chunk_align() when every GDN block takes the chunked prefill recurrence
   int res16 = -1;         // residual16(): whether the model's prefill passes may keep the residual in bf16 (-1: unknown)
+  int batch_alone = -1;   // batch_alone(): whether its rounds of several sequences run one at a time (-1: unknown)
   // The most rows a round may have: FLYX_MAX_WIDE_ROWS where lookup rounds may be wide (open_model), else
   // FLYX_MAX_ROWS.  Each sequence's round buffers hold this many rows.
   int wide_rows = FLYX_MAX_ROWS;

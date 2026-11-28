@@ -568,13 +568,14 @@ void test_blocks_round_glu() {
     const std::string tag = std::string(bg.name) + (n == 1 ? " gate|up: " : std::string(" gate, ") + bu.name + " up: ");
     bool same = true;
     int ran = 0, engine = 0;
+    for (int act : {0, 1})  // SiLU, GELU's tanh form (Gemma's)
     for (int rows : {1, 2, 3, 4}) {
       start(rows);
       gemm_blocks_staged_runs(W, n, K, dy, ld, rows, false, TL);
-      swiglu_split(dy, ld, I, rows, TL, true);
+      swiglu_split(dy, ld, I, rows, TL, true, nullptr, {}, act);
       CK(cudaGetLastError());
       const Bytes want = read(sc.q8, sc.q8_scale, sc.q8_sums, rows);
-      const RoundGlu glu{dy, ld, I};
+      const RoundGlu glu{dy, ld, I, act};
       Launch L = TL;
       L.glu = &glu;
       for (int c = 0; c < kBlocksRoundConfigCount; ++c) {
@@ -590,7 +591,7 @@ void test_blocks_round_glu() {
         CK(cudaGetLastError());
         ++ran;
         const bool ok = read(sc.q8_glu, sc.q8_glu_scale, sc.q8_glu_sums, rows) == want;
-        if (!ok && same) std::printf("  (first difference: %d rows, configuration %d)\n", rows, c);
+        if (!ok && same) std::printf("  (first difference: %d rows, configuration %d, act %d)\n", rows, c, act);
         same = same && ok;
       }
       if (gemm_blocks_round_glu_takes(W, n, rows, I, TL)) {
@@ -599,12 +600,13 @@ void test_blocks_round_glu() {
         CK(cudaGetLastError());
         ++engine;
         const bool ok = read(sc.q8_glu, sc.q8_glu_scale, sc.q8_glu_sums, rows) == want;
-        if (!ok && same) std::printf("  (first difference: %d rows, as the engine runs it)\n", rows);
+        if (!ok && same) std::printf("  (first difference: %d rows, as the engine runs it, act %d)\n", rows, act);
         same = same && ok;
       }
     }
     same = same && ran > 0;
-    std::printf("  %-4s %sswiglu_split's 8-bit rows and the gate|up rows (%d launches, %d as the engine)\n",
+    std::printf("  %-4s %sswiglu_split's 8-bit rows and the gate|up rows, SiLU and GELU (%d launches, %d as the "
+                "engine)\n",
                 same ? "ok" : "FAIL", tag.c_str(), ran, engine);
     g_fail += !same;
     for (int r = 0; r < n; ++r) {

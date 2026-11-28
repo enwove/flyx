@@ -13,6 +13,8 @@
 #include "core/interfaces/chat.h"
 #include "core/modelfile/modelfile.h"
 #include "models/formats/family.h"
+#include "models/formats/gemma4.h"
+#include "models/formats/harmony.h"
 #include "models/formats/inkling2.h"
 #include "models/formats/qwen35.h"
 #include "models/formats/tags.h"
@@ -53,6 +55,16 @@ class Chat : public interfaces::Chat {
       inkling2_tools_ = has(source_, "<|content_invoke_tool_json|>");
       return;
     }
+    if (is_harmony_template(source_)) {  // gpt-oss: tools are messages to functions.NAME
+      format_ = "harmony";
+      harmony_ = true;
+      return;
+    }
+    if (is_gemma4_template(source_)) {  // Gemma 4: <|channel>thought..<channel|>, <|tool_call>call:NAME{..}<tool_call|>
+      format_ = "gemma4";
+      gemma4_ = true;
+      return;
+    }
     // Tool calls written as XML: Qwen3.5, Qwen3-Coder (llama.cpp's test, chat.cpp "Qwen3-Coder").
     if (has(source_, "<tool_call>") && has(source_, "<function=") && has(source_, "<parameter=")) {
       format_ = "qwen3_coder";
@@ -69,16 +81,21 @@ class Chat : public interfaces::Chat {
   const std::string& template_source() const override { return source_; }
   const ojson& template_tokens() const override { return tokens_; }
   const char* format() const override { return format_; }
-  bool reads_tool_calls() const override { return inkling2_ ? inkling2_tools_ : (syntax_.calls != nullptr); }
+  bool reads_tool_calls() const override {
+    return harmony_ || gemma4_ || (inkling2_ ? inkling2_tools_ : (syntax_.calls != nullptr));
+  }
 
   bool opens_reasoning(std::string_view gen) const override {
-    if (inkling2_ || !syntax_.thinking) return false;
+    if (gemma4_) return gemma4_opens_reasoning(gen);
+    if (inkling2_ || harmony_ || !syntax_.thinking) return false;  // harmony: its reply's header opens a channel
     size_t open = gen.rfind("<think>");
     return open != std::string_view::npos && gen.find("</think>", open) == std::string_view::npos;
   }
 
   std::unique_ptr<interfaces::OutputParser> parser(bool in_reasoning, const std::vector<ojson>* tools) const override {
     if (inkling2_) return make_inkling2_parser(inkling2_tools_ ? tools : nullptr);
+    if (harmony_) return make_harmony_parser(tools);
+    if (gemma4_) return make_gemma4_parser(in_reasoning, tools);
     TagSyntax s = syntax_;
     if (!tools || tools->empty()) s.calls = nullptr;
     if (!s.thinking && !s.calls) return std::make_unique<PlainParser>();
@@ -88,11 +105,13 @@ class Chat : public interfaces::Chat {
   std::string reply_grammar(const std::vector<ojson>& tools, const interfaces::ReplyRules& rules,
                             bool in_reasoning) const override {
     if (inkling2_) return inkling2_reply_grammar(inkling2_tools_ ? tools : std::vector<ojson>{}, rules);
+    if (harmony_) return {};  // no reply grammar for harmony's channels yet: replies unconstrained
+    if (gemma4_) return formats::reply_grammar(kGemma4Syntax, tools, rules, in_reasoning);
     return formats::reply_grammar(syntax_, tools, rules, in_reasoning);
   }
 
   std::vector<std::string> reply_tokens() const override {
-    return inkling2_ ? inkling2_reply_tokens() : std::vector<std::string>();
+    return inkling2_ ? inkling2_reply_tokens() : harmony_ ? harmony_reply_tokens() : std::vector<std::string>();
   }
 
   bool thinking_markers(std::string* open, std::string* close) const override {
@@ -122,6 +141,8 @@ class Chat : public interfaces::Chat {
   const char* format_ = "plain";
   bool inkling2_ = false;
   bool inkling2_tools_ = false;
+  bool harmony_ = false;
+  bool gemma4_ = false;  // its marks are text tokens (llama.cpp's USER_DEFINED): no reply_tokens
   TagSyntax syntax_;
 };
 

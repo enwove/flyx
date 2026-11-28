@@ -19,6 +19,10 @@ struct TagSyntax {
   bool thinking = true;        // <think> blocks exist
   CallReader calls = nullptr;  // null: no tool calls, <tool_call> is text
   const CallSyntax* written = nullptr;  // how calls are written (grammars); with `calls`
+  // A thinking block's marks in a reply grammar, and what follows its end (Gemma 4: <|channel>, <channel|>, nothing)
+  const char* think_open = "<think>";
+  const char* think_close = "</think>";
+  const char* think_after = "\n\n";
 };
 
 // The structural tag (XGrammar JSON) a reply in this syntax must match; see
