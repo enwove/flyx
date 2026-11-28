@@ -13,11 +13,15 @@
 <link rel="icon" href="/dashboard/brand/favicon.svg" type="image/svg+xml">
 <link rel="apple-touch-icon" href="/dashboard/brand/apple-touch-icon.png">
 <script>
-// The sidebar's width before the first paint: ?side= in the address, else as chosen last.
+// Before the first paint: the sidebar's width (?side= in the address, else as chosen last) and the theme (as chosen
+// last, else the system's; lib/theme.js keeps it after), so a dark page never shows white first.
 (function () {
-  let s = new URLSearchParams(location.search).get("side");
-  try { if (s === null) s = localStorage.getItem("flyx.side"); } catch (e) {}
-  if (s === "collapsed") document.documentElement.dataset.side = "collapsed";
+  const root = document.documentElement;
+  let s = new URLSearchParams(location.search).get("side"), theme = null;
+  try { if (s === null) s = localStorage.getItem("flyx.side"); theme = localStorage.getItem("flyx.theme"); } catch (e) {}
+  if (s === "collapsed") root.dataset.side = "collapsed";
+  if (theme !== "light" && theme !== "dark") theme = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  root.dataset.theme = theme;
 })();
 </script>
 <!-- hooks.module.js imports "preact" by name: the map says where it is, so the libraries stay as their authors built them. -->
@@ -59,6 +63,8 @@
   <symbol id="i-arrowup" viewBox="0 0 16 16"><path d="M8 13V3.5M3.75 7.5 8 3.25l4.25 4.25"/></symbol>
   <symbol id="i-stopsq" viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" rx="2" fill="currentColor" stroke="none"/></symbol>
   <symbol id="i-globe" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c1.75 1.6 2.6 3.6 2.6 6S9.75 12.4 8 14M8 2C6.25 3.6 5.4 5.6 5.4 8s.85 4.4 2.6 6"/></symbol>
+  <symbol id="i-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2.9"/><path d="M8 1.9v1.5M8 12.6v1.5M1.9 8h1.5M12.6 8h1.5M3.69 3.69l1.06 1.06M11.25 11.25l1.06 1.06M3.69 12.31l1.06-1.06M11.25 4.75l1.06-1.06"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 16 16"><path d="M7.6 2.26A5.75 5.75 0 1 0 13.74 8.4 4.6 4.6 0 0 1 7.6 2.26z"/></symbol>
   <symbol id="i-check" viewBox="0 0 16 16"><path d="M3.5 8.5 6.5 11.5 12.5 4.5"/></symbol>
   <symbol id="i-chev" viewBox="0 0 16 16"><path d="M6 3.5 10.5 8 6 12.5"/></symbol>
   <symbol id="i-machine" viewBox="0 0 16 16"><rect x="2.25" y="2.75" width="11.5" height="8" rx="1.25"/><path d="M5.5 13.25h5M8 10.75v2.5"/></symbol>

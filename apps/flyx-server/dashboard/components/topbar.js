@@ -1,7 +1,8 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// The top bar: the logo and the page; the model being served with its quick actions; the language.
+// The top bar: the logo and the page; the model being served with its quick actions; the theme and the language.
 import { html, useState, useEffect } from "../lib/html.js";
 import { t, LANGS, currentLang, setLang } from "../lib/i18n.js";
+import { THEMES, themeChoice, setTheme, shownTheme } from "../lib/theme.js";
 import { fmt, shortDevice } from "../lib/format.js";
 import { Icon } from "../lib/ui.js";
 import { live, phaseOf, phaseNames, phaseTone } from "../lib/telemetry.js";
@@ -87,14 +88,33 @@ function LangMenu() {
     </div>`;
 }
 
+const THEME_NAMES = { system: "Match system", light: "Light", dark: "Dark" };
+
+// The theme as chosen in this browser; the button shows the one on the page.
+function ThemeMenu() {
+  const [open, setOpen] = useMenu("themewrap");
+  const choice = themeChoice();
+  return html`
+    <div class="themewrap">
+      <button class="iconbtn" id="theme" title=${t("Theme")} aria-label=${t("Theme")} aria-haspopup="menu"
+              aria-expanded=${String(open)} onClick=${() => setOpen(!open)}><${Icon} name=${shownTheme() === "dark" ? "moon" : "sun"}/></button>
+      <div class="menu" id="theme-menu" role="menu" hidden=${!open}>
+        ${THEMES.map((id) => html`
+          <button role="menuitemradio" data-choice=${id} aria-checked=${String(choice === id)}
+                  onClick=${() => { setOpen(false); setTheme(id); }}><${Icon} name="check"/>${t(THEME_NAMES[id])}</button>`)}
+      </div>
+    </div>`;
+}
+
 export function TopBar({ title, go }) {
   return html`
     <header class="topbar">
       <a class="word" href="#overview" aria-label="FLYX" onClick=${(e) => { e.preventDefault(); go("overview"); }}>
-        <img src="/dashboard/brand/flyx-lockup.svg" alt="" width="102" height="24"/></a>
+        <img src=${"/dashboard/brand/flyx-lockup" + (shownTheme() === "dark" ? "-dark" : "") + ".svg"} alt="" width="102" height="24"/></a>
       <span class="sep">/</span><h1 class="crumb" id="page-title">${t(title)}</h1>
       <div class="right">
         <${ModelMenu} go=${go}/>
+        <${ThemeMenu}/>
         <${LangMenu}/>
       </div>
     </header>`;
