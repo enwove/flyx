@@ -108,6 +108,7 @@ struct TelemetrySnapshot {
             tool_calls = 0, grammar_fixes = 0;
   } totals;
   double started_at = 0;          // unix seconds the server started
+  double loaded_at = 0;           // unix seconds the served model finished loading (0: none served)
 };
 
 // The names of FLYX_CLOCK_* bits ("power cap, thermal"); "" when none is set.

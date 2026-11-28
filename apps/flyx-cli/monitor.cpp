@@ -385,7 +385,14 @@ struct TermStyle {
     if (rates.contains("output_per_second") && rates["output_per_second"].is_array())
       for (const auto& v : rates["output_per_second"])
         if (v.is_number()) per_second.push_back(v.get<double>());
-    const json last = recent.empty() ? json::object() : recent[0];
+    // The last request the served model ran (since it loaded): the "last reply" figures beside its drafter.
+    json last = json::object();
+    const double loaded_at = get(model, "loaded_at");
+    for (const auto& r : recent)
+      if (get(r, "finished_at") >= loaded_at) {
+        last = r;
+        break;
+      }
     std::vector<double> tpr, ttft;
     for (auto it = recent.rbegin(); it != recent.rend(); ++it) {
       tpr.push_back(get(*it, "tokens_per_round"));
@@ -411,7 +418,7 @@ struct TermStyle {
     const double prefill_ms = get(last, "prefill_ms");
     const double first = get(last, "ttft_ms", -1);
     tiles.push_back({"Time to first token", paint(kBold, first < 0 ? "-" : num(first / 1000, 2) + " s"),
-                     paint(kDim, recent.empty()
+                     paint(kDim, last.empty()
                                      ? ""
                                      : grouped(static_cast<long long>(fresh)) + " new · " +
                                            (prefill_ms > 0 ? grouped(static_cast<long long>(fresh * 1000 / prefill_ms)) : "-") +

@@ -5,7 +5,7 @@ import { t } from "../lib/i18n.js";
 import { fmt, gib, ktok, secs, level, shortDevice, short } from "../lib/format.js";
 import { Icon, Meter, MemBar, Val } from "../lib/ui.js";
 import { Spark } from "../lib/charts.js";
-import { live, phaseOf, phaseNames, ttftSeconds, speeds, memoryOf } from "../lib/telemetry.js";
+import { live, phaseOf, phaseNames, ttftSeconds, speeds, memoryOf, servedRecent } from "../lib/telemetry.js";
 
 export const PAGES = [
   ["overview", "Overview", "overview"], ["model", "Model", "model"], ["requests", "Requests", "requests"],
@@ -15,10 +15,10 @@ export const PAGES = [
 
 // The figures both views show, from the last telemetry.
 function figures(tm) {
-  const model = tm.model || {}, state = tm.state || {}, d = tm.device, recent = tm.recent || [];
+  const model = tm.model || {}, state = tm.state || {}, d = tm.device;
   const phase = phaseOf(tm), busy = phase === "decode" || phase === "prefill", decoding = phase === "decode";
-  const lastReq = recent[0] || {};
-  const sp = speeds(tm, phase, recent);
+  const served = servedRecent(tm), lastReq = served[0] || {};
+  const sp = speeds(tm, phase, served);
   const tpr = decoding ? (Number.isFinite(tm.rates && tm.rates.tokens_per_round) && tm.rates.tokens_per_round > 0
                           ? tm.rates.tokens_per_round : state.tokens_per_round)
                        : lastReq.tokens_per_round;
@@ -35,7 +35,7 @@ function figures(tm) {
   // part (both of all the processors).
   const sys = tm.system || {}, { vram, ram } = memoryOf(tm);
   const cpu = { all: tm._sys_cpu === undefined ? null : tm._sys_cpu, own: tm._cpu === undefined || !sys.cpus ? null : tm._cpu / sys.cpus };
-  return { model, state, d, recent, phase, busy, lastReq, decode: sp.decode, prefill: sp.prefill,
+  return { model, state, d, recent: served, phase, busy, lastReq, decode: sp.decode, prefill: sp.prefill,
            decodeWhen: sp.decodeWhen, prefillWhen: sp.prefillWhen, tpr, ttft, used, vram, ram, cpu,
            ops: (tm.rates && tm.rates.output_per_second) || [] };
 }

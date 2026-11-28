@@ -116,6 +116,7 @@ ojson snapshot_json(const Server& s, int recent) {
     model["max_sessions"] = m.max_sessions;
     model["memory"] = m.memory;
     model["load_s"] = m.load_s;
+    model["loaded_at"] = t.loaded_at;  // the figures of "the last request" are of requests since
     ojson deg = ojson::array();
     for (const LoadAdjustment& a : m.load_adjustments)
       deg.push_back({{"kind", a.kind}, {"from", a.from}, {"to", a.to}, {"detail", a.detail}});

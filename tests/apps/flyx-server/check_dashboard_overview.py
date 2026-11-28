@@ -92,6 +92,16 @@ def check(page, shots):
     expect(fig).to_have_text("119.0decode tok/s, last request3,000prefill tok/s, last request")
     expect(page.locator("#r-decode")).to_have_text("119.0tok/s")
     expect(page.locator("#r-prefill")).to_have_text("3,000tok/s")
+    # Another model loaded since (a switch): the requests stay listed, but "the last request"'s figures beside its
+    # drafter are of none: the served model has run none yet.
+    tm["now"]["model"]["loaded_at"] = 1500.0
+    expect(fig).not_to_contain_text("119.0")
+    expect(fig).not_to_contain_text("last request")
+    expect(page.locator("#ov-spec .fig")).not_to_contain_text("2.50")
+    expect(page.locator("#r-decode")).not_to_contain_text("119.0")
+    expect(page.locator("#ov-req tr")).to_have_count(2)
+    tm["now"]["model"]["loaded_at"] = 900.0  # loaded before both: they are its own
+    expect(fig).to_have_text("119.0decode tok/s, last request3,000prefill tok/s, last request")
     tm["now"]["state"] = {"phase": "prefill", "queued": 0, "running": 1, "label": "messages", "session": 1,
                           "prompt_tokens": 9000, "reused_tokens": 1000, "prefilled": 5000, "generated": 0,
                           "prefill_tok_s": 5123.4, "decode_tok_s": None, "elapsed_s": 0.8, "max_new_tokens": 0}
