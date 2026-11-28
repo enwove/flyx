@@ -126,7 +126,7 @@
     {
       "name": "test-base",
       "hidden": true,
-      "description": "The engine's and server's settings (core/os/env.h) cleared: an empty value is no setting, so the tests run on what they give the engine (a test's own ENVIRONMENT still sets its own), never on the shell's FLYX_BACKEND_DIR, FLYX_BACKEND_OPTIONS or FLYX_API_KEY; PYTHONOPTIMIZE cleared, which would take the asserts out of the Python tests.",
+      "description": "Every FLYX_* setting docs/server.md lists cleared (core/os/env.h's, the CUDA backend's kEnvAliases, the Python binding's FLYX_LIB; tools/check_docs.py checks the list): an empty value is no setting, so the tests run on what they give the engine (a test's own ENVIRONMENT still sets its own), never on the shell's FLYX_BACKEND_DIR, FLYX_BACKEND_OPTIONS, FLYX_WARM or FLYX_API_KEY; PYTHONOPTIMIZE cleared, which would take the asserts out of the Python tests.",
       "environment": {
         "FLYX_BACKEND": "",
         "FLYX_BACKEND_DIR": "",
@@ -141,6 +141,16 @@
         "FLYX_API_KEY": "",
         "FLYX_KEY": "",
         "FLYX_MODELS_DIR": "",
+        "FLYX_SC_CLUSTER": "",
+        "FLYX_MOE_VEC": "",
+        "FLYX_WARM": "",
+        "FLYX_EXPERT_PREFETCH": "",
+        "FLYX_GUESS": "",
+        "FLYX_GUESS_K": "",
+        "FLYX_SIDE_LOOP_MSG": "",
+        "FLYX_SIDE_COMPANION": "",
+        "FLYX_SIDE_KV": "",
+        "FLYX_LIB": "",
         "PYTHONOPTIMIZE": ""
       },
       "output": { "outputOnFailure": true },
