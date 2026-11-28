@@ -167,10 +167,102 @@ void prefill_512_case() {
     CK(cudaFree(p));
 }
 
+// Per-layer inputs (E2B, E4B): each of a row's layers' dim-wide slices normed alone, the table row times its scale
+// added, the sum times the mix; a row alone gives a pass's bits.
+void per_layer_inputs_case() {
+  const int rows = 5, layers = 3, dim = 256, W = layers * dim, ldy = W + 3, ldp = W;
+  seed("gemma4_per_layer_inputs", rows, layers, dim);
+  const Vec y = randv(size_t(rows) * ldy, 3.0), t = randv(size_t(rows) * ldp, 1.0), w = randv(dim, 0.5);
+  const float ts = 16.f, mix = 0.70710677f, eps = 1e-6f;
+  Vec want(size_t(rows) * ldp), normed(dim);
+  for (int r = 0; r < rows; ++r)
+    for (int l = 0; l < layers; ++l) {
+      Vec ys(y.begin() + ptrdiff_t(r) * ldy + l * dim, y.begin() + ptrdiff_t(r) * ldy + (l + 1) * dim);
+      for (double& v : ys) v = float(v);
+      ops::rmsnorm(ys.data(), w.data(), dim, eps, 0.0, normed.data());
+      for (int k = 0; k < dim; ++k)
+        want[size_t(r) * ldp + l * dim + k] = (normed[k] + float(t[size_t(r) * ldp + l * dim + k]) * ts) * mix;
+    }
+  float *dy = up(y), *dp = up(t), *dp1 = up(Vec(t.begin(), t.begin() + ldp)), *dw = up(w);
+  per_layer_inputs(dy, ldy, dp, ldp, layers, dim, dw, 0.f, eps, ts, mix, rows, 0);
+  per_layer_inputs(dy, ldy, dp1, ldp, layers, dim, dw, 0.f, eps, ts, mix, 1, 0);
+  const Vec got = down(dp, want.size());
+  expect("per_layer_inputs", got, want, 1e-5);
+  expect("per_layer_inputs: a row alone, the same bits", down(dp1, size_t(ldp)), Vec(got.begin(), got.begin() + ldp),
+         0);
+  for (void* q : {static_cast<void*>(dy), static_cast<void*>(dp), static_cast<void*>(dp1), static_cast<void*>(dw)})
+    CK(cudaFree(q));
+}
+
+// An MLP's per-layer gate: g = act(g) * p, GELU (tanh) and SiLU.
+void per_layer_gate_case() {
+  const int rows = 6, dim = 256, ldg = 300, ldp = 1024;
+  seed("gemma4_per_layer_gate", rows, dim);
+  const Vec g = randv(size_t(rows) * ldg, 4.0), p = randv(size_t(rows) * ldp, 2.0);
+  for (const int act : {FLYX_MLP_GELU_TANH, FLYX_MLP_SILU}) {
+    Vec want(g.size());
+    for (size_t i = 0; i < g.size(); ++i) want[i] = float(g[i]);
+    for (int r = 0; r < rows; ++r)
+      for (int k = 0; k < dim; ++k) {
+        const double v = float(g[size_t(r) * ldg + k]);
+        want[size_t(r) * ldg + k] = (act ? ops::gelu_tanh(v) : ops::silu(v)) * float(p[size_t(r) * ldp + k]);
+      }
+    float *dg = up(g), *dp = up(p);
+    per_layer_gate(dg, ldg, dp, ldp, dim, act, rows, 0);
+    expect(std::string("per_layer_gate ") + (act ? "GELU (tanh)" : "SiLU") + ", the columns past dim kept",
+           down(dg, want.size()), want, 1e-5);
+    CK(cudaFree(dg));
+    CK(cudaFree(dp));
+  }
+}
+
+// The assistant's clustered head (E2B, E4B): its clusters' tokens in turn, each scored against the bf16 head in
+// float32, the chosen positions mapped back to tokens.
+void cluster_head_case() {
+  const int V = 512, H = 64, clusters_n = 16, top_k = 4, per = V / clusters_n, C = top_k * per;
+  seed("gemma4_cluster_head", V, H, clusters_n);
+  Vec head = randv(size_t(V) * H, 0.5), x = randv(H, 1.0);
+  round_bf16(head);
+  std::vector<int> order(V), clusters = {3, 11, 0, 7};
+  for (int i = 0; i < V; ++i) order[size_t(i)] = (i * 37 + 5) % V;
+  bf16* dh = up_bf16(head);
+  float* dx = up(x);
+  int *dorder = dev<int>(V), *dcl = dev<int>(top_k), *dcand = dev<int>(C), *dpos = dev<int>(3), *dids = dev<int>(3);
+  float* dscore = dev<float>(C);
+  CK(cudaMemcpy(dorder, order.data(), V * 4, cudaMemcpyHostToDevice));
+  CK(cudaMemcpy(dcl, clusters.data(), top_k * 4, cudaMemcpyHostToDevice));
+  cluster_candidates(dcl, top_k, dorder, per, dcand, 0);
+  gather_logits(dh, H, dcand, C, dx, dscore, 0);
+  std::vector<int> cand(C), pos = {5, 0, C - 1}, ids(3);
+  CK(cudaMemcpy(cand.data(), dcand, C * 4, cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy(dpos, pos.data(), 3 * 4, cudaMemcpyHostToDevice));
+  map_ids(dpos, dcand, 3, dids, 0);
+  CK(cudaMemcpy(ids.data(), dids, 3 * 4, cudaMemcpyDeviceToHost));
+  bool same = true;
+  Vec want(C);
+  for (int c = 0; c < C; ++c) {
+    same = same && cand[size_t(c)] == order[size_t(clusters[size_t(c / per)]) * per + c % per];
+    double l = 0;
+    for (int k = 0; k < H; ++k) l += head[size_t(cand[size_t(c)]) * H + k] * float(x[size_t(k)]);
+    want[size_t(c)] = l;
+  }
+  for (int i = 0; i < 3; ++i) same = same && ids[size_t(i)] == cand[size_t(pos[size_t(i)])];
+  std::printf("  %s cluster_candidates, map_ids: the clusters' tokens in turn\n", same ? "ok  " : "FAIL");
+  if (!same) ++g_fail;
+  expect("gather_logits", down(dscore, size_t(C)), want, 1e-5);
+  for (void* q : {static_cast<void*>(dh), static_cast<void*>(dx), static_cast<void*>(dorder), static_cast<void*>(dcl),
+                  static_cast<void*>(dcand), static_cast<void*>(dpos), static_cast<void*>(dids),
+                  static_cast<void*>(dscore)})
+    CK(cudaFree(q));
+}
+
 }  // namespace
 
 void test_gemma4() {
   std::printf("gemma4\n");
+  per_layer_inputs_case();
+  per_layer_gate_case();
+  cluster_head_case();
   norm_add_case();
   scale_rows_case();
   glu_act_case();

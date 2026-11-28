@@ -384,6 +384,60 @@ void gpt_oss(const std::string& dir, const std::string& backend) {
 // of up to 16 and 64 rows.  The file with its default 8-bit inputs: prompt lookup's rounds give plain decoding's
 // tokens, greedy and seeded, and on CUDA the unfused kernels the fused ones' and, teacher forced, the float64
 // backend's next token at all but at most four of 24 places.
+// E2B's and E4B's layers (tiny_gemma4_e.gguf): an input of its own for every layer through a stage after each MLP,
+// the last layers reading the K/V of the last of their kind before them.  Transformers' tokens, prefill in passes of
+// up to 16 and 64 rows; prompt lookup's rounds and the unfused kernels give plain decoding's; its assistant, its head
+// clustered as E4B's, drafts as transformers' does after each prompt (from its directory: its GGUF, as llama.cpp's
+// converter writes one, has no clusters and scores every token) and its rounds give plain decoding's tokens.
+void gemma4_e(const std::string& dir, const std::string& backend) {
+  const std::string path = dir + "/tiny_gemma4_e.gguf", assistant = dir + "/tiny_gemma4_e_assistant";
+  std::ifstream f(dir + "/golden_gemma4_e.json");
+  const json golden = json::parse(f);
+  auto exact = engine(path, backend, {.activations = "exact"});
+  auto exact_long = engine(path, backend, {.prefill_chunk = 64, .activations = "exact"});
+  auto flyx_exact = engine(dir + "/tiny_gemma4_e.flyx", backend, {.activations = "exact"});
+  auto plain = engine(path, backend);
+  auto lookup = engine(path, backend, {.speculative = true, .drafter = "none", .lookup = true});
+  auto mtp = engine(path, backend, {.speculative = true, .drafter = "mtp", .drafter_files = {assistant}});
+  auto mtp_exact = engine(path, backend, {.speculative = true, .drafter = "mtp", .drafter_files = {assistant},
+                                          .options = "draft_weights=exact", .activations = "exact"});
+  auto mtp_gguf = engine(path, backend, {.speculative = true, .drafter = "mtp",
+                                         .drafter_files = {assistant + ".gguf"}});
+  std::unique_ptr<Engine> unfused = backend != "cpu_ref" ? engine(path, backend, {.options = "fusion=0"}) : nullptr;
+  size_t compared = 0;
+  for (const auto& item : golden.at("cases")) {
+    const auto p = item.at("prompt").get<std::vector<int32_t>>();
+    const auto want = item.at("tokens").get<std::vector<int32_t>>();
+    check(same_tokens(tokens_of(*exact, p, int(want.size())), want), "tiny gemma4_e: transformers' tokens");
+    check(same_tokens(tokens_of(*exact_long, p, int(want.size())), want),
+          "tiny gemma4_e: transformers' tokens, prefill in passes of up to 64 rows");
+    check(same_tokens(tokens_of(*flyx_exact, p, int(want.size())), want),
+          "tiny gemma4_e .flyx (python/convert): transformers' tokens");
+    auto q = p;
+    const size_t n = q.size();
+    for (size_t i = 0; i < 2 * n; ++i) q.push_back(q[i % n]);  // the prompt three times over: lookup drafts
+    const auto plain_q = tokens_of(*plain, q, 24);
+    check(tokens_of(*lookup, q, 24) == plain_q, "tiny gemma4_e: prompt lookup's rounds give plain decoding's tokens");
+    if (unfused) check(tokens_of(*unfused, q, 24) == plain_q, "tiny gemma4_e: fusion=0 gives the fused kernels' tokens");
+    const auto plain_p = tokens_of(*plain, p, 24);
+    check(tokens_of(*mtp, p, 24) == plain_p, "tiny gemma4_e: its assistant's rounds give plain decoding's tokens");
+    check(tokens_of(*mtp, p, 24, true) == tokens_of(*plain, p, 24, true),
+          "tiny gemma4_e: its assistant's rounds preserve seeded sampling");
+    check(tokens_of(*mtp_gguf, p, 24) == plain_p,
+          "tiny gemma4_e: its assistant's GGUF (every token scored) rounds give plain decoding's tokens");
+    const auto drafts = item.at("drafts").get<std::vector<int32_t>>();
+    if (drafts.empty()) continue;
+    std::vector<int32_t> got;
+    const auto trace = traced(*mtp_exact, p, 24, &got);
+    const flyx_round_result* first = trace.size() > 1 ? &trace[1] : nullptr;
+    const size_t k = first ? std::min(size_t(first->n_drafts), drafts.size()) : 0;
+    check(first && first->n_drafts > 0 && std::equal(drafts.begin(), drafts.begin() + std::ptrdiff_t(k), first->drafts),
+          "tiny gemma4_e: its clustered assistant's first drafts are transformers'");
+    compared += k;
+  }
+  check(compared >= 6, "tiny gemma4_e: " + std::to_string(compared) + " of its assistant's drafts compared");
+}
+
 void gemma4(const std::string& dir, const std::string& backend) {
   for (const std::string stem : {"gemma4", "gemma4_f32"}) {
     std::ifstream f(dir + "/golden_" + stem + ".json");
@@ -563,6 +617,7 @@ void gemma4(const std::string& dir, const std::string& backend) {
                              std::to_string(agree) + " of 24 places");
     }
   }
+  gemma4_e(dir, backend);
 }
 
 // The MTP layer in a file of its own (EngineOptions::drafter_files; unsloth ships the 27B's so): the quantized tiny

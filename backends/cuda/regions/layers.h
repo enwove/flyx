@@ -34,9 +34,11 @@ void mtp_draft_attention(flyx_seq* s, const AttnBlock& a, const KvBuf& kv, int p
                          int ld_proj, float* q, float* out, float* part, const Launch& L);
 // add16 (the generic ops of a pass with a bf16 residual, residual16_pass): the down or out projection into h (H
 // wide), then added to x with the sum rounded once to bf16 (add_rows_bf16), as the fused producers add it.
-// branch (Gemma 4's MLP beside its experts): post_norm(down's output) written there, x read alone.
+// branch (Gemma 4's MLP beside its experts): post_norm(down's output) written there, x read alone.  pli (Gemma 4's
+// E2B / E4B): the pass's per-layer inputs, ld_pli a row, which a block's per-layer stage reads.
 void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_proj, float* act, int ld_act,
-              const Launch& L, bool fused, bool add16 = false, float* branch = nullptr);
+              const Launch& L, bool fused, bool add16 = false, float* branch = nullptr, const float* pli = nullptr,
+              int ld_pli = 0);
 void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused, bool add16 = false);
 void head_logits(const HeadBlock& h, const RowView& v, int r0, int n, bool cert, const CertScratch& cs,
                  const KernelOptions& ko, bool x16 = false);
@@ -121,6 +123,8 @@ void lora_in_end(const RowView& rv, const Adapters& l, int linears, const int* o
 void lora_out_end(const RowView& rv, const Adapters& l, int linear, const float* x, int ldx, int K, int H, int R,
                   int ldu, const Launch& L);
 void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused = false);
+// Gemma 4's E2B / E4B: every layer's input of its own into RowBufs::pli.
+void per_layer_input_layer(const Pass& ps, const PerLayerInputBlock& q);
 void head(const Pass& ps, const HeadBlock& h, bool last_only);  // logits and the token choice
 void draft_context(const Pass& ps, const DFlashBlock& b, bool fused = false);  // DFlash2 context K/V from the target taps
 // DV (docs/design/dv.md): the round's tree of `width` drafts from the canvas (DRAFT), the TreeRows with them; after

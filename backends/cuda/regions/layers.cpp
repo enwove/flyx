@@ -25,6 +25,26 @@ void draft_head_pick(const HeadBlock& head, const float* x, int nr, int k, int* 
   }
 }
 
+// Gemma 4's clustered assistant head (E2B / E4B), a row: its centroids' logits, the tokens of its top_k best clusters
+// scored by its bf16 head, their best k (ids and logits; prob and margin over those candidates), in the pick's room.
+void cluster_head_pick(const Gemma4MtpBlock& b, const HeadBlock& head, const float* x, int k, int* idx, float* val,
+                       const DraftPickScratch& sc, const Launch& L, float* prob, float* margin) {
+  if (!head.w || head.softcap > 0.f) throw std::logic_error("cuda: a clustered assistant head not in bf16, or capped");
+  const int H = head.hidden, per = head.vocab / b.n_centroids, C = b.top_k * per;
+  float* cscore = sc.logits;              // [n_centroids]
+  float* cval = cscore + b.n_centroids;   // [top_k]
+  float* score = cval + b.top_k;          // [C]
+  int* clusters = reinterpret_cast<int*>(score + C);  // [top_k]
+  int* cand = clusters + b.top_k;         // [C]
+  int* pos = cand + C;                    // [k]
+  gemm(x, H, b.centroids, b.n_centroids, H, cscore, b.n_centroids, 1, false, L);
+  topk_rows(cscore, b.n_centroids, b.n_centroids, b.top_k, clusters, cval, 1, L.st);
+  cluster_candidates(clusters, b.top_k, b.token_order, per, cand, L.st);
+  gather_logits(head.w, H, cand, C, x, score, L.st);
+  topk_rows(score, C, C, k, pos, val, 1, L.st, sc.topv, sc.topi, sc.top_rows, prob, margin);
+  map_ids(pos, cand, k, idx, L.st);
+}
+
 bool draft_head_additive_ready(const HeadBlock& head, const Lin& extra, const SignHead& extra_coarse, int K_extra) {
   return head.coarse.bits && extra_coarse.bits && (head.wb.data || head.w) &&
          (extra.w || (extra.packed() && extra.blk.size() == 1 && K_extra % 128 == 0));
@@ -107,9 +127,11 @@ bool residual16_pass(const Pass& ps) {
 bool residual16(const Pass& ps) { return ps.s->m->opt.fusion && residual16_pass(ps); }
 
 void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_proj, float* act, int ld_act,
-              const Launch& L, bool fused, bool add16, float* branch) {
+              const Launch& L, bool fused, bool add16, float* branch, const float* pli, int ld_pli) {
   const int H = f.hidden, I = f.inter;
   const Norm& n = f.norm;
+  if (f.per_layer >= 0 && (!pli || branch || add16 || !f.post_norm.w))
+    throw std::logic_error("cuda: an MLP's per-layer stage without the pass's per-layer inputs");
   // Gemma's: down's output into h (H wide: free past the gate|up GEMM, which the generic path's h fed), normed and
   // added to x (norm_add), then x times its scalar; or, beside its experts, normed into branch (x read alone)
   const bool post = f.post_norm.w != nullptr;
@@ -118,7 +140,17 @@ void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_
   float* const down_y = post ? h : x;
   auto finish = [&] {
     if (branch) rmsnorm(h, H, f.post_norm.w, f.post_norm.offset, f.post_norm.eps, branch, H, R, H, L.st);
-    else if (post) norm_add(x, H, h, H, f.post_norm.w, f.post_norm.offset, f.post_norm.eps, f.out_scale, R, H, L.st);
+    else if (post && f.per_layer < 0)
+      norm_add(x, H, h, H, f.post_norm.w, f.post_norm.offset, f.post_norm.eps, f.out_scale, R, H, L.st);
+    if (f.per_layer < 0) return;
+    // Gemma 4's E2B / E4B: down's normed output added, then its layer's input gated by the residual (into proj, free
+    // past the down GEMM), projected into h, normed and added, the layer times its scalar
+    const int P = f.per_layer_dim;
+    norm_add(x, H, h, H, f.post_norm.w, f.post_norm.offset, f.post_norm.eps, nullptr, R, H, L.st);
+    gemm(x, H, f.w_pl_gate, P, H, proj, ld_proj, R, false, L);
+    per_layer_gate(proj, ld_proj, pli + size_t(f.per_layer) * P, ld_pli, P, f.act, R, L.st);
+    gemm(proj, ld_proj, f.w_pl_proj, H, P, h, H, R, false, L);
+    norm_add(x, H, h, H, f.pl_norm.w, f.pl_norm.offset, f.pl_norm.eps, f.out_scale, R, H, L.st);
   };
   if (fused) {
     rmsnorm_split(x, H, n.w, n.offset, n.eps, R, H, L, f.w_gu.q8_inputs());
@@ -556,7 +588,9 @@ void gemma4_mtp_draft(flyx_seq* s, const Gemma4MtpBlock& b, int width, const Lau
     rmsnorm(own.mx, H, head.norm.w, head.norm.offset, head.norm.eps, own.h, H, 1, H, st);
     gemm(own.h, H, b.post_proj, Ht, H, s->mg, Ht, 1, false, L);  // the next step's h
     const int K = std::min(ops::kMtpCands, head.vocab);
-    draft_head_pick(head, own.h, 1, K, s->mcand, s->mval, s, L, s->draft_prob + i, s->draft_margin + i);
+    if (b.n_centroids) cluster_head_pick(b, head, own.h, K, s->mcand, s->mval, pick_scratch(s), L, s->draft_prob + i,
+                                         s->draft_margin + i);
+    else draft_head_pick(head, own.h, 1, K, s->mcand, s->mval, s, L, s->draft_prob + i, s->draft_margin + i);
     mtp_choose(s->P, s->G, s->reply.count, s->mcand, s->mval, K, head.vocab, i, s->mtok, st);
     mtp_oracle(s->P, s->oracle, i, s->mtok, st);
   }
@@ -944,9 +978,15 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
   const KvBuf& kb = s->kv[size_t(a.kv)];
   KvRef kv = kb.ref();
   const TreeRows* tree = tree_of(ps);
+  if (a.kv_shared) {  // Gemma 4's E2B / E4B: q alone, over the K/V its source layer wrote this pass
+    attn_prep(rv.b.proj, rv.ld_proj, 0, a.q_width(), a.q_width(), a.q_norm.w, nullptr, a.q_norm.offset, a.q_norm.eps,
+              a.theta, a.rot, nh, 0, hd, R, s->P, kPosPosition, false, rv.b.qbuf, KvRef{}, st, 0, tree, 0,
+              CanvasKeys{}, a.mrope(ps.pos_3d), a.rope);
+    kv = {};
+  }
   // Stage aligned 16-row prefill Strata writes in dead device memory (rv.b.act) and flush contiguously
   // via cudaMemcpyAsync instead of scattering 4-byte writes across PCIe into host-pinned Strata buffers.
-  const bool stage_strata =
+  const bool stage_strata = !a.kv_shared &&
       !ps.round && !tree && rv.b.act && kb.kq && kb.kq_host && kb.kq == kb.kq_host && kb.ring == 0 &&
       R >= 16 && (R & 15) == 0 && (s->position & 15) == 0;
   const bool stage_grids = kb.copy_slot >= 0;  // copy_slot < 0 keeps kqs/vqs directly on device
@@ -973,9 +1013,10 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
       kv.vqs = kb.vqs + goff;
     }
   }
-  attn_prep(rv.b.proj, rv.ld_proj, 0, a.q_width(), a.v_off(), a.q_norm.w, a.k_norm.w, a.q_norm.offset,
-            a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, R, s->P, kPosPosition, false, rv.b.qbuf, kv, st, 0, tree,
-            use_stage ? s->position : 0, CanvasKeys{}, a.mrope(ps.pos_3d), a.rope, a.qkv_b, a.v_eps);
+  if (!a.kv_shared)
+    attn_prep(rv.b.proj, rv.ld_proj, 0, a.q_width(), a.v_off(), a.q_norm.w, a.k_norm.w, a.q_norm.offset,
+              a.q_norm.eps, a.theta, a.rot, nh, nkv, hd, R, s->P, kPosPosition, false, rv.b.qbuf, kv, st, 0, tree,
+              use_stage ? s->position : 0, CanvasKeys{}, a.mrope(ps.pos_3d), a.rope, a.qkv_b, a.v_eps);
   if (use_stage) {
     const size_t woff = strata_words_at(s->position, 0, nkv, kb.words);
     CK(cudaMemcpyAsync(kb.kq + woff, stg_kq, q_words * sizeof(uint32_t), cudaMemcpyDefault, st));
@@ -1052,6 +1093,20 @@ void attn_layer(const Pass& ps, const AttnBlock& a, bool fused) {
   if (a.lora) lora_out_end(rv, a.lora, FLYX_LIN_O, rv.b.act, nh * hd, nh * hd, H, R, ldu, L);
 }
 
+// Every layer's input of its own (Gemma 4's E2B / E4B): the tokens' table rows into pli, the embedded rows' projection
+// (proj, free here) scaled, normed a layer's slice at a time and mixed in.
+void per_layer_input_layer(const Pass& ps, const PerLayerInputBlock& q) {
+  const RowView& rv = ps.v;
+  const int R = ps.rows, W = q.width(), ld = ps.s->m->need.per_layer, H = ps.s->m->hidden;
+  cudaStream_t st = rv.L.st;
+  if (q.table.blk.data) embed_blocks(rv.b.tokens, q.table.blk, W, rv.b.pli, R, st);
+  else embed(rv.b.tokens, q.table.table, W, rv.b.pli, R, st);
+  gemm(rv.b.x, H, q.w_proj, W, H, rv.b.proj, rv.ld_proj, R, false, rv.L);
+  scale_rows(rv.b.proj, rv.ld_proj, W, q.proj_scale, R, st);
+  per_layer_inputs(rv.b.proj, rv.ld_proj, rv.b.pli, ld, q.layers, q.dim, q.norm.w, q.norm.offset, q.norm.eps,
+                   q.table_scale, q.mix, R, st);
+}
+
 void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused) {
   const RowView& rv = ps.v;
   if (residual16(ps)) {  // norm from the bf16 rows, SwiGLU in the gate|up GEMM, the down GEMM added to them
@@ -1065,7 +1120,7 @@ void mlp_layer(const Pass& ps, const MlpBlock& f, bool fused) {
   }
   if (!f.lora) {
     mlp_body(rv.b.x, f, ps.rows, rv.b.h, rv.b.proj, rv.ld_proj, rv.b.act, rv.ld_act, rv.L, fused,
-             residual16_pass(ps));
+             residual16_pass(ps), nullptr, rv.b.pli, ps.s->m->need.per_layer);
     return;
   }
   // The block's own adapters (ABI 43): the gate and up rows take their products before the SwiGLU, so the gate|up GEMM

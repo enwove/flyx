@@ -957,4 +957,42 @@ void draft_pick_blocks(const float* x, int ldx, const SignHead& h, const BlockMa
   draft_pick_topk(rough, ld, rows, k, idx, val, L.st, prob, margin, nullptr, 0, nullptr, cap);
 }
 
+namespace {
+
+__global__ void k_cluster_candidates(const int* clusters, int top_k, const int* order, int per, int* cand) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < top_k * per) cand[i] = order[size_t(clusters[i / per]) * per + i % per];
+}
+
+// a warp a row: lane-strided products in ascending k, then the xor tree
+__global__ void k_gather_logits(const bf16* W, int H, const int* rows, int n, const float* x, float* out) {
+  const int r = int((blockIdx.x * blockDim.x + threadIdx.x) >> 5), lane = threadIdx.x & 31;
+  if (r >= n) return;
+  const bf16* w = W + size_t(rows[r]) * H;
+  float acc = 0.f;
+  for (int k = lane; k < H; k += 32) acc = __fmaf_rn(__bfloat162float(w[k]), x[k], acc);
+  acc = warp_sum(acc);
+  if (lane == 0) out[r] = acc;
+}
+
+__global__ void k_map_ids(const int* pos, const int* ids, int n, int* out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) out[i] = ids[pos[i]];
+}
+
+}  // namespace
+
+void cluster_candidates(const int* clusters, int top_k, const int* order, int per, int* cand, cudaStream_t st) {
+  const int n = top_k * per;
+  if (n > 0) k_cluster_candidates<<<(n + 255) / 256, 256, 0, st>>>(clusters, top_k, order, per, cand);
+}
+
+void gather_logits(const bf16* W, int H, const int* rows, int n, const float* x, float* out, cudaStream_t st) {
+  if (n > 0) k_gather_logits<<<(n + 7) / 8, 256, 0, st>>>(W, H, rows, n, x, out);
+}
+
+void map_ids(const int* pos, const int* ids, int n, int* out, cudaStream_t st) {
+  if (n > 0) k_map_ids<<<(n + 255) / 256, 256, 0, st>>>(pos, ids, n, out);
+}
+
 }  // namespace flyx::cuda

@@ -597,6 +597,7 @@ def main(out):
     tiny_gemma4.write(out, stem="gemma4_moe", moe=True)
     tiny_gemma4.write(out, quant=False, stem="gemma4_moe_f32", moe=True)
     tiny_gemma4.write(out, stem="gemma4_moe_nvfp4", moe=True, nvfp4=nvfp4_blocks)
+    tiny_gemma4.write(out, stem="gemma4_e", e=True)
     gemma4_tokenizer.write(out)
     print("wrote GGUF model, tokenizer and independent quantization fixtures")
 

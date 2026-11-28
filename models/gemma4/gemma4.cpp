@@ -9,7 +9,9 @@
 // without one, q.k unscaled, GELU's tanh form, and the embedding times sqrt(hidden) rounded to bf16 as the
 // checkpoints' bf16 forward rounds it.  A layer with experts (26B-A4B: one with a router, ffn_gate_inp) runs its
 // dense MLP beside them (models/model.h's MoE block: its shared MLP), each between norms of its own, the sum normed
-// again before the residual add.  Per-layer embeddings and shared K/V layers (E2B, E4B) are refused here for now.
+// again before the residual add.  E2B and E4B: an input of its own for every layer (per_layer_token_embd and
+// per_layer_model_proj, models/model.h's per-layer input block) through a stage after each MLP, and their last
+// attention.shared_kv_layers layers reading the K/V of the last layer of their kind before them (q and o alone).
 #include "models/gemma4/gemma4.h"
 
 #include <algorithm>
@@ -32,6 +34,7 @@ struct Layer {
   double theta = 0;
   bool v_from_k = false;
   bool moe = false;  // experts beside its MLP
+  int kv_source = -1;  // a layer reading another's K/V: that layer (E2B, E4B)
 };
 
 struct Config {
@@ -41,8 +44,28 @@ struct Config {
   int trained_ctx = 0;
   bool gguf = false;
   int n_experts = 0, top_k = 0, moe_inter = 0;
+  int per_layer_dim = 0, per_layer_vocab = 0;  // every layer's input of its own (E2B, E4B)
   std::vector<Layer> layers;
 };
+
+// The layers from `first_shared` on read the K/V of the last layer of their kind before it (Hugging Face's
+// store_full_length_kv layer; llama.cpp's kv_source).
+void share_kv(Config* c, int first_shared) {
+  const int L = int(c->layers.size());
+  if (first_shared >= L) return;
+  if (first_shared < 1) throw std::runtime_error("Gemma 4: every layer reading another's K/V");
+  for (int i = first_shared; i < L; ++i) {
+    Layer& l = c->layers[size_t(i)];
+    int src = first_shared - 1;
+    while (src >= 0 && c->layers[size_t(src)].sliding != l.sliding) --src;
+    if (src < 0) throw std::runtime_error("Gemma 4: a shared K/V layer with no layer of its kind before them");
+    const Layer& s = c->layers[size_t(src)];
+    if (s.n_kv != l.n_kv || s.head_dim != l.head_dim)
+      throw std::runtime_error("Gemma 4: a shared K/V layer of other heads than its source's");
+    l.kv_source = src;
+    l.v_from_k = false;
+  }
+}
 
 void validate(const Config& c, int hd_full, int hd_swa) {
   if (c.hidden <= 0 || c.hidden > kMaxWidth || c.vocab <= 0 || c.vocab > kMaxVocab || c.layers.empty() ||
@@ -59,6 +82,10 @@ void validate(const Config& c, int hd_full, int hd_swa) {
               c.top_k > c.n_experts ||
               c.moe_inter < 1 || c.moe_inter > kMaxWidth))
     throw std::runtime_error("invalid Gemma 4 experts' configuration");
+  if (c.per_layer_dim && (c.per_layer_dim < 1 || c.per_layer_dim > kMaxWidth || c.per_layer_vocab < 1 ||
+                          c.per_layer_vocab > kMaxVocab || moe ||
+                          int64_t(c.per_layer_dim) * int64_t(c.layers.size()) > kMaxWidth * 16))
+    throw std::runtime_error("invalid Gemma 4 per-layer inputs' configuration");
 }
 
 // A .flyx file's config (python/convert canonical_gemma4_config).
@@ -80,6 +107,10 @@ Config read_flyx_config(const ModelFile& file) {
   c.n_experts = j.value("experts", 0);
   c.top_k = j.value("top_k", 0);
   c.moe_inter = j.value("moe_inter", 0);
+  c.per_layer_dim = j.value("per_layer_dim", 0);
+  c.per_layer_vocab = j.value("per_layer_vocab", 0);
+  const int shared_kv = j.value("kv_shared_layers", 0);
+  const bool double_wide = j.value("double_wide_mlp", false);
   const auto& types = j.at("layer_types");
   if (!types.is_array() || int(types.size()) != j.at("layers").get<int>())
     throw std::runtime_error("Gemma 4 layer_types: not one a layer");
@@ -96,6 +127,10 @@ Config read_flyx_config(const ModelFile& file) {
     l.moe = c.n_experts > 0;  // Hugging Face's enable_moe_block: every layer's
     c.layers.push_back(l);
   }
+  const int first_shared = int(c.layers.size()) - shared_kv;
+  share_kv(&c, first_shared);
+  if (double_wide)  // Hugging Face's use_double_wide_mlp: the shared K/V layers' MLPs twice as wide
+    for (size_t i = size_t(std::max(first_shared, 0)); i < c.layers.size(); ++i) c.layers[i].inter *= 2;
   validate(c, hd_full, hd);
   return c;
 }
@@ -156,11 +191,13 @@ Config read_config(const ModelFile& file) {
   c.trained_ctx = m.count_or("context_length", 0, 0);
   for (const char* key : {"attention.layer_norm_rms_epsilon", "rope.freq_base", "rope.freq_base_swa"})
     if (!m.has(key)) throw std::runtime_error(std::string("GGUF without gemma4.") + key);
-  // What this build does not run yet: per-layer embeddings (E2B, E4B), layers reading another's K/V.
-  if (m.count_or("embedding_length_per_layer_input", 0, 0) != 0)
-    throw std::runtime_error("Gemma 4 with per-layer embeddings (E2B, E4B) is not supported yet");
-  if (m.count_or("attention.shared_kv_layers", 0, 0) != 0)
-    throw std::runtime_error("Gemma 4 with shared K/V layers is not supported yet");
+  c.per_layer_dim = m.count_or("embedding_length_per_layer_input", 0, 0);
+  if (c.per_layer_dim) {
+    const auto* t = file.tensor("per_layer_token_embd.weight");
+    if (!t || t->ndim != 2) throw std::runtime_error("GGUF Gemma 4 per-layer inputs without per_layer_token_embd");
+    c.per_layer_vocab = int(t->shape[0]);
+  }
+  const int shared_kv = m.count_or("attention.shared_kv_layers", 0, 0);
   if (m.count_or("expert_count", 0, 0) != 0) {
     c.n_experts = m.count("expert_count");
     c.top_k = m.count("expert_used_count");
@@ -190,13 +227,15 @@ Config read_config(const ModelFile& file) {
     l.rot_dim = l.sliding ? rot_swa : rot_full;
     l.theta = l.sliding ? theta_swa : theta;
     l.inter = inter[size_t(i)];
-    l.v_from_k = !file.tensor("blk." + std::to_string(i) + ".attn_v.weight");
+    const bool shared = i >= layers - shared_kv;
+    l.v_from_k = !shared && !file.tensor("blk." + std::to_string(i) + ".attn_v.weight");
     l.moe = file.tensor("blk." + std::to_string(i) + ".ffn_gate_inp.weight") != nullptr;
     if (l.moe && c.n_experts == 0) throw std::runtime_error("GGUF Gemma 4 router without gemma4.expert_count");
     if (l.sliding && l.v_from_k) throw std::runtime_error("Gemma 4 sliding layer without a v projection");
     if (c.n_heads % l.n_kv) throw std::runtime_error("Gemma 4 query heads not a multiple of a layer's K/V heads");
     c.layers.push_back(l);
   }
+  share_kv(&c, layers - shared_kv);
   validate(c, hd_full, hd_swa);
   return c;
 }
@@ -204,12 +243,23 @@ Config read_config(const ModelFile& file) {
 // A tensor's GGUF name from the canonical name the Tables builders ask for ("target.L<i>.attn.post_norm").
 std::string gguf_name(const std::string& name) {
   if (const char* top = gguf_top_name(name)) return top;
+  // every layer's input of its own (E2B, E4B)
+  static const std::pair<std::string_view, const char*> kPerLayer[] = {
+      {"target.per_layer.table", "per_layer_token_embd.weight"},
+      {"target.per_layer.proj", "per_layer_model_proj.weight"},
+      {"target.per_layer.norm", "per_layer_proj_norm.weight"},
+  };
+  for (const auto& [c, f] : kPerLayer)
+    if (name == c) return f;
   const size_t dot = name.find('.', 8);  // "target.L<i>."
   const std::string layer = "blk." + name.substr(8, dot - 8) + ".";
   const std::string_view suffix = std::string_view(name).substr(dot + 1);
   if (suffix == "attn.post_norm") return layer + "post_attention_norm.weight";
   if (suffix == "mlp.post_norm") return layer + "post_ffw_norm.weight";
   if (suffix == "layer_scalar") return layer + "layer_output_scale.weight";
+  if (suffix == "per_layer.gate") return layer + "inp_gate.weight";
+  if (suffix == "per_layer.proj") return layer + "proj.weight";
+  if (suffix == "per_layer.post_norm") return layer + "post_norm.weight";
   // a layer with experts: the dense MLP's norm after it, the experts' and the router's tensors
   static const std::pair<std::string_view, const char*> kMoe[] = {
       {"mlp.post_norm_1", "post_ffw_norm_1.weight"},  {"moe.norm", "pre_ffw_norm_2.weight"},
@@ -237,6 +287,7 @@ class Gemma4 final : public Model {
   int moe_block(const std::string& p, const Config& c, int shared, const Tables::NameFn& n);
 
   int embed_ = -1, head_ = -1;
+  int per_layer_ = -1;       // every layer's input of its own (E2B, E4B)
   std::vector<int> layers_;  // per layer: attention block, MLP block
   drafters::DrafterRegistry drafters_reg_;
 };
@@ -281,6 +332,24 @@ bool Gemma4::build(const ModelFile& file, const ModelOptions& o, std::string* er
   T.blocks[size_t(embed_)].embed.scale = round_bf16(std::sqrt(float(H)));
   head_ = T.head_block(H, c.vocab, embed_, 0.0, c.eps, n);
   T.blocks[size_t(head_)].head.softcap = c.softcap;
+  const int L = int(c.layers.size()), P = c.per_layer_dim;
+  if (P) {  // Hugging Face's get_per_layer_inputs and project_per_layer_inputs
+    flyx_block b{};
+    b.kind = FLYX_BLOCK_PER_LAYER_INPUT;
+    auto& q = b.per_layer_input;
+    q.hidden = H;
+    q.layers = L;
+    q.dim = P;
+    q.vocab = c.per_layer_vocab;
+    q.table = T.weight(n("target.per_layer.table"), {c.per_layer_vocab, int64_t(L) * P});
+    q.proj = T.weight(n("target.per_layer.proj"), {int64_t(L) * P, H});
+    q.norm = T.norm(n("target.per_layer.norm"), P, 0.0, c.eps);
+    q.table_scale = round_bf16(std::sqrt(float(P)));  // as the checkpoints' bf16 forward rounds it
+    q.proj_scale = float(1.0 / std::sqrt(double(H)));
+    q.mix = float(1.0 / std::sqrt(2.0));
+    per_layer_ = T.block(b);
+  }
+  std::vector<int> attn_of(c.layers.size(), -1);  // each layer's attention block
   for (size_t i = 0; i < c.layers.size(); ++i) {
     const Layer& l = c.layers[i];
     const std::string p = "target.L" + std::to_string(i) + ".";
@@ -289,12 +358,23 @@ bool Gemma4::build(const ModelFile& file, const ModelOptions& o, std::string* er
     if (!l.sliding) a.rope.kind = FLYX_ROPE_PROPORTIONAL;
     a.scale = 1.f;
     a.v_from_k = l.v_from_k;
-    a.v_norm = a.post_norm = true;
-    layers_.push_back(T.attn_block(p, a, n));
+    a.post_norm = true;
+    a.v_norm = l.kv_source < 0;  // a shared layer's v is its source's, normed there
+    if (l.kv_source >= 0) a.kv_from = T.blocks[size_t(attn_of[size_t(l.kv_source)])].attn.kv;
+    attn_of[i] = T.attn_block(p, a, n);
+    layers_.push_back(attn_of[i]);
     const int mlp = T.mlp_block(p, H, l.inter, 0.0, c.eps, n);
     flyx_mlp_block& f = T.blocks[size_t(mlp)].mlp;
     f.act = FLYX_MLP_GELU_TANH;
     f.has_post_norm = 1;
+    if (P) {  // Hugging Face's per_layer_input_gate, per_layer_projection and post_per_layer_input_norm
+      f.has_per_layer = 1;
+      f.per_layer_input = per_layer_;
+      f.per_layer_index = int(i);
+      f.per_layer_gate = T.weight(n(p + "per_layer.gate"), {P, H});
+      f.per_layer_proj = T.weight(n(p + "per_layer.proj"), {H, P});
+      f.per_layer_norm = T.norm(n(p + "per_layer.post_norm"), H, 0.0, c.eps);
+    }
     if (!l.moe) {
       f.post_norm = T.norm(n(p + "mlp.post_norm"), H, 0.0, c.eps);
       f.has_out_scale = 1;
@@ -391,6 +471,7 @@ void Gemma4::add_layers(std::vector<flyx_node>* p) const {
 std::vector<flyx_node> Gemma4::prefill_program() const {
   std::vector<flyx_node> p;
   p.push_back({FLYX_NODE_RUN, embed_, 0, 0});
+  if (per_layer_ >= 0) p.push_back({FLYX_NODE_RUN, per_layer_, 0, 0});
   add_layers(&p);
   drafters_reg_.emit_contexts(&p);
   p.push_back({FLYX_NODE_RUN, head_, 1, 0});
@@ -404,6 +485,7 @@ std::vector<flyx_node> Gemma4::round_program(int width, int d, bool given) const
     p.push_back(given ? flyx_node{FLYX_NODE_GIVEN, -1, width, 0}
                       : flyx_node{FLYX_NODE_DRAFT, drafters_.at(size_t(d)).block, width, 0});
   p.push_back({FLYX_NODE_RUN, embed_, 0, 0});
+  if (per_layer_ >= 0) p.push_back({FLYX_NODE_RUN, per_layer_, 0, 0});
   add_layers(&p);
   p.push_back({FLYX_NODE_RUN, head_, 0, 0});
   p.push_back({FLYX_NODE_ACCEPT, -1, width, 0});

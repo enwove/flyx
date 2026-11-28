@@ -185,13 +185,11 @@ def canonical_dense_config(tc: dict) -> dict:
 def canonical_gemma4_config(tc: dict) -> dict:
     """Gemma 4's dense layers (models/gemma4): sliding and global layers, each kind its head width, K/V heads,
     rotary and theta; v from k's projection on the global ones (attention_k_eq_v); GELU (tanh) MLPs; the final logits
-    softcapped; experts beside every layer's MLP (26B-A4B: enable_moe_block).  Per-layer embeddings (E2B, E4B) and
-    shared K/V layers are refused for now."""
-    for key, what in (("hidden_size_per_layer_input", "per-layer embeddings (E2B, E4B)"),
-                      ("num_kv_shared_layers", "shared K/V layers"),
-                      ("use_double_wide_mlp", "a double-wide MLP"), ("attention_bias", "attention biases")):
-        if tc.get(key):
-            raise ValueError(f"Gemma 4 with {what} is not supported yet")
+    softcapped; experts beside every layer's MLP (26B-A4B: enable_moe_block); E2B's and E4B's input of its own for
+    every layer (hidden_size_per_layer_input) and last layers reading the K/V of the last of their kind before them
+    (num_kv_shared_layers), their MLPs twice as wide (use_double_wide_mlp)."""
+    if tc.get("attention_bias"):
+        raise ValueError("Gemma 4 with attention biases is not supported yet")
     if tc.get("hidden_activation", "gelu_pytorch_tanh") != "gelu_pytorch_tanh":
         raise ValueError(f"activation {tc.get('hidden_activation')!r} is not supported (gelu_pytorch_tanh)")
     rp = tc.get("rope_parameters") or {}
@@ -223,6 +221,11 @@ def canonical_gemma4_config(tc: dict) -> dict:
         "tie_embed": bool(tc.get("tie_word_embeddings", True)), "max_pos": tc.get("max_position_embeddings", 131072),
         **({"experts": tc["num_experts"], "top_k": tc["top_k_experts"], "moe_inter": tc["moe_intermediate_size"]}
            if tc.get("enable_moe_block") else {}),
+        **({"per_layer_dim": tc["hidden_size_per_layer_input"],
+            "per_layer_vocab": tc.get("vocab_size_per_layer_input") or tc["vocab_size"]}
+           if tc.get("hidden_size_per_layer_input") else {}),
+        **({"kv_shared_layers": tc["num_kv_shared_layers"], "double_wide_mlp": bool(tc.get("use_double_wide_mlp"))}
+           if tc.get("num_kv_shared_layers") else {}),
     }
 
 
@@ -429,7 +432,15 @@ _G4_RULES = [
     (r"layers\.(\d+)\.router\.per_expert_scale", "L{0}.moe.expert_scale"),
     (r"layers\.(\d+)\.experts\.gate_up_proj", "L{0}.moe.gate_up"),
     (r"layers\.(\d+)\.experts\.down_proj", "L{0}.moe.down"),
+    # every layer's input of its own (E2B, E4B)
+    (r"embed_tokens_per_layer\.weight", "per_layer.table"),
+    (r"per_layer_model_projection\.weight", "per_layer.proj"),
+    (r"per_layer_projection_norm\.weight", "per_layer.norm"),
+    (r"layers\.(\d+)\.per_layer_input_gate\.weight", "L{0}.per_layer.gate"),
+    (r"layers\.(\d+)\.per_layer_projection\.weight", "L{0}.per_layer.proj"),
+    (r"layers\.(\d+)\.post_per_layer_input_norm\.weight", "L{0}.per_layer.post_norm"),
 ]
+_G4_PER_LAYER_KEYS = ("per_layer.gate", "per_layer.proj", "per_layer.post_norm")
 _G4_MOE_KEYS = ("mlp.post_norm_1", "moe.norm", "moe.post_norm", "moe.router", "moe.router_in", "moe.expert_scale",
                 "moe.gate_up", "moe.down")
 _G4_LAYER_KEYS = ("in_norm", "attn.post_norm", "post_norm", "mlp.post_norm", "layer_scalar", "attn.q", "attn.k",
@@ -774,13 +785,19 @@ def _check_target(cfg, seen, qk_norm=True):
 
 
 def _check_gemma4(cfg, seen):
-    """Every tensor Gemma 4's layers read; a global layer's v projection there unless v is k's (k_eq_v)."""
+    """Every tensor Gemma 4's layers read; a global layer's v projection there unless v is k's (k_eq_v); no k or v
+    in a layer reading another's K/V; every layer's input of its own where the config gives one (E2B, E4B)."""
     need = {"embed", "norm"}
+    if cfg.get("per_layer_dim"):
+        need |= {"per_layer.table", "per_layer.proj", "per_layer.norm"}
+    first_shared = len(cfg["layer_types"]) - cfg.get("kv_shared_layers", 0)
     for i, t in enumerate(cfg["layer_types"]):
-        need |= {f"L{i}.{n}" for n in _G4_LAYER_KEYS}
+        need |= {f"L{i}.{n}" for n in _G4_LAYER_KEYS if i < first_shared or n not in ("attn.k", "attn.k_norm")}
         if cfg.get("experts"):
             need |= {f"L{i}.{n}" for n in _G4_MOE_KEYS}
-        if t == "sliding" or not cfg["k_eq_v"]:
+        if cfg.get("per_layer_dim"):
+            need |= {f"L{i}.{n}" for n in _G4_PER_LAYER_KEYS}
+        if i < first_shared and (t == "sliding" or not cfg["k_eq_v"]):
             need.add(f"L{i}.attn.v")
     check_tensors("target", need, seen)
     extra = sorted(seen - need)

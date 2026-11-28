@@ -42,9 +42,18 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       lora_part(4, g->lora.rank, g->hidden, g->v_width());
       if (g->w_in.q8_inputs() || g->w_out.q8_inputs()) n.q8 = true;
       ks({g->hidden, g->v_width(), g->lora.rank});
+    } else if (const auto* q = std::get_if<PerLayerInputBlock>(&blk)) {
+      n.per_layer = std::max(n.per_layer, q->width());
+      n.proj = std::max(n.proj, q->width());  // the embedded rows' projection
+      if (q->w_proj.q8_inputs()) n.q8 = true;
+      ks({q->table.hidden});
     } else if (const auto* f = std::get_if<MlpBlock>(&blk)) {
       n.proj = std::max(n.proj, 2 * f->inter);
       n.act = std::max(n.act, f->inter);
+      if (f->per_layer >= 0) {
+        if (f->w_pl_gate.q8_inputs() || f->w_pl_proj.q8_inputs()) n.q8 = true;
+        ks({f->per_layer_dim});
+      }
       if (!f->w_gu.packed() && !f->w_down.packed()) n.glu = true;
       if (f->w_gu.q8_inputs() || f->w_down.q8_inputs()) n.q8 = true;
       n.lora = std::max(n.lora, 2 * f->lora.rank);
@@ -180,6 +189,7 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     }
   }
   if (n.feats) b->feats = f(size_t(R) * n.feats);  // DFlash2/DSpark taps survive across layers
+  if (n.per_layer) b->pli = f(size_t(R) * n.per_layer);  // every layer reads its slice
   if (n.max_bank > 0) {
     b->res_bank = f(size_t(n.max_bank) * R * H);
     b->attn_in = f(size_t(3) * R * H);

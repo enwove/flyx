@@ -1173,6 +1173,18 @@ void norm_add(float* x, int ldx, const float* y, int ldy, const float* w, float 
               const float* scale, int rows, int n, cudaStream_t st);
 // x *= s, n values of each of `rows` rows (an embedding's scale).
 void scale_rows(float* x, int ld, int n, float s, int rows, cudaStream_t st);
+// Gemma 4's per-layer inputs (E2B, E4B, ABI 58): over each of a row's `layers` dim-wide slices, pli = (rmsnorm(y)
+// (offset + w) + pli * table_scale) * mix, y the row's projection already scaled, pli its table row (in place).
+void per_layer_inputs(const float* y, int ldy, float* pli, int ldp, int layers, int dim, const float* w, float offset,
+                      float eps, float table_scale, float mix, int rows, cudaStream_t st);
+// Gemma 4's clustered assistant head (E2B / E4B, ABI 58): the tokens of a row's top_k clusters into cand ([top_k *
+// per], cluster by cluster as ranked; order: each cluster's per tokens, int32); out[i] = W[rows[i]] . x (bf16 rows,
+// H wide; a warp a row, lane-strided products in ascending k, a xor tree); out[i] = ids[pos[i]].
+void cluster_candidates(const int* clusters, int top_k, const int* order, int per, int* cand, cudaStream_t st);
+void gather_logits(const bf16* W, int H, const int* rows, int n, const float* x, float* out, cudaStream_t st);
+void map_ids(const int* pos, const int* ids, int n, int* out, cudaStream_t st);
+// g = act(g) * p, dim values a row (act flyx_mlp_act): an MLP's per-layer gate over its layer's input.
+void per_layer_gate(float* g, int ldg, const float* p, int ldp, int dim, int act, int rows, cudaStream_t st);
 // Each of n values of `rows` rows x [rows][ld] rounded to bf16 in place (the generic regions' rows where a fused
 // producer keeps bf16 ones: prefill_rows_bf16, layers.cpp); add_rows_bf16: x + y first, the float32 sum rounded
 // once (a bf16 residual's add, as gemm_staged_bf16's accumulate makes it).

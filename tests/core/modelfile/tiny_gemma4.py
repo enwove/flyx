@@ -35,6 +35,12 @@
                          the same with experts of 64 in GGML's NVFP4 as llama.cpp's converter writes NVIDIA's
                          26B-A4B: gate and up apart, each expert's matrices over a scale of its own (`.scale`, [E]),
                          the router's per-expert scale folded into down's
+    tiny_gemma4_e.gguf, golden_gemma4_e.json, tiny_gemma4_e_assistant/, hf_gemma4_e/, tiny_gemma4_e.flyx
+                         the same layers as E2B and E4B lay theirs out: an input of its own for every layer (64 wide,
+                         per_layer_token_embd and per_layer_model_proj) through a stage after each MLP, v projected on
+                         the global layers too, the last two layers reading the K/V of the last of their kind before
+                         them (q and o alone) with MLPs twice as wide; its assistant's head clustered (16 clusters of
+                         32 tokens, the 4 best scored), as E4B's
     hf_gemma4_nvfp4/, tiny_gemma4_nvfp4.flyx
                          the same with its MLPs' linears in NVFP4 as ModelOpt writes them (its attention left in
                          float, as NVIDIA's Gemma-4-31B-IT-NVFP4 leaves it), and its .flyx
@@ -62,6 +68,10 @@ THETA, THETA_SWA, EPS, SOFTCAP = 1000000.0, 10000.0, 1e-6, 30.0
 SPECIALS = ["<pad>", "<eos>", "<bos>", "<unk>", "<turn|>"]
 MIN_MARGIN, NEW_TOKENS, CASES = 0.15, 12, 8
 N_EXPERTS, TOP_K, MOE_INTER = 8, 2, 32  # the experts (stem gemma4_moe)
+PER_LAYER, N_SHARED, CENTROIDS, CENTROID_TOP = 64, 2, 16, 4  # E2B's and E4B's (stem gemma4_e)
+# a clustered head's drafts: its best clusters at least this far from the next (binary16 K/V move its scores a few
+# hundredths, as they move a token's logits)
+MIN_CLUSTER_MARGIN = 0.15
 A_H, A_INTER, A_LAYERS, DRAFTS, MIN_DRAFT_MARGIN = 32, 48, [True, False], 7, 0.25  # the assistant
 QK_LO, QK_HI = 0.6, 0.8  # q and k norm weights (see put below)
 
@@ -146,23 +156,25 @@ def write_nvfp4(src: Path, dst: Path):
     save_file({k: t.contiguous() for k, t in out.items()}, str(dst / "model.safetensors"))
 
 
-def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False, nvfp4=None):
+def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False, nvfp4=None, e: bool = False):
     """quant False: every tensor float32 (no input rounding anywhere); moe: experts beside every MLP; nvfp4: those
     experts in GGML's NVFP4, through this writer of its blocks (make_gguf.py's nvfp4_blocks).  Skipped where the files
-    are there, made from the same inputs (their stamp)."""
-    extras = quant and not moe  # the assistant, the HF directory and its .flyx files: the dense Q8 model's
+    are there, made from the same inputs (their stamp).  e: E2B's and E4B's layers (per-layer inputs, shared K/V)."""
+    extras = quant and not moe  # the assistant, the HF directory and its .flyx files: the dense Q8 models'
     stamp = out / f"tiny_{stem}.stamp"
     assistant_dir = out / f"tiny_{stem}_assistant"
     made = [out / f"tiny_{stem}.gguf", out / f"golden_{stem}.json"]
     if extras:
-        made += [assistant_dir / "model.safetensors", out / f"tiny_{stem}_assistant.gguf", out / f"tiny_{stem}.flyx",
-                 out / f"tiny_{stem}_nvfp4.flyx"]
+        made += [assistant_dir / "model.safetensors", out / f"tiny_{stem}_assistant.gguf", out / f"tiny_{stem}.flyx"]
+        if not e:
+            made += [out / f"tiny_{stem}_nvfp4.flyx"]
     if stamp.exists() and stamp.read_text() == inputs_digest() and all(m.exists() for m in made):
         return
     import torch
     from transformers import Gemma4ForCausalLM, Gemma4TextConfig
 
     torch.set_num_threads(min(4, os.cpu_count() or 1))  # a tiny model's products: more threads only spin
+    nkv_full = NKV_SWA if e else NKV_FULL  # E2B's and E4B's global layers: the K/V heads of the others (v its own)
     torch.manual_seed(20261128)
     rng = np.random.default_rng(20261128)
     layers = len(SLIDING)
@@ -173,8 +185,9 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
         rope_parameters={"sliding_attention": {"rope_type": "default", "rope_theta": THETA_SWA},
                          "full_attention": {"rope_type": "proportional", "partial_rotary_factor": ROTARY,
                                             "rope_theta": THETA}},
-        final_logit_softcapping=SOFTCAP, rms_norm_eps=EPS, hidden_size_per_layer_input=0, attention_k_eq_v=True,
-        num_kv_shared_layers=0, enable_moe_block=moe, tie_word_embeddings=True, max_position_embeddings=131072,
+        final_logit_softcapping=SOFTCAP, rms_norm_eps=EPS, hidden_size_per_layer_input=PER_LAYER if e else 0,
+        vocab_size_per_layer_input=VOCAB, attention_k_eq_v=not e, num_kv_shared_layers=N_SHARED if e else 0,
+        use_double_wide_mlp=e, enable_moe_block=moe, tie_word_embeddings=True, max_position_embeddings=131072,
         pad_token_id=0, eos_token_id=1, bos_token_id=2,
         **({"num_experts": N_EXPERTS, "top_k_experts": TOP_K,
             "moe_intermediate_size": MOE_INTER if nvfp4 is None else 64} if moe else {}))
@@ -220,27 +233,43 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
     put("output_norm.weight", 3 + rnd((H,), 0.3), None, "model.norm.weight")
     rot = int(ROTARY * HD_FULL // 2)  # the global layers' turning pairs; llama.cpp's factors keep the others still
     tensors.append(("rope_freqs.weight", np.array([1.0] * rot + [1e30] * (HD_FULL // 2 - rot), np.float32), None))
+    L, P = len(SLIDING), PER_LAYER
+    if e:  # every layer's input of its own: a table of the tokens' and a projection of the embedded row
+        put("per_layer_token_embd.weight", rnd((VOCAB, L * P), 0.25), Q8, "model.embed_tokens_per_layer.weight")
+        put("per_layer_model_proj.weight", rnd((L * P, H), 1 / np.sqrt(H)), Q8,
+            "model.per_layer_model_projection.weight")
+        put("per_layer_proj_norm.weight", 1 + rnd((P,), 0.1), None, "model.per_layer_projection_norm.weight")
+    inters = []
     for i, sliding in enumerate(SLIDING):
         b, p = f"blk.{i}.", f"model.layers.{i}."
-        nkv, hd = (NKV_SWA, HD_SWA) if sliding else (NKV_FULL, HD_FULL)
+        nkv, hd = (NKV_SWA, HD_SWA) if sliding else (nkv_full, HD_FULL)
+        shared = e and i >= L - N_SHARED  # q and o alone: the K/V of the last layer of its kind before them
+        inter = INTER * (2 if shared else 1)  # use_double_wide_mlp
+        inters.append(inter)
         put(b + "attn_norm.weight", 1 + rnd((H,), 0.1), None, p + "input_layernorm.weight")
         put(b + "attn_q.weight", rnd((NH * hd, H), 1 / np.sqrt(H)), Q8, p + "self_attn.q_proj.weight")
-        put(b + "attn_k.weight", rnd((nkv * hd, H), 1 / np.sqrt(H)), Q8, p + "self_attn.k_proj.weight")
-        if sliding:  # the global layers' v is k's projection
+        if not shared:
+            put(b + "attn_k.weight", rnd((nkv * hd, H), 1 / np.sqrt(H)), Q8, p + "self_attn.k_proj.weight")
+        if (sliding or e) and not shared:  # the global layers' v is k's projection (but E2B's and E4B's)
             put(b + "attn_v.weight", rnd((nkv * hd, H), 1 / np.sqrt(H)), Q8, p + "self_attn.v_proj.weight")
         # q.k is unscaled over q and k normed per head: norm weights of 1 would make each head's softmax nearly an
         # argmax, where any rounding of an input may move which key it picks; these keep its logits a few apart
         put(b + "attn_q_norm.weight", rng.uniform(QK_LO, QK_HI, size=(hd,)).astype(np.float32), None,
             p + "self_attn.q_norm.weight")
-        put(b + "attn_k_norm.weight", rng.uniform(QK_LO, QK_HI, size=(hd,)).astype(np.float32), None,
-            p + "self_attn.k_norm.weight")
+        if not shared:
+            put(b + "attn_k_norm.weight", rng.uniform(QK_LO, QK_HI, size=(hd,)).astype(np.float32), None,
+                p + "self_attn.k_norm.weight")
         put(b + "attn_output.weight", rnd((H, NH * hd), 1 / np.sqrt(NH * hd)), Q8, p + "self_attn.o_proj.weight")
         put(b + "post_attention_norm.weight", 2 + rnd((H,), 0.2), None, p + "post_attention_layernorm.weight")
         put(b + "ffn_norm.weight", 1 + rnd((H,), 0.1), None, p + "pre_feedforward_layernorm.weight")
-        put(b + "ffn_gate.weight", rnd((INTER, H), 1 / np.sqrt(H)), Q8, p + "mlp.gate_proj.weight")
-        put(b + "ffn_up.weight", rnd((INTER, H), 1 / np.sqrt(H)), Q8, p + "mlp.up_proj.weight")
-        put(b + "ffn_down.weight", rnd((H, INTER), 1 / np.sqrt(INTER)), Q8, p + "mlp.down_proj.weight")
+        put(b + "ffn_gate.weight", rnd((inter, H), 1 / np.sqrt(H)), Q8, p + "mlp.gate_proj.weight")
+        put(b + "ffn_up.weight", rnd((inter, H), 1 / np.sqrt(H)), Q8, p + "mlp.up_proj.weight")
+        put(b + "ffn_down.weight", rnd((H, inter), 1 / np.sqrt(inter)), Q8, p + "mlp.down_proj.weight")
         put(b + "post_ffw_norm.weight", 2 + rnd((H,), 0.2), None, p + "post_feedforward_layernorm.weight")
+        if e:  # the layer's input of its own, gated by its residual, after the MLP
+            put(b + "inp_gate.weight", rnd((P, H), 1 / np.sqrt(H)), Q8, p + "per_layer_input_gate.weight")
+            put(b + "proj.weight", rnd((H, P), 1 / np.sqrt(P)), Q8, p + "per_layer_projection.weight")
+            put(b + "post_norm.weight", 1 + rnd((H,), 0.1), None, p + "post_per_layer_input_norm.weight")
         if moe:  # the experts beside the MLP, and the norms around both (llama.cpp's names)
             E, MI = N_EXPERTS, MOE_INTER if nvfp4 is None else 64  # NVFP4 blocks: 64 columns
             put(b + "post_ffw_norm_1.weight", 1 + rnd((H,), 0.1), None, p + "post_feedforward_layernorm_1.weight")
@@ -277,13 +306,16 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
     w.add_uint32(a + "block_count", layers)
     w.add_uint32(a + "context_length", 131072)
     w.add_uint32(a + "embedding_length", H)
-    w.add_uint32(a + "feed_forward_length", INTER)
+    if e:
+        w.add_array(a + "feed_forward_length", inters)
+    else:
+        w.add_uint32(a + "feed_forward_length", INTER)
     if moe:
         w.add_uint32(a + "expert_count", N_EXPERTS)
         w.add_uint32(a + "expert_used_count", TOP_K)
         w.add_uint32(a + "expert_feed_forward_length", MOE_INTER if nvfp4 is None else 64)
     w.add_uint32(a + "attention.head_count", NH)
-    w.add_array(a + "attention.head_count_kv", [NKV_SWA if s else NKV_FULL for s in SLIDING])
+    w.add_array(a + "attention.head_count_kv", [NKV_SWA if s else nkv_full for s in SLIDING])
     w.add_float32(a + "rope.freq_base", THETA)
     w.add_float32(a + "rope.freq_base_swa", THETA_SWA)
     w.add_float32(a + "attention.layer_norm_rms_epsilon", EPS)
@@ -291,8 +323,8 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
     w.add_uint32(a + "attention.value_length", HD_FULL)
     w.add_float32(a + "final_logit_softcapping", SOFTCAP)
     w.add_uint32(a + "attention.sliding_window", WINDOW)
-    w.add_uint32(a + "attention.shared_kv_layers", 0)
-    w.add_uint32(a + "embedding_length_per_layer_input", 0)
+    w.add_uint32(a + "attention.shared_kv_layers", N_SHARED if e else 0)
+    w.add_uint32(a + "embedding_length_per_layer_input", PER_LAYER if e else 0)
     w.add_array(a + "attention.sliding_window_pattern", list(SLIDING))
     w.add_uint32(a + "attention.key_length_swa", HD_SWA)
     w.add_uint32(a + "attention.value_length_swa", HD_SWA)
@@ -328,8 +360,9 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
         merge_pairs = [(bt[ord("t")], bt[ord("h")]), (bt[ord("h")], bt[ord("e")])]
         write_hf(out / f"hf_{stem}", cfg, sd, tokens, merge_pairs, SPECIALS)
         convert(str(out / f"hf_{stem}"), str(out / f"tiny_{stem}.flyx"), None, log=lambda *_: None)
-        write_nvfp4(out / f"hf_{stem}", out / f"hf_{stem}_nvfp4")
-        convert(str(out / f"hf_{stem}_nvfp4"), str(out / f"tiny_{stem}_nvfp4.flyx"), None, log=lambda *_: None)
+        if not e:
+            write_nvfp4(out / f"hf_{stem}", out / f"hf_{stem}_nvfp4")
+            convert(str(out / f"hf_{stem}_nvfp4"), str(out / f"tiny_{stem}_nvfp4.flyx"), None, log=lambda *_: None)
 
     # The same model with every linear's weights and input rounded to bf16, the coarsest an engine reads one (a
     # prefill pass's bf16 tensor cores, which take a float32 file's matrices in bf16): a case kept gives the same
@@ -382,7 +415,7 @@ def write(out: Path, quant: bool = True, stem: str = "gemma4", moe: bool = False
                 cases.append({"prompt": prompt, "tokens": tokens, "min_margin": margin})
     assert len(cases) == CASES, f"only {len(cases)} cases with a clear margin"
     if extras:
-        write_assistant(assistant_dir, model, cases, rng)
+        write_assistant(assistant_dir, model, cases, rng, clustered=e, nkv_full=nkv_full)
     (out / f"golden_{stem}.json").write_text(json.dumps({"eos": eos, "cases": cases}), encoding="utf-8")
     stamp.write_text(inputs_digest())
 
@@ -393,7 +426,7 @@ if __name__ == "__main__":
     write(Path(sys.argv[1]), quant=False, stem="gemma4_f32")
 
 
-def write_assistant(out: Path, target, cases, rng):
+def write_assistant(out: Path, target, cases, rng, clustered: bool = False, nkv_full: int = NKV_FULL):
     """The tiny model's assistant into out, and each case's drafts from it (case["drafts"]): its steps at the position
     after the prompt, each reading the target's K/V before it (a sliding layer's from WINDOW - 1 back), as flyx's
     drafts read them (backend_abi.h flyx_gemma4_mtp_block)."""
@@ -404,7 +437,7 @@ def write_assistant(out: Path, target, cases, rng):
     tcfg = Gemma4TextConfig(
         vocab_size=VOCAB, hidden_size=A_H, intermediate_size=A_INTER, num_hidden_layers=len(A_LAYERS),
         num_attention_heads=NH, num_key_value_heads=NKV_SWA, head_dim=HD_SWA, global_head_dim=HD_FULL,
-        num_global_key_value_heads=NKV_FULL, sliding_window=WINDOW,
+        num_global_key_value_heads=nkv_full, sliding_window=WINDOW,
         layer_types=["sliding_attention" if s else "full_attention" for s in A_LAYERS],
         rope_parameters={"sliding_attention": {"rope_type": "default", "rope_theta": THETA_SWA},
                          "full_attention": {"rope_type": "proportional", "partial_rotary_factor": ROTARY,
@@ -413,7 +446,10 @@ def write_assistant(out: Path, target, cases, rng):
         attention_k_eq_v=True,
         num_kv_shared_layers=len(A_LAYERS), enable_moe_block=False, tie_word_embeddings=True,
         max_position_embeddings=131072, pad_token_id=0, eos_token_id=1, bos_token_id=2)
-    cfg = Gemma4AssistantConfig(text_config=tcfg, backbone_hidden_size=H, use_ordered_embeddings=False)
+    # clustered: E4B's head, the tokens of its CENTROID_TOP best of CENTROIDS clusters scored (a clustered head's
+    # GGUF, as llama.cpp's converter writes one, holds no clusters: every token scored)
+    cfg = Gemma4AssistantConfig(text_config=tcfg, backbone_hidden_size=H, use_ordered_embeddings=clustered,
+                                num_centroids=CENTROIDS, centroid_intermediate_top_k=CENTROID_TOP)
     cfg.architectures = ["Gemma4AssistantForCausalLM"]
     cfg._attn_implementation = "eager"
     cfg.text_config._attn_implementation = "eager"
@@ -437,14 +473,17 @@ def write_assistant(out: Path, target, cases, rng):
             v = 1 + rnd(shape, 0.1)
         elif k == "model.embed_tokens.weight":
             v = rnd(shape, 0.25)
+        elif k.endswith("token_ordering"):  # each cluster's tokens: a permutation of the vocabulary
+            sd[k] = torch.from_numpy(rng.permutation(VOCAB).astype(np.int64))
+            continue
         else:  # a linear [out, in]
             v = rnd(shape, 1 / np.sqrt(shape[1]))
         sd[k] = v.to(torch.bfloat16)  # as the checkpoints hold them
     out.mkdir(parents=True, exist_ok=True)
     save_file(sd, str(out / "model.safetensors"), metadata={"format": "pt"})
     cfg.to_json_file(str(out / "config.json"), use_diff=False)  # every field, as the checkpoints list them
-    write_assistant_gguf(out.parent / (out.name + ".gguf"), {k: v.float().numpy() for k, v in sd.items()})
-    full = {k: v.double() for k, v in sd.items()}
+    write_assistant_gguf(out.parent / (out.name + ".gguf"), {k: v.float().numpy() for k, v in sd.items()}, nkv_full)
+    full = {k: v if k.endswith("token_ordering") else v.double() for k, v in sd.items()}
     full["lm_head.weight"] = full["model.embed_tokens.weight"]
     model.load_state_dict(full)
     model = model.double()
@@ -469,17 +508,22 @@ def write_assistant(out: Path, target, cases, rng):
                                 attention_mask={"full_attention": full_mask, "sliding_attention": swa_mask},
                                 use_cache=False)
                 g = o.last_hidden_state
-                logits = model.lm_head(g)[0, -1]
+                # its head as its forward runs it: the tokens of its best clusters where clustered
+                logits = (model.masked_embedding(g, model.lm_head.weight) if clustered else model.lm_head(g))[0, -1]
                 top = torch.topk(logits, 2).values
                 if float(top[0] - top[1]) < MIN_DRAFT_MARGIN:
                     break
+                if clustered:
+                    c = torch.sort(model.masked_embedding.centroids(g)[0, -1], descending=True).values
+                    if float(c[CENTROID_TOP - 1] - c[CENTROID_TOP]) < MIN_CLUSTER_MARGIN:
+                        break
                 tok = int(torch.argmax(logits))
                 drafts.append(tok)
                 h = model.post_projection(g)
             case["drafts"] = drafts
 
 
-def write_assistant_gguf(path: Path, w):
+def write_assistant_gguf(path: Path, w, nkv_full: int = NKV_FULL):
     """The assistant's tensors w (transformers' names, float32) as llama.cpp's Gemma4AssistantModel writes them."""
     a = "gemma4-assistant."
     g = gguf.GGUFWriter(str(path), "gemma4-assistant")
@@ -489,7 +533,7 @@ def write_assistant_gguf(path: Path, w):
     g.add_uint32(a + "embedding_length", A_H)
     g.add_uint32(a + "feed_forward_length", A_INTER)
     g.add_uint32(a + "attention.head_count", NH)
-    g.add_array(a + "attention.head_count_kv", [NKV_SWA if s else NKV_FULL for s in A_LAYERS])
+    g.add_array(a + "attention.head_count_kv", [NKV_SWA if s else nkv_full for s in A_LAYERS])
     g.add_float32(a + "rope.freq_base", THETA)
     g.add_float32(a + "rope.freq_base_swa", THETA_SWA)
     g.add_float32(a + "attention.layer_norm_rms_epsilon", EPS)

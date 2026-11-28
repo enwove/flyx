@@ -7,6 +7,7 @@
 // kinds, not models.
 #include "backends/cuda/loader/loader.h"
 #include "ops/rope/ref.h"
+#include "ops/sampling/sampling.h"
 
 #include <algorithm>
 #include <cmath>
@@ -432,7 +433,8 @@ GdnBlock gdn(WeightLoader& L, const flyx_gdn_block& b, const StateMap& sm, Adapt
   return g;
 }
 
-MlpBlock mlp(WeightLoader& L, const flyx_mlp_block& b, AdapterCarve& carve, DraftQuant dq = DraftQuant::kNone) {
+MlpBlock mlp(WeightLoader& L, const flyx_mlp_block& b, AdapterCarve& carve, DraftQuant dq = DraftQuant::kNone,
+             const flyx_model_desc* d = nullptr) {
   MlpBlock f;
   f.hidden = b.hidden;
   f.inter = b.inter;
@@ -447,6 +449,19 @@ MlpBlock mlp(WeightLoader& L, const flyx_mlp_block& b, AdapterCarve& carve, Draf
   if (b.has_out_scale) {
     expect(L.t(b.out_scale)->ndim >= 1 && L.t(b.out_scale)->shape[0] == 1, "an MLP block's out scale is not [1]");
     f.out_scale = L.vec(b.out_scale);
+  }
+  if (b.has_per_layer) {  // Gemma 4's E2B / E4B: its layer's input of its own
+    expect(d && b.per_layer_input >= 0 && b.per_layer_input < d->n_blocks &&
+               d->blocks[b.per_layer_input].kind == FLYX_BLOCK_PER_LAYER_INPUT && b.has_post_norm && dq == DraftQuant::kNone,
+           "an MLP block's per-layer stage without a per-layer input block (or a norm after down)");
+    const auto& q = d->blocks[b.per_layer_input].per_layer_input;
+    expect(b.per_layer_index >= 0 && b.per_layer_index < q.layers && q.hidden == b.hidden,
+           "an MLP block's per-layer slice outside its per-layer inputs");
+    f.per_layer = b.per_layer_index;
+    f.per_layer_dim = q.dim;
+    f.w_pl_gate = L.lin(b.per_layer_gate);
+    f.w_pl_proj = L.lin(b.per_layer_proj);
+    f.pl_norm = norm(L, b.per_layer_norm);
   }
   expect(f.plain() || (!b.lora[0].rank && !b.lora[1].rank && !b.lora[2].rank),
          "adapters on an MLP block of another activation, a post-norm or an out scale");
@@ -1399,7 +1414,27 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
       }
       case FLYX_BLOCK_ATTN: put_block(m, i, attention(L, b.attn, sm, carve)); break;
       case FLYX_BLOCK_GDN: put_block(m, i, gdn(L, b.gdn, sm, carve)); break;
-      case FLYX_BLOCK_MLP: put_block(m, i, mlp(L, b.mlp, carve)); break;
+      case FLYX_BLOCK_MLP: put_block(m, i, mlp(L, b.mlp, carve, DraftQuant::kNone, &d)); break;
+      case FLYX_BLOCK_PER_LAYER_INPUT: {  // Gemma 4's E2B / E4B
+        const auto& q = b.per_layer_input;
+        PerLayerInputBlock p;
+        p.layers = q.layers;
+        p.dim = q.dim;
+        p.table.hidden = q.layers * q.dim;
+        p.table.vocab = q.vocab;
+        // its rows gathered as an embedding's: in host memory under embed=host, as the embedding (no head reads it)
+        const bool host = m->opt.embed == 1;
+        if (L.packable(q.table)) p.table.blk = host ? L.pack_host(q.table) : L.pack(q.table);
+        else p.table.table = host ? L.mat_host(q.table) : L.mat(q.table);
+        p.w_proj = L.lin(q.proj);
+        p.norm = norm(L, q.norm);
+        p.table_scale = q.table_scale;
+        p.proj_scale = q.proj_scale;
+        p.mix = q.mix;
+        expect(q.dim > 0 && q.layers > 0 && q.hidden == d.hidden, "a per-layer input block's dimensions");
+        put_block(m, i, std::move(p));
+        break;
+      }
       case FLYX_BLOCK_REL_ATTN: put_block(m, i, rel_attn(L, b.rel_attn, sm)); break;
       case FLYX_BLOCK_MOE: put_block(m, i, moe(L, b.moe, sm)); break;
       case FLYX_BLOCK_DV: {
@@ -1510,7 +1545,29 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         t.target_head = ref(i, g.target_head, FLYX_BLOCK_HEAD, "head");
         t.first_layer = g.first_layer;
         t.layers = g.layers;
-        expect(g.centroids < 0, "Gemma 4's assistant with a clustered head (not in this backend yet)");
+        if (g.centroids >= 0) {  // its clustered head (E2B / E4B)
+          const int V = g.vocab;
+          expect(g.n_centroids > 0 && V % g.n_centroids == 0 && g.top_k > 0 && g.top_k <= std::min(g.n_centroids, kWalkMax) &&
+                     g.n_centroids + 2 * (g.top_k * (V / g.n_centroids) + g.top_k) + ops::kMtpCands <=
+                         std::max(V, kDraftPickFloats),
+                 "Gemma 4's assistant: clusters that do not split its vocabulary, or more than its pick's room");
+          t.centroids = L.lin(g.centroids);
+          t.n_centroids = g.n_centroids;
+          t.top_k = g.top_k;
+          const flyx_tensor_view* o = L.t(g.token_order);
+          expect(o && (o->dtype == FLYX_DT_I32 || o->dtype == FLYX_DT_I64) && WeightLoader::numel(o) == size_t(V),
+                 "Gemma 4's assistant: its token order is not one int32 or int64 a token");
+          std::vector<int> order(static_cast<size_t>(V));
+          for (size_t j = 0; j < order.size(); ++j) {
+            int64_t v = 0;
+            if (o->dtype == FLYX_DT_I32) v = static_cast<const int32_t*>(o->data)[j];
+            else std::memcpy(&v, static_cast<const uint8_t*>(o->data) + 8 * j, 8);
+            expect(v >= 0 && v < V, "Gemma 4's assistant: its token order names a token outside its vocabulary");
+            order[j] = int(v);
+          }
+          t.token_order = m->alloc<int>(order.size());
+          CK(cudaMemcpy(t.token_order, order.data(), order.size() * sizeof(int), cudaMemcpyHostToDevice));
+        }
         expect(g.target_hidden == d.hidden && d.blocks[t.head].head.hidden == g.hidden &&
                    d.blocks[t.head].head.vocab == g.vocab,
                "Gemma 4's assistant: its widths are not its head's and its target's");

@@ -22,6 +22,7 @@ std::string node_name(const flyx_node& n, const Block* b) {
       if (std::holds_alternative<VitMlpBlock>(*b)) return "vit mlp";
       if (std::holds_alternative<VisionMergeBlock>(*b)) return "vision merge";
       if (std::holds_alternative<MoeBlock>(*b)) return "moe";
+      if (std::holds_alternative<PerLayerInputBlock>(*b)) return "per-layer inputs";
       return "head + choose";
     case FLYX_NODE_TAP: return "tap";
     case FLYX_NODE_DRAFT:
@@ -226,7 +227,7 @@ const Block* block_of(const flyx_bmodel* m, const flyx_node& n, std::string* err
              std::holds_alternative<HeadBlock>(*b) || std::holds_alternative<VisionStemBlock>(*b) ||
              std::holds_alternative<VitAttnBlock>(*b) || std::holds_alternative<VitMlpBlock>(*b) ||
              std::holds_alternative<VisionMergeBlock>(*b) || std::holds_alternative<RelAttnBlock>(*b) ||
-             std::holds_alternative<MoeBlock>(*b);
+             std::holds_alternative<MoeBlock>(*b) || std::holds_alternative<PerLayerInputBlock>(*b);
       break;
     case FLYX_NODE_TAP: {
       if (const auto* d = std::get_if<DFlashBlock>(b)) fits = n.arg0 >= 0 && n.arg0 < d->n_taps;
@@ -492,6 +493,8 @@ void run_node(const Pass& ps, const flyx_node& n, const Block* b) {
             if (residual16_pass(ps)) round_rows_bf16(rv.b.x, e->hidden, e->hidden, ps.rows, st);
           }
         }
+      } else if (const auto* q = std::get_if<PerLayerInputBlock>(b)) {
+        per_layer_input_layer(ps, *q);
       } else if (const auto* g = std::get_if<GdnBlock>(b)) {
         gdn_layer(ps, *g);
       } else if (const auto* a = std::get_if<AttnBlock>(b)) {

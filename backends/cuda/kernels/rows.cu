@@ -324,6 +324,35 @@ __global__ void __launch_bounds__(512, 2) k_norm_add(float* x, int ldx, const fl
     put_one(i, rms_value<true>(yr[i], inv, offset, w[i]));
 }
 
+// Gemma 4's per-layer inputs (E2B, E4B): pli = (rmsnorm(y) (offset + w) + pli * table_scale) * mix over each of a
+// row's dim-wide slices (blockIdx.y), y the scaled projection of the row, pli its table row.  A block of 512 a slice,
+// rms_inv's order: a row's bits whatever the rows.
+__global__ void __launch_bounds__(512, 2) k_per_layer_inputs(const float* y, int ldy, float* pli, int ldp, int dim,
+                                                             const float* w, float offset, float eps,
+                                                             float table_scale, float mix) {
+  pdl_trigger();
+  const float* yr = y + size_t(blockIdx.x) * ldy + size_t(blockIdx.y) * dim;
+  float* pr = pli + size_t(blockIdx.x) * ldp + size_t(blockIdx.y) * dim;
+  float yv[kNormCache], wv[kNormCache];
+  const float inv = rms_inv(yr, w, dim, eps, yv, wv);
+  auto put = [&](int i, float v) { pr[i] = __fmul_rn(__fadd_rn(v, __fmul_rn(pr[i], table_scale)), mix); };
+#pragma unroll
+  for (int u = 0; u < kNormCache; ++u) {
+    const int i = threadIdx.x + u * 512;
+    if (i < dim) put(i, rms_value<true>(yv[u], inv, offset, wv[u]));
+  }
+  for (int i = threadIdx.x + kNormCache * 512; i < dim; i += 512) put(i, rms_value<true>(yr[i], inv, offset, w[i]));
+}
+
+// g = act(g) * p, dim values a row (Gemma 4's per-layer gate; act flyx_mlp_act)
+__global__ void k_per_layer_gate(float* g, int ldg, const float* p, int ldp, int dim, int act) {
+  pdl_trigger();
+  float* gr = g + size_t(blockIdx.y) * ldg;
+  const float* pr = p + size_t(blockIdx.y) * ldp;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < dim; i += gridDim.x * blockDim.x)
+    gr[i] = __fmul_rn(glu_act(act, gr[i]), pr[i]);
+}
+
 __global__ void k_scale_rows(float* x, int ld, int n, float s) {
   pdl_trigger();
   float* r = x + size_t(blockIdx.y) * ld;
@@ -409,6 +438,16 @@ void swiglu(const float* gu, int ld, int I, float* out, int ld_out, int rows, cu
 void norm_add(float* x, int ldx, const float* y, int ldy, const float* w, float offset, float eps,
               const float* scale, int rows, int n, cudaStream_t st) {
   if (rows > 0 && n > 0) k_norm_add<<<rows, 512, 0, st>>>(x, ldx, y, ldy, w, offset, eps, scale, n);
+}
+
+void per_layer_inputs(const float* y, int ldy, float* pli, int ldp, int layers, int dim, const float* w, float offset,
+                      float eps, float table_scale, float mix, int rows, cudaStream_t st) {
+  if (rows > 0 && layers > 0 && dim > 0)
+    k_per_layer_inputs<<<dim3(rows, layers), 512, 0, st>>>(y, ldy, pli, ldp, dim, w, offset, eps, table_scale, mix);
+}
+
+void per_layer_gate(float* g, int ldg, const float* p, int ldp, int dim, int act, int rows, cudaStream_t st) {
+  if (rows > 0 && dim > 0) k_per_layer_gate<<<dim3((dim + 255) / 256, rows), 256, 0, st>>>(g, ldg, p, ldp, dim, act);
 }
 
 void scale_rows(float* x, int ld, int n, float s, int rows, cudaStream_t st) {

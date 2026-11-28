@@ -322,7 +322,8 @@ typedef enum {
   FLYX_BLOCK_DSPINE = 19,       /* ABI 51: DSpine, a block drafter whose rows pass a code bridge's message on */
   FLYX_BLOCK_DSPINE_LAYER = 20, /* ABI 51: a DSpine layer: a Qwen3 layer, then its bridge's read and write */
   FLYX_BLOCK_EAGLE4 = 21,       /* ABI 55: EAGLE-4, a one-layer drafter run a step a draft from target taps */
-  FLYX_BLOCK_GEMMA4_MTP = 22    /* ABI 58: Gemma 4's assistant, layers that read the target's K/V, a step a draft */
+  FLYX_BLOCK_GEMMA4_MTP = 22,   /* ABI 58: Gemma 4's assistant, layers that read the target's K/V, a step a draft */
+  FLYX_BLOCK_PER_LAYER_INPUT = 23 /* ABI 58: every layer's input of its own (Gemma 4's E2B / E4B) */
 } flyx_block_kind;
 
 /* Token rows -> residual rows: x = table[token] * scale, optionally followed by RMSNorm (has_norm != 0, ABI 45). */
@@ -334,6 +335,18 @@ typedef struct {
   float scale;                         /* ABI 58: each row times scale (Gemma's sqrt(hidden)); 0 = 1 */
   int32_t pad0;
 } flyx_embed_block;
+
+/* ABI 58 (Gemma 4's E2B / E4B): an input of its own for every layer, from the pass's tokens and its embedded rows x
+ * (run after the embedding): pli[r] = (norm(proj(x[r]) * proj_scale) + table[token[r]] * table_scale) * mix, layers
+ * times dim values a row, each layer's dim-wide slice normed alone.  An MLP block's per-layer stage reads its slice. */
+typedef struct {
+  int32_t hidden, layers, dim, vocab;
+  int32_t table;                       /* [vocab, layers * dim] */
+  int32_t proj;                        /* [layers * dim, hidden] */
+  flyx_norm norm;                      /* [dim]: every layer's slice */
+  float table_scale, proj_scale, mix;
+  int32_t pad0;
+} flyx_per_layer_input_block;
 
 /* Rotary scaling of an attention block (ABI 56).  PLAIN: theta^(-2i / rot_dim).  YARN (Peng et al., "YaRN", 2023,
  * as gpt-oss defines it): each pair's frequency between theta's (extrapolated) and theta's / factor (interpolated)
@@ -439,6 +452,13 @@ typedef struct {
   int32_t has_post_norm;
   flyx_norm post_norm;
   int32_t has_out_scale, out_scale;
+  /* ABI 58 (Gemma 4's E2B / E4B): has_per_layer 1: after the residual add, before out_scale,
+   * x += per_layer_norm(per_layer_proj(act(per_layer_gate(x)) * pli[per_layer_index])), pli the pass's
+   * FLYX_BLOCK_PER_LAYER_INPUT rows (block per_layer_input), act this block's. */
+  int32_t has_per_layer, per_layer_input, per_layer_index;
+  int32_t per_layer_gate, per_layer_proj; /* [dim, hidden], [hidden, dim] */
+  int32_t pad1;
+  flyx_norm per_layer_norm;
 } flyx_mlp_block;
 
 /* logits = w(norm(x)), optional softcapping (cap * tanh(logit / cap) when softcap > 0, ABI 45),
@@ -896,6 +916,7 @@ typedef struct {
     flyx_dspine_layer_block dspine_layer; /* ABI 51 */
     flyx_eagle4_block eagle4;             /* ABI 55 */
     flyx_gemma4_mtp_block gemma4_mtp;     /* ABI 58 */
+    flyx_per_layer_input_block per_layer_input; /* ABI 58 */
   };
 } flyx_block;
 

@@ -260,6 +260,7 @@ struct RefSeq {
   std::unordered_map<int, const float*> embed_override;
   const int32_t* pos_3d = nullptr;
   Vec x, feats;
+  Vec pli;  // ABI 58: the pass's per-layer inputs (FLYX_BLOCK_PER_LAYER_INPUT), rows x layers x dim
   // Pass-local depth-residual and looped-pass scratch (ABI 45).
   std::vector<Vec> res_bank, prelude_blocks, loop_bank;
   Vec prelude_cur, loop_bank_out, loop_msg;
@@ -313,6 +314,29 @@ void embed_rows(RefSeq* s, const flyx_embed_block& e, const int32_t* ids, int n,
       for (int c = 0; c < H; ++c) row[c] = load(E, size_t(ids[r]) * H + c) * scale;
       if (e.has_norm) norm(s->m, e.norm, row, H, row);
     }
+  }
+}
+
+// Every layer's input of its own (ABI 58, Gemma 4's E2B / E4B): pli[r] = (norm(proj(x[r]) * proj_scale)
+// + table[token[r]] * table_scale) * mix, each layer's dim-wide slice normed alone.
+void per_layer_inputs(RefSeq* s, const flyx_per_layer_input_block& B) {
+  const auto* M = s->m;
+  const int H = B.hidden, P = B.dim, W = B.layers * B.dim;
+  const auto* T = M->w(B.table);
+  s->pli.assign(size_t(s->rows) * size_t(W), 0.0);
+  Vec y(static_cast<size_t>(W));
+  for (int r = 0; r < s->rows; ++r) {
+    const int t = s->tok[size_t(r)];
+    if (t < 0 || t >= B.vocab) throw std::runtime_error("per-layer inputs: a token outside their table");
+    lin(M, B.proj, &s->x[size_t(r) * H], 1, H, W, y.data(), s->rows);
+    double* out = &s->pli[size_t(r) * size_t(W)];
+    for (int l = 0; l < B.layers; ++l) {
+      double* yl = &y[size_t(l) * P];
+      for (int k = 0; k < P; ++k) yl[k] *= double(B.proj_scale);
+      norm(M, B.norm, yl, P, yl);
+    }
+    for (int j = 0; j < W; ++j)
+      out[j] = (y[size_t(j)] + load(T, size_t(t) * W + size_t(j)) * double(B.table_scale)) * double(B.mix);
   }
 }
 
@@ -471,10 +495,26 @@ void attn_mixer(RefSeq* s, const flyx_attn_block& B) {
   }
 }
 
-// x += down(act(gate(h)) * up(h)), h = norm(x), for R rows of x; then x *= out_scale where the block has one.
-void mlp(const RefModel* M, const flyx_mlp_block& B, double* x, int R) {
+// x += down(act(gate(h)) * up(h)), h = norm(x), for R rows of x; then, with a per-layer stage, x += per_layer_norm(
+// per_layer_proj(act(per_layer_gate(x)) * pli)) (pli: R rows of the pass's per-layer inputs); then x *= out_scale where
+// the block has one.
+void mlp(const RefModel* M, const flyx_mlp_block& B, double* x, int R, const Vec* pli = nullptr) {
   const int H = B.hidden, I = B.inter;
   Vec h(H), g(I), u(I), y(H);
+  auto act = [&](double v) {
+    if (B.act == FLYX_MLP_GELU_TANH) return flyx::ops::gelu_tanh(v);
+    if (B.act == FLYX_MLP_SILU) return silu(v);
+    throw std::runtime_error("unknown MLP activation");
+  };
+  int P = 0, W = 0;
+  if (B.has_per_layer) {
+    const auto& q = M->block(B.per_layer_input).per_layer_input;
+    P = q.dim;
+    W = q.layers * q.dim;
+    if (!pli || pli->size() < size_t(R) * size_t(W) || B.per_layer_index < 0 || B.per_layer_index >= q.layers)
+      throw std::runtime_error("an MLP block's per-layer stage without the pass's per-layer inputs");
+  }
+  Vec pg(static_cast<size_t>(P));
   for (int r = 0; r < R; ++r) {
     double* xr = &x[size_t(r) * H];
     norm(M, B.norm, xr, H, h.data());
@@ -482,12 +522,7 @@ void mlp(const RefModel* M, const flyx_mlp_block& B, double* x, int R) {
     lin(M, B.up, h.data(), 1, H, I, u.data(), R);
     lora(M, B.lora[0], h.data(), 1, H, I, g.data());
     lora(M, B.lora[1], h.data(), 1, H, I, u.data());
-    if (B.act == FLYX_MLP_GELU_TANH)
-      for (int i = 0; i < I; ++i) g[i] = flyx::ops::gelu_tanh(g[i]) * u[i];
-    else if (B.act == FLYX_MLP_SILU)
-      for (int i = 0; i < I; ++i) g[i] = silu(g[i]) * u[i];
-    else
-      throw std::runtime_error("unknown MLP activation");
+    for (int i = 0; i < I; ++i) g[i] = act(g[i]) * u[i];
     // NVFP4 inputs in a pass: the engine's gate|up GEMM leaves its SwiGLU rows in bf16 (as vLLM's and SGLang's)
     if (R > FLYX_MAX_ROWS && M->a4.count(M->w(B.down)))
       for (int i = 0; i < I; ++i) g[i] = flyx::ops::round_bf16(g[i]);
@@ -495,6 +530,14 @@ void mlp(const RefModel* M, const flyx_mlp_block& B, double* x, int R) {
     lora(M, B.lora[2], g.data(), 1, I, H, y.data());
     if (B.has_post_norm) norm(M, B.post_norm, y.data(), H, y.data());
     for (int c = 0; c < H; ++c) xr[c] = residual_add(M, R, xr[c], y[c]);
+    if (B.has_per_layer) {
+      const double* pr = &(*pli)[size_t(r) * size_t(W) + size_t(B.per_layer_index) * size_t(P)];
+      lin(M, B.per_layer_gate, xr, 1, H, P, pg.data(), R);
+      for (int k = 0; k < P; ++k) pg[size_t(k)] = act(pg[size_t(k)]) * pr[k];
+      lin(M, B.per_layer_proj, pg.data(), 1, P, H, y.data(), R);
+      norm(M, B.per_layer_norm, y.data(), H, y.data());
+      for (int c = 0; c < H; ++c) xr[c] = residual_add(M, R, xr[c], y[c]);
+    }
     if (B.has_out_scale) {
       const double sc = M->vec(B.out_scale)[0];
       for (int c = 0; c < H; ++c) xr[c] = residual_add(M, R, xr[c] * sc, 0.0);
@@ -1677,6 +1720,7 @@ const char* node_label(const flyx_node& n, const flyx_block* b, int phase) {
         case FLYX_BLOCK_MLP: return pre ? "prefill mlp" : "round mlp";
         case FLYX_BLOCK_REL_ATTN: return pre ? "prefill rel_attn" : "round rel_attn";
         case FLYX_BLOCK_MOE: return pre ? "prefill moe" : "round moe";
+        case FLYX_BLOCK_PER_LAYER_INPUT: return pre ? "prefill per-layer inputs" : "round per-layer inputs";
         case FLYX_BLOCK_HEAD: return pre ? "prefill head" : "round head";
         default: return "run";
       }
@@ -1721,7 +1765,8 @@ void run_nodes(RefPlan* p, RefSeq* s) {
             break;
           case FLYX_BLOCK_GDN: gdn_mixer(s, b->gdn, p->phase == FLYX_PHASE_ROUND); break;
           case FLYX_BLOCK_ATTN: attn_mixer(s, b->attn); break;
-          case FLYX_BLOCK_MLP: mlp(M, b->mlp, s->x.data(), s->rows); break;
+          case FLYX_BLOCK_MLP: mlp(M, b->mlp, s->x.data(), s->rows, &s->pli); break;
+          case FLYX_BLOCK_PER_LAYER_INPUT: per_layer_inputs(s, b->per_layer_input); break;
           case FLYX_BLOCK_REL_ATTN: rel_attn_mixer(s, b->rel_attn, p->phase == FLYX_PHASE_ROUND); break;
           case FLYX_BLOCK_MOE: moe_ffn(s, b->moe, p->phase == FLYX_PHASE_ROUND); break;
           case FLYX_BLOCK_HEAD:
@@ -1963,7 +2008,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       const flyx_block& b = desc->blocks[i];
       const int k = b.kind;
       // DV's blocks (ABI 42) are taken and never run: such a model decodes here as without DV (lower).
-      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_GEMMA4_MTP)
+      if (k < FLYX_BLOCK_EMBED || k > FLYX_BLOCK_PER_LAYER_INPUT)
         throw std::runtime_error("block kind " + std::to_string(k) + ": not implemented by cpu_ref");
       if (k == FLYX_BLOCK_ATTN && b.attn.kv_shared && (b.attn.k >= 0 || b.attn.v >= 0 || b.attn.v_from_k))
         throw std::runtime_error("an attention block reading another's K/V with a k or v projection of its own");

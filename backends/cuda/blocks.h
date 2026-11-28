@@ -149,7 +149,24 @@ struct MlpBlock {
   int act = 0;
   Norm post_norm;
   const float* out_scale = nullptr;
-  bool plain() const { return act == 0 && !post_norm.w && !out_scale; }  // SwiGLU added to the residual as it is
+  // Gemma 4's E2B / E4B (ABI 58): after the residual add, x += pl_norm(w_pl_proj(act(w_pl_gate(x)) * pli)), pli
+  // slice per_layer (per_layer_dim wide) of the pass's per-layer inputs (RowBufs::pli; per_layer < 0: none)
+  int per_layer = -1, per_layer_dim = 0;
+  Lin w_pl_gate, w_pl_proj;
+  Norm pl_norm;
+  bool plain() const { return act == 0 && !post_norm.w && !out_scale && per_layer < 0; }  // SwiGLU added as it is
+};
+
+// Every layer's input of its own (ABI 58, Gemma 4's E2B / E4B), into RowBufs::pli: its table's rows (as an
+// embedding's table: bf16 or packed GGML blocks, on the GPU or in host memory), the projection of the embedded rows,
+// each layer's slice normed alone.
+struct PerLayerInputBlock {
+  int layers = 0, dim = 0;
+  EmbedBlock table;  // [vocab, layers * dim]
+  Lin w_proj;        // [layers * dim, hidden]
+  Norm norm;         // [dim]
+  float table_scale = 1.f, proj_scale = 1.f, mix = 1.f;
+  int width() const { return layers * dim; }
 };
 
 // Final norm -> logits -> the token choice per row.
@@ -204,6 +221,11 @@ struct Gemma4MtpBlock {
   int embed = -1, head = -1, target_head = -1;  // blocks: the target's embedding, its own head, the target's head
   int first_layer = -1, layers = 0;
   Lin pre_proj, post_proj;                      // [hidden, 2 target_hidden], [target_hidden, hidden]
+  // its clustered head (E2B / E4B; n_centroids 0: every token scored): the centroids' logits, then the tokens of the
+  // top_k best clusters (token_order: vocab / n_centroids a cluster, int32 on the device) scored by its head
+  Lin centroids;
+  int* token_order = nullptr;
+  int n_centroids = 0, top_k = 0;
 };
 
 // DFlash2: a block of `block` rows (the anchor, then mask tokens) through its
@@ -496,7 +518,8 @@ struct DSparkBlock {
 
 using Block = std::variant<EmbedBlock, AttnBlock, GdnBlock, MlpBlock, HeadBlock, MtpBlock, DFlashBlock, DFlashLayer,
                            DvBlock, DvLayer, VisionStemBlock, VitAttnBlock, VitMlpBlock, VisionMergeBlock,
-                           RelAttnBlock, MoeBlock, DSparkBlock, DSparkLayer, Eagle4Block, Gemma4MtpBlock>;
+                           RelAttnBlock, MoeBlock, DSparkBlock, DSparkLayer, Eagle4Block, Gemma4MtpBlock,
+                           PerLayerInputBlock>;
 
 // ---- a sequence's state, as the table declares it -------------------------------------------
 struct KvBuf {
