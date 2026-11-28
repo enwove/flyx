@@ -704,6 +704,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
       log::info("flyx: %d NVFP4 weights take bf16 inputs on this GPU (no FP4 tensor cores)", nvfp4);
   }
   eos_ = file_.eos_ids();
+  model_max_new_ = file_.max_new_tokens();
 
   const bool orig_has_vision = model_->vision() != nullptr;
   const std::string orig_drafters_str = model_drafters_str(*model_);

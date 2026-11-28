@@ -423,6 +423,39 @@ void test_round_costs_learned(const char* model, const flyx_backend_api* cpu) {
         "two generations at once: no round's cost learned");
 }
 
+// A request naming no limit (max_new_tokens 0): the engine's default (EngineOptions::max_new_tokens, serve's
+// --max-tokens), else the end of the context; one that names a limit keeps it.
+void test_default_max_new_tokens(const char* model, const flyx_backend_api* cpu) {
+  g_cpu = cpu;
+  flyx_test_delegate(cpu);
+  auto run = [&](int engine_default, int asked, int* got) {
+    EngineOptions eo;
+    eo.backend = "test-host-kv";
+    eo.max_ctx = 96;
+    eo.speculative = false;
+    eo.max_new_tokens = engine_default;
+    Engine engine;
+    std::string err;
+    if (!engine.load(model, eo, &err)) return check(false, "load engine for the default reply limit: " + err), false;
+    Session s(&engine);
+    if (!s.init(&err)) return check(false, "session init: " + err), false;
+    GenerateRequest rq;
+    rq.prompt = engine.tokenizer().encode("one two three");
+    rq.max_new_tokens = asked;
+    rq.ignore_eos = true;
+    GenerateResult res;
+    if (generate(s, rq, [](std::string_view, const int32_t*, int) { return true; }, &res, &err) != 0)
+      return check(false, "generate: " + err), false;
+    *got = res.usage.new_tokens;
+    return true;
+  };
+  int got = 0;
+  if (run(7, 0, &got)) check(got == 7, "no limit asked: the engine's default, 7 tokens (" + std::to_string(got) + ")");
+  if (run(7, 3, &got)) check(got == 3, "a limit asked: its own, 3 tokens (" + std::to_string(got) + ")");
+  if (run(0, 0, &got))
+    check(got > 7 && got <= 96, "no limit anywhere: up to the context's end (" + std::to_string(got) + " tokens)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -445,5 +478,6 @@ int main(int argc, char** argv) {
   test_prepare_failure_resets_session(argv[1], cpu);
   test_empty_history_text_tokenize(argv[1], cpu);
   test_round_costs_learned(argv[1], cpu);
+  test_default_max_new_tokens(argv[1], cpu);
   return flyx::test::finish("generation_test");
 }

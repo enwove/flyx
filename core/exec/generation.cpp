@@ -118,7 +118,9 @@ bool Generation::start() {
   if (!req_.ignore_eos)
     for (int32_t id : e_->eos()) add_stop(id);
   for (int32_t id : req_.stop_tokens) add_stop(id);
-  max_new_ = req_.max_new_tokens > 0 ? req_.max_new_tokens : max_ctx;
+  // A request naming no limit takes the engine's (serve --max-tokens, the model's own), else the context's end.
+  const int limit = req_.max_new_tokens > 0 ? req_.max_new_tokens : e_->default_max_new_tokens();
+  max_new_ = limit > 0 ? limit : max_ctx;
   g_.limit = static_cast<int32_t>(std::min<long long>(static_cast<long long>(n_) + max_new_ - 1, max_ctx));
   // A grammar: the first token is chosen under its mask (nothing to undo
   // before it); later tokens are checked after each round.

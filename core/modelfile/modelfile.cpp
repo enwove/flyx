@@ -1,6 +1,8 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "core/modelfile/modelfile.h"
 
+#include <cstdint>
+
 #include "core/modelfile/readers.h"
 
 namespace flyx {
@@ -134,6 +136,15 @@ std::vector<int32_t> ModelFile::eos_ids() const {
     }
   }
   return out;
+}
+
+int ModelFile::max_new_tokens() const {
+  if (!c_.header.is_object() || !c_.header.contains("generation") || !c_.header["generation"].is_object()) return 0;
+  const auto& g = c_.header["generation"];
+  const auto it = g.find("max_new_tokens");
+  if (it == g.end() || !it->is_number_integer()) return 0;
+  const int64_t n = it->get<int64_t>();
+  return n > 0 && n <= INT32_MAX ? static_cast<int>(n) : 0;
 }
 
 ModelOrigin model_origin(const std::string& path, const PathAllowFn& allow_path) {

@@ -544,7 +544,7 @@ def convert(model_dir: str, out: str, draft_dir: str | None = None, log=print, a
     w.meta = {
         "arch": arch, "config": cfg, "draft": draft, "mtp": mtp, "dv": dv, "lora": lora, "quant": quant,
         "tokenizer": tok_info,
-        "generation": {"eos_ids": eos},
+        "generation": _generation(model_dir, eos),
         # The engine reads the template (blob above) and recognises its output
         # format itself (models/formats); these are the variables it may print.
         "chat": _template_tokens(tok_cfg),
@@ -661,6 +661,17 @@ def _template_tokens(tok_cfg: dict) -> dict:
         v = v.get("content") if isinstance(v, dict) else v
         if isinstance(v, str):
             out[k] = v
+    return out
+
+
+def _generation(model_dir: str, eos: list[int]) -> dict:
+    """The header's generation section: the end tokens, and the most tokens a reply takes where a request names
+    no limit when the model's maker set one (generation_config.json's max_new_tokens; the engine's default then,
+    as vLLM and SGLang take it)."""
+    out = {"eos_ids": eos}
+    n = _read_optional_config(os.path.join(model_dir, "generation_config.json")).get("max_new_tokens")
+    if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+        out["max_new_tokens"] = n
     return out
 
 

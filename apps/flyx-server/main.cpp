@@ -123,6 +123,9 @@ void pause_owned_console() {
                "  --cors ORIGIN        let the pages of ORIGIN call the API from a browser (repeatable): https://host[:port],\n"
                "                       an extension's origin, null (a page opened from a file); '*': any page; none: not\n"
                "                       even this machine's own pages (localhost), which may by default\n"
+               "  --max-tokens N       the most tokens a reply takes when its request names no limit (default 0: the\n"
+               "                       model's own generation limit if its file has one, else up to the end of the\n"
+               "                       context, as other servers do)\n"
                "  --queue N            requests allowed to wait (default 16)\n"
                "  --queue-timeout S    longest wait in the queue (default 600)\n"
                "  --idle-unload S      free sessions after S idle seconds (default 0 = never)\n"
@@ -232,6 +235,7 @@ ServeArgs parse_args(int argc, char** argv) {
       else if (const std::string o = cors_origin_of(v); !o.empty()) a.cfg.cors_origins.push_back(o);
       else bad_usage("--cors " + v + ": an origin (https://host[:port], chrome-extension://ID, null), '*' or none");
     }
+    else if (f == "--max-tokens") a.eo.max_new_tokens = apps::whole_flag("--max-tokens", next(), 0, INT_MAX);
     else if (f == "--queue") a.so.queue_limit = apps::whole_flag("--queue", next(), 1, INT_MAX);
     else if (f == "--queue-timeout") a.so.queue_timeout_ms = apps::whole_flag("--queue-timeout", next(), 1, INT_MAX / 1000) * 1000;
     else if (f == "--idle-unload") a.so.idle_unload_ms = apps::whole_flag("--idle-unload", next(), 0, INT_MAX / 1000) * 1000;

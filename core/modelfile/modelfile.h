@@ -59,6 +59,9 @@ class ModelFile {
   // Empty view if the blob does not exist.
   std::string_view blob(const std::string& name) const;
   std::vector<int32_t> eos_ids() const;
+  // The most tokens a reply takes where the request names no limit, as the model's maker set it (Hugging Face's
+  // generation_config.json max_new_tokens, kept by the converter); 0 where the file names none.
+  int max_new_tokens() const;
   // The bytes of this file and its companions.
   uint64_t bytes() const;
   // Reads this file and then its companions from disk, front to back a piece at a time (os::MappedFile::read_ahead),

@@ -57,6 +57,9 @@ struct EngineOptions {
   // chosen every round; DV is never beside another drafter, its rounds chosen against plain decoding's and lookup's
   // every round (docs/design/dv.md).
   std::string drafter;
+  // The most tokens a reply takes where its request names no limit (serve --max-tokens); 0: the model file's own
+  // (ModelFile::max_new_tokens), else up to the end of the context, as other servers do.
+  int max_new_tokens = 0;
   // Files with drafters' weights beside the model file: a GGUF holding only the MTP
   // layer (unsloth ships Qwen3.8-27B's so: MTP/mtp-*.gguf), a block drafter's file (python/convert --draft
   // alone).  Empty: none.
@@ -269,6 +272,9 @@ class Engine {
   bool roomy() const { return roomy_; }  // at least 32 GB free after the text target weights
   int auto_prefill_chunk() const;  // opt_.prefill_chunk == 0: by the device memory left
   const std::vector<int32_t>& eos() const { return eos_; }
+  // A reply's limit where its request names none (EngineOptions::max_new_tokens, else the model file's); 0: none,
+  // the context's end.
+  int default_max_new_tokens() const { return opt_.max_new_tokens > 0 ? opt_.max_new_tokens : model_max_new_; }
   // The model's vocabulary as grammars see it (core/grammar), built on first use.
   Grammar& grammar();
 
@@ -340,6 +346,7 @@ class Engine {
   uint64_t given_back_ = 0;                 // bytes the backend gave back at load (trim)
   std::vector<int> round_trunks_;
   std::vector<int32_t> eos_;
+  int model_max_new_ = 0;  // the model file's own (default_max_new_tokens)
   Grammar grammar_;
   std::mutex grammar_mu_;
   mutable vision::VisionCache vision_cache_;
