@@ -11,4 +11,10 @@ namespace flyx::interfaces {
 inline constexpr uint64_t kClosableOthersKnownBytes = 256ull << 20;
 inline constexpr uint64_t kClosableOthersUnknownBytes = 1ull << 30;
 
+// Upper charge per low-bit head for placement: packed codes plus two binary16 grid values.
+// Three-bit codes can need packing padding. CUDA's supported layouts are checked against this bound.
+constexpr uint64_t strata_copy_head_bound(int head_dim, int bits) {
+  return uint64_t(head_dim) * (bits == 2 ? 2 : 4) / 8 + 4;
+}
+
 }  // namespace flyx::interfaces

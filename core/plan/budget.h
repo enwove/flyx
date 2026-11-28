@@ -43,6 +43,8 @@ struct Budget {
   // FLYX_KV_AUTO placed with every position exact: its copy did not fit beside the K/V (why: copy_note).
   bool auto_exact = false;
   std::string copy_note;
+  int prefix_copies = 0;  // extra host copies in the selected layout to keep AUTO's exact prefix on the GPU
+  int declined_pair_host_rows = 0;  // exact prefix rows in host memory in the feasible but declined pair
   // True when account() returned false due to insufficient device memory (not a non-OOM backend error).
   bool oom = false;
 };
@@ -50,7 +52,8 @@ struct Budget {
 // The tiers a session's K/V caches may use (EngineOptions::kv_gpu, kv_ram): positions on the GPU at most (-1: as
 // many as fit), bytes of host memory (-1: what the machine can spare, less `reserved`; 0: none).  copy_gpu
 // (EngineOptions::kv_copy_gpu): the layers whose low-bit copy stays on the GPU at most, the others' in host memory
-// (-1: as many as fit).  vram_reserve / ram_reserve: opt-in byte reserves overriding device_reserve() / host_keep()
+// (-1: automatic, allowing extra host copies to protect the exact prefix within its transfer budget).
+// vram_reserve / ram_reserve: opt-in byte reserves overriding device_reserve() / host_keep()
 // (-1: automatic defaults).
 struct KvTiers {
   int gpu = -1;
@@ -63,7 +66,10 @@ struct KvTiers {
   int method = FLYX_KV_READ_ALL, method_arg = 0;  // how rounds read the K/V (flyx_seq_layout)
   bool gpu_paged = false;  // Windows pages the GPU's memory unseen (os::gpu_memory_paged, WSL2): reserve 832 MiB
   bool allow_auto_exact = true;  // a locked AUTO switch must survive placement and retries
+  double copy_to_exact = 0;  // a uniform layer's copy bytes per exact byte, zero if the ratio is unknown
 };
+
+double copy_to_exact_ratio(const flyx_model_desc& model, bool fp8, int bits);
 
 // The host memory kv_ram's auto leaves to the system and other programs, of a machine with `total_ram` bytes: a
 // sixteenth of it, at least 2 GiB (32 GB: 2 GiB; 64 GB: 4; 128 GB: 8).  The K/V's host memory is page-locked, so

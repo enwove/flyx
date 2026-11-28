@@ -98,7 +98,7 @@ struct EngineOptions {
   int64_t kv_ram = -1;
   std::string kv_method = "auto";
   // With the K/V in host memory, the layers whose low-bit copy stays on the GPU at most; the others' copy is in host
-  // memory too, each read through a staging a round fills a layer ahead. -1: as many as fit.
+  // memory too, each read through a staging a round fills a layer ahead. -1: automatic placement.
   int kv_copy_gpu = -1;
   // Host memory the process takes besides, which kv_ram's auto leaves aside.  (The server's store of parked
   // conversations, is not: it takes what the sessions' K/V leave, Scheduler.)

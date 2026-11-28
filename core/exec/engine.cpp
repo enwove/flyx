@@ -513,6 +513,8 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
   tiers->gpu = opt_.kv_gpu;
   tiers->ram = opt_.kv_ram;
   tiers->copy_gpu = opt_.kv_copy_gpu;
+  tiers->copy_to_exact = plan::copy_to_exact_ratio(model_->desc(), opt_.kv == FLYX_KV_FP8,
+                                                   tiers->method_arg ? tiers->method_arg : 2);
   tiers->reserved = opt_.host_reserved;
   tiers->vram_reserve = opt_.vram_reserve;
   tiers->min_vram_reserve = device_.reserve_floor;
@@ -583,6 +585,9 @@ void Engine::log_memory_plan(int asked_ctx) const {
     if (budget_.layout.copy_host > 0 && size.copies > 0)
       log::info("flyx: the copy of %d of the %d layers in host memory",
                 std::min(budget_.layout.copy_host, size.copies), size.copies);
+    if (budget_.prefix_copies)
+      log::info("flyx: placed %d additional layer copies in host memory to keep the first %d exact K/V rows on the GPU",
+                budget_.prefix_copies, size.strata_from);
   }
   if (const int dev = budget_.layout.device_positions; dev == 0) {
     log::info("flyx: context %d tokens: K/V in host memory, read over the bus every step (%s of host memory "
