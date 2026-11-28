@@ -3,14 +3,16 @@
 and a temperature: the same requests for every engine.  Standard library only.
 
     python -I bench/ab/chat_bench.py --url http://127.0.0.1:8080 [--conc N] [--temp T] [--top-p P] [--seed S]
-        [--warm 1] [--max-new 256] [--json OUT.json] SET.jsonl ...
+        [--warm 1] [--warm-first N] [--tag TAG] [--max-new 256] [--json OUT.json] SET.jsonl ...
 
 A set is JSON lines with a "question" each, sent as one user message, thinking off (chat_template_kwargs
 enable_thinking false), presence and frequency penalties 0, streamed; request i of a set has seed --seed + i.
 Per request: new tokens (the server's usage), time to the first content, decode time (first content to the end of the
 stream).  Per set and over all: decode tok/s (tokens after the first over the decode times, the per-request speed)
 and the throughput (every new token over the wall time of the timed pass).  --warm 1 runs every request once untimed
-first.
+first (--warm-first N: a set's first N only).  --tag TAG starts every timed question with "[run TAG] " and every warm
+one with "[warm TAG] ", so that no request shares a prefix with another beyond the chat template's (a server's prefix
+cache would otherwise serve the timed pass's prompts from the warm pass).
 """
 from __future__ import annotations
 
@@ -99,6 +101,8 @@ def main(argv=None) -> int:
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--warm", type=int, default=1)
     ap.add_argument("--max-new", type=int, default=256)
+    ap.add_argument("--warm-first", type=int, default=0, help="warm with a set's first N requests only (0: all)")
+    ap.add_argument("--tag", default="", help="timed questions start '[run TAG] ', warm ones '[warm TAG] '")
     ap.add_argument("--json")
     a = ap.parse_args(argv)
 
@@ -106,11 +110,15 @@ def main(argv=None) -> int:
             for path in a.sets]
     jobs = [((si, qi), (q, a.seed + qi)) for si, (_, qs) in enumerate(sets) for qi, q in enumerate(qs)]
 
+    def tagged(js, word):
+        return [(k, (f"[{word} {a.tag}] " + q, seed)) for k, (q, seed) in js] if a.tag else js
+
     def fn(question, seed):
         return chat_one(a.url, a.model_name, question, a.max_new, a.temp, a.top_p, a.top_k, seed)
 
     if a.warm:
-        run_batch(fn, jobs, a.conc)
+        run_batch(fn, tagged([j for j in jobs if not a.warm_first or j[0][1] < a.warm_first], "warm"), a.conc)
+    jobs = tagged(jobs, "run")
     res, wall, nerr = run_batch(fn, jobs, a.conc)
 
     def summary(keys):

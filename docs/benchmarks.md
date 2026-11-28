@@ -296,6 +296,7 @@ python bench/prompts/make_coding_prompt.py --flyx ./bin/flyx --model MODEL.gguf 
 | `flyx bench --prompts` | A prompt set (`{"question"}`, `{"messages"}` or `{"ids"}` a line), every prompt's tokens and rounds in the `--json` record: `flyx bench MODEL --prompts FILE.jsonl [--suffix S] [--limit N] --json OUT.json`; `tests/e2e/check_dv.py` scores and compares such records. |
 | `bench/ab/paired_records.sh`, `bench/ab/summarize_records.py`, `bench/ab/same_runs.py` | Two builds' `flyx bench --prompts` runs in turns (waiting for a quiet GPU), their medians, and whether two runs give the same answers and rounds. |
 | `bench/ab/sglang_bench.py` | A `flyx bench --prompts` record's prompts, token for token, through an SGLang server: its decode tok/s as flyx counts it, its tokens a round, and how many answers are the record's (section 6). |
+| `bench/ab/chat_bench.py` | Prompt sets (`{"question"}` a line) through any OpenAI-compatible `/v1/chat/completions` server at a concurrency and a temperature, the same requests for every engine: decode tok/s, time to the first token, throughput (section 7). |
 | `bench/replay/dv_choice` | DV's per-round choice replayed on recorded rounds (`bench/replay/dv_traces/`), each constant set otherwise: `python -I bench/replay/dv_choice.py table BUILD/bin/dv_choice`. |
 | `bench/trace/dv_round_kernels.py` | Where a DV round's time goes, from an `nsys` trace of DV's rounds with graphs off. |
 | `bench/trace/` | CUPTI kernel timeline analysis (`gaps.py`, `layer_times.py`, `per_matrix.py`, `prefill_kinds.py`). |
@@ -509,7 +510,9 @@ thinking off, both engines through their OpenAI `/v1/chat/completions` with the 
   --cuda-graph-backend-decode full --chunked-prefill-size 16384 --mamba-ssm-dtype bfloat16
   --speculative-draft-model-quantization unquant --speculative-draft-attention-backend flashinfer
   --speculative-attention-mode prefill`, the same 12 steps, top 4, 16 tokens, `{"mode":"serve"}`), each case
-  against the better of the two.
+  against the better of the two. Eight requests at a time both take `--max-mamba-cache-size 24` (and the
+  measured recipe `--mem-fraction-static 0.86`): its mamba state cache holds three states a request, and at its
+  defaults it runs at most 3 requests at once with the measured recipe and 4 with the quickstart's.
 
 ```sh
 PYTHONPATH=python/convert python -m flyx_convert --model Qwen3.8-27B --draft Qwen3.8-27B-EAGLE4 -o q38-e4.flyx
@@ -525,29 +528,72 @@ the end-to-end throughput (every new token over the wall time, time to the first
 
 | concurrency 1 | flyx T = 0 | SGLang T = 0 | flyx T = 0.7 | SGLang T = 0.7 | flyx T = 1 | SGLang T = 1 |
 |---|---:|---:|---:|---:|---:|---:|
-| chat (24) | **92.5** | 89.6 | **83.9** | 83.3 | **79.5** | 78.6 |
-| GSM8K | **155.4** | 148.1 | **151.1** | 141.9 | **141.9** | 133.6 |
-| HumanEval | **254.2** | 206.4 | **242.5** | 204.0 | **232.3** | 183.3 |
-| MATH-500 | **145.1** | 136.4 | **142.6** | 130.5 | **129.9** | 123.6 |
-| MBPP | **156.8** | 147.9 | **142.6** | 139.0 | **136.1** | 133.4 |
-| MT-Bench | **85.2** | 79.9 | **79.9** | 76.4 | 74.0 | **74.4** |
-| all 174 | **127.5** | 119.6 | **120.7** | 113.9 | **112.8** | 108.7 |
-| throughput | **123.8** | 116.4 | **117.3** | 111.0 | **109.9** | 106.1 |
+| chat (24) | **93.0** | 89.6 | **84.1** | 83.3 | **79.7** | 78.6 |
+| GSM8K | **155.7** | 148.1 | **151.4** | 141.9 | **142.1** | 133.6 |
+| HumanEval | **267.0** | 206.4 | **253.6** | 204.0 | **242.4** | 183.3 |
+| MATH-500 | **145.4** | 136.4 | **142.8** | 130.5 | **130.1** | 123.6 |
+| MBPP | **157.0** | 147.9 | **142.7** | 139.0 | **136.2** | 133.4 |
+| MT-Bench | **85.4** | 79.9 | **80.0** | 76.4 | 74.0 | **74.4** |
+| all 174 | **128.2** | 119.6 | **121.3** | 113.9 | **113.3** | 108.7 |
+| throughput | **124.4** | 116.4 | **117.9** | 111.0 | **110.3** | 106.1 |
 
-Eight requests at a time (`--sessions 8`; SGLang's quickstart recipe, its measured one 299.9, 289.3 and 267.9):
+Eight requests at a time (`--sessions 8`; SGLang's measured recipe, its quickstart one 543.5, 516.4 and 493.8):
 throughput, every new token over the wall time of the 174 requests.
 
 | concurrency 8 | flyx | SGLang |
 |---|---:|---:|
-| T = 0 | **371.4** | 352.2 |
-| T = 0.7 | **347.5** | 339.7 |
-| T = 1 | **321.1** | 319.9 |
+| T = 0 | 443.6 | **594.2** |
+| T = 0.7 | 411.3 | **559.7** |
+| T = 1 | 375.5 | **543.3** |
 
 Greedy, every flyx reply is its plain decoding's, alone and eight at a time. flyx's drafts are NVFP4
 (`draft_weights=auto` beside a BF16 target; `exact`, its bf16 weights, 9% slower one at a time on chat and MT-Bench,
 `q8` 3%), its rounds chosen by cost and acceptance among the drafter's chains of 1 to 15, its trees of 15 drafts (a
 beam of 4 for 10 steps, best first greedy; sampled, the candidates scored by how likely each is the target's choice,
 [tree verification](design/tree-verification.md)) and prompt-lookup rounds; eight sessions' rounds are batched up to 64
-rows (`wide`), the chains drafted in lockstep, trees alone. Its 9..16-row GEMMs over K of 15360 and more split a
-column tile's chunks among four blocks (the mlp down at 16 rows 1346 GB/s against 1206), and its prefill GEMMs of
-up to 160 rows take a 6-stage pipeline (a chat prompt's prefill about 50 ms).
+rows (`wide`), the chains drafted in lockstep, trees alone, a session past the first adding what the engine timed at
+load (0.67 ms). Its 9..16-row GEMMs over K of 15360 and more split a column tile's chunks among four blocks (the mlp
+down at 16 rows 1346 GB/s against 1206), its GEMMs of 17..64 rows take 32 columns a block (the gate|up at 64 rows 1009
+GB/s against 696 with the RTX 5090's rules), and its prefill GEMMs of up to 160 rows take a 6-stage pipeline (a chat
+prompt's prefill about 50 ms).
+
+### 200,000-token prompts
+
+Four chat prompts of up to 200,000 tokens with the chat template (`bench/prompts/make_long_chat_prompts.py --rev
+86360f0`, MD5 `9bae93700eb1cec1a8629333ab30ed9a`, 199,985 to 199,998 tokens: flyx's C++ and CUDA sources with a
+passphrase at half depth and an ISO 8601 parser to write, its backend's sources with four codes and the files to
+explain, its Python sources with a passphrase and a file to repeat with docstrings, War and Peace with a phrase at
+three quarters and a summary chapter by chapter), one at a time, up to 512 new tokens, the first prompt once untimed
+first. Every timed question starts `[run c1 tT] ` and the untimed one `[warm c1 tT] ` (`--tag`), so neither engine's
+prefix cache serves a timed prompt. flyx runs one session, its K/V binary16 on the GPU (SGLang's: bf16), in passes of
+4096 rows; SGLang one request (`--max-running-requests 1 --max-mamba-cache-size 6 --skip-server-warmup`, the measured
+recipe with `--cuda-graph-max-bs-decode 1 --mem-fraction-static 0.86`, the quickstart's with
+`--mem-fraction-static 0.9`).
+
+```sh
+flyx serve q38-e4.flyx --port 8080 --no-browser --ctx 204800 --presence-penalty 0 --drafter eagle4 --sessions 1 \
+  --kv 16 --kv-method exact --kv-ram 0 --prefill-chunk 4096
+python -m sglang.launch_server --model-path Qwen3.8-27B --port 30000 --context-length 204800 \
+  --max-running-requests 1 --max-mamba-cache-size 6 --skip-server-warmup ...   # a recipe above
+python -I bench/ab/chat_bench.py --url URL --temp T --max-new 512 --warm-first 1 --tag "c1 tT" --json R.json \
+  long200k.jsonl
+```
+
+Decode `tok/s` per request as above; the time to the first token, the mean of the four; the throughput, every new
+token (2048) over the wall time. SGLang's better recipe a row: the quickstart's at T = 1 (the measured one's 61.9 and
+7.96), the measured one's otherwise (the quickstart's 56.1 s, 69.1 and 66.3 tok/s, 8.07 and 8.02).
+
+| 200k, one at a time | flyx | SGLang |
+|---|---:|---:|
+| time to the first token | 70.5 s | **56.0 s** |
+| decode, T = 0 | **85.5** | 71.9 |
+| decode, T = 0.7 | **80.4** | 71.6 |
+| decode, T = 1 | **75.9** | 66.2 |
+| throughput, T = 0 | 6.68 | **8.11** |
+| throughput, T = 0.7 | 6.67 | **8.11** |
+| throughput, T = 1 | 6.65 | **8.02** |
+
+Every flyx reply at T = 0, 0.7 and 1 is its plain decoding's (22.7 tok/s, the first token after 68.4 s) and gives
+its needles, 7 of 7 (SGLang's quickstart recipe missed one at T = 0.7). flyx's prefill of such a prompt (nsys, plain
+decoding) runs 69.6 s of kernels: its attention 37.4 s (`k_flash_gqa`, about 210 TFLOPS of the 7.9 PFLOP), its GEMMs
+29.7 s (`k_gemm_tc`, about 330 TFLOPS), its gated delta nets 2.5 s.
