@@ -82,7 +82,7 @@ Decode speed in tokens/s, verified on four GPUs (greedy). **Plain** is decoding 
 
 <sub>**×** is the speedup over plain decoding on the same prompts, from unrounded rates; **Plain** shows the chat / mixed run. Speculative output matched plain decoding token for token in every run that recorded token IDs (all but the Windows Qwen mixed run). Linux, except the RTX 5070 Ti on native Windows 11.</sub>
 
-<sub>**Also measured:** Qwen3.8-27B's built-in **MTP** drafter (no extra file) reaches **286.6 / 158.0 / 121.7 / 167.2 tok/s** on the mixed prompts (5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4`:** W4A4 prefill at **15,496 tok/s**; **203.8 tok/s** with MTP at 128K context (plain: 73.4); **164.5 tok/s** at 256K with **100%** needle retrieval (v0.2.0 run). Hardware, drivers, and exact commands: [docs/benchmarks.md](docs/benchmarks.md#decode-and-prefill-on-four-gpus).</sub>
+<sub>**Also measured:** Qwen3.8-27B's built-in **MTP** drafter (no extra file) reaches **286.6 / 158.0 / 121.7 / 167.2 tok/s** on the mixed prompts (5090 / 4090 / 3090 / 5070 Ti). **RTX 5090 `NVFP4`:** W4A4 prefill at **15,496 tok/s**; **203.8 tok/s** with MTP at 128K context (plain: 73.4); **164.5 tok/s** at 256K with **100%** needle retrieval. Hardware, drivers, and exact commands: [docs/benchmarks.md](docs/benchmarks.md#decode-and-prefill-on-four-gpus).</sub>
 
 ## Quick Start
 
