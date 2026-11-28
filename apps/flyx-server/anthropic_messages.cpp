@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <initializer_list>
 
+#include "apps/common/chat_options.h"
 #include "apps/flyx-server/server.h"
 #include "core/render/chat_json.h"
 
@@ -123,7 +124,11 @@ bool read_request(Server* s, const ojson& body, Request* in, std::string* err) {
     // say what a request that names nothing gets.
     request_kwargs["enable_thinking"] = false;
   }
-  const bool thinking_off = request_kwargs.value("enable_thinking", true) == false;
+  // Whether the reply thinks, as read_chat_options will resolve it below: the server's defaults (--no-think,
+  // --chat-template-kwargs), this request's thinking, its own chat_template_kwargs.
+  ojson asked = request_kwargs;
+  if (const auto kw = body.find("chat_template_kwargs"); kw != body.end() && kw->is_object()) asked.update(*kw);
+  const bool thinking_off = !apps::resolve_chat_options(s->cfg.chat_defaults, asked).enable_thinking;
   if (const auto oc = body.find("output_config"); oc != body.end() && oc->is_object()) {
     if (const auto ef = oc->find("effort"); ef != oc->end() && !ef->is_null()) {
       if (!ef->is_string()) return *err = "output_config.effort must be a string", false;

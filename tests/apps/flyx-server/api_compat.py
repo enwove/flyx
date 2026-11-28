@@ -248,6 +248,19 @@ THINK_TEMPLATE = (
 )
 
 
+def check_no_think_effort(url):
+    """A server started with --no-think: a Messages request naming no thinking but an effort thinks not, and the
+    effort is not given the template (Inkling-2's would take one for thinking on)."""
+    cl = Client(url, None)
+    counted = {}
+    for name, extra in (("plain", {}), ("effort", {"output_config": {"effort": "high"}})):
+        st, c = cl.post("/v1/messages/count_tokens", {"model": MODEL_NAME, "messages": [{"role": "user", "content": "hi"}],
+                                                      **extra})
+        assert st == 200, (name, st, c)
+        counted[name] = c["input_tokens"]
+    assert counted["effort"] == counted["plain"], counted
+
+
 def check_thinking_budget(url):
     cl = Client(url, None)
     body = {"model": MODEL_NAME, "messages": [{"role": "user", "content": "Count to ten."}], "max_tokens": 48,
@@ -284,6 +297,9 @@ if __name__ == "__main__":
               options=["--name", MODEL_NAME, "--no-spec", "--api-key", "secret-key"], expect_name=MODEL_NAME)
         serve(exe, tmp, env, [asset], check_queued_anthropic_stream_error, ctx=16384,
               options=["--name", MODEL_NAME, "--sessions", "1", "--no-spec", "--chat-template", template],
+              expect_name=MODEL_NAME)
+        serve(exe, tmp, env, [asset], check_no_think_effort, ctx=4096,
+              options=["--name", MODEL_NAME, "--no-spec", "--no-think", "--chat-template", template],
               expect_name=MODEL_NAME)
         think = Path(tmp) / "think.jinja"
         think.write_text(THINK_TEMPLATE, encoding="utf-8")
