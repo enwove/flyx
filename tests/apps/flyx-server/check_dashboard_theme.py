@@ -66,6 +66,45 @@ def contrast(a, b):
     return (hi + 0.05) / (lo + 0.05)
 
 
+# A state's fills and edges (style.css): the light theme's as they were, the dark theme's its own state colours.
+STATE_FILLS = [  # (classes, property, light fill (r, g, b, alpha), the dark token it is made of)
+    ("badge warn", "background-color", (230, 180, 92, 0.16), "--warning"),
+    ("badge bad", "background-color", (168, 50, 43, 0.10), "--danger"),
+    ("badge info", "background-color", (42, 120, 214, 0.10), "--info"),
+    ("hint ok", "border-top-color", (38, 112, 79, 0.28), "--accent"),
+    ("hint warn", "background-color", (230, 180, 92, 0.10), "--warning"),
+    ("hint warn", "border-top-color", (176, 122, 30, 0.30), "--warning"),
+    ("hint bad", "background-color", (168, 50, 43, 0.05), "--danger"),
+    ("hint bad", "border-top-color", (168, 50, 43, 0.26), "--danger"),
+    ("tag2 bad", "background-color", (168, 50, 43, 0.10), "--danger"),
+    ("lvb warn", "background-color", (230, 180, 92, 0.18), "--warning"),
+]
+
+
+def fill(css):
+    """(r, g, b, alpha) of a computed colour: rgb() / rgba(), or color(srgb r g b / a) as color-mix() computes."""
+    m = re.fullmatch(r"color\(srgb ([\d.e+-]+) ([\d.e+-]+) ([\d.e+-]+)(?: / ([\d.e+-]+))?\)", css.strip())
+    if m:
+        return tuple(round(float(v) * 255) for v in m.groups()[:3]) + (float(m.group(4) or 1),)
+    v = [float(x) for x in re.findall(r"[\d.]+", css)]
+    return (round(v[0]), round(v[1]), round(v[2]), v[3] if len(v) > 3 else 1.0)
+
+
+def state_fills(page):
+    return [fill(css) for css in page.evaluate("""specs => specs.map(([cls, prop]) => {
+        const el = document.createElement('div');
+        el.className = cls;
+        document.body.appendChild(el);
+        const v = getComputedStyle(el).getPropertyValue(prop);
+        el.remove();
+        return v;
+    })""", [[c, p] for c, p, _, _ in STATE_FILLS])]
+
+
+def close(a, b, channel=2, alpha=0.006):
+    return all(abs(x - y) <= channel for x, y in zip(a[:3], b[:3])) and abs(a[3] - b[3]) <= alpha
+
+
 def grey(c):
     """A neutral grey: the channels close together, and green not above both of the others."""
     return max(c) - min(c) <= 12 and c[1] <= max(c[0], c[2])
@@ -136,6 +175,8 @@ def check_light(page, shots):
     expect(page.locator(".word img")).to_have_attribute("src", "/dashboard/brand/flyx-lockup.svg")
     expect(page.locator("#theme use")).to_have_attribute("href", "#i-sun")
     assert inked(page, "canvas.spark", rgb(PAPER["--chart"])), "the sparkline is not in the light theme's colour"
+    for (cls, prop, light, _), got in zip(STATE_FILLS, state_fills(page)):
+        assert close(got, light), (cls, prop, got, "is not the light theme's", light)
     assert saved_theme(page) is None
     chosen(page, "Match system")
     if shots:
@@ -164,6 +205,9 @@ def check_dark(page, shots):
         for fg in ("--muted", "--faint", "--accent", "--success", "--warning", "--danger", "--info", "--chart-2"):
             assert contrast(tk[fg], tk[ground]) >= 4.5, (fg, ground, round(contrast(tk[fg], tk[ground]), 2))
     assert contrast(tk["--on-primary"], tk["--primary"]) >= 7
+    # The badges', hints' and tags' fills and edges: the dark theme's state colours, see-through, none the light's.
+    for (cls, prop, light, token), got in zip(STATE_FILLS, state_fills(page)):
+        assert close(got[:3] + (0,), tk[token] + (0,)) and 0 < got[3] < 1, (cls, prop, got, token, tk[token])
 
     # What the page draws: the frame, the panels, the chosen page in the sidebar, an open menu; none green.
     page.locator("#theme").click()
