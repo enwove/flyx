@@ -38,7 +38,7 @@ public:
   void attach(flyx_bmodel* model, MoeBlock& block, int gate, int down, int resident,
               const std::array<const flyx_tensor_view*, 4>& views);
   void load_profile();
-  void request_boundary(bool begin);
+  void request_boundary(bool begin, cudaStream_t stream);
   std::shared_lock<std::shared_mutex> reading();
   size_t gather_bytes(int pairs) const;
   void note_rows(int rows);
@@ -60,11 +60,11 @@ private:
     std::vector<uint8_t> hot;
   };
   struct Histogram {
-    explicit Histogram(size_t n) : order(n), decode(n), heat(n), unsaved(n) {}
+    explicit Histogram(size_t n) : order(n), decode(n), recorded(n), heat(n), unsaved(n) {}
     ExpertOrder order;
     uint32_t* device = nullptr;
     int* slots = nullptr;
-    std::vector<uint32_t> decode;
+    std::vector<uint32_t> decode, recorded;
     std::vector<uint64_t> heat, unsaved;  // lifetime decode counts and the increments awaiting a cache merge
     size_t desired = 0;
     std::atomic<bool> gather{false};
@@ -73,7 +73,8 @@ private:
   };
   bool resident(std::pair<int, int> pair, size_t slot) const;
   void publish_residency(std::pair<int, int> pair, Histogram& h) const;
-  void observe(bool learn = false);
+  bool record_decode(Histogram& h);
+  void observe(bool between_requests = false);
   std::vector<ProfileLayer> profile_layers() const;
   void save_profile();
   void select_gather();
@@ -92,7 +93,7 @@ private:
   std::filesystem::path profile_;
   uint64_t fingerprint_ = kFingerprintSeed;
   size_t requests_ = 0;
-  bool guided_ = false;
+  bool warm_start_ = false, user_started_ = false;
   std::shared_mutex pages_mu_;  // shared across submission, exclusive across sync, remap and map publication
   std::mutex mutex_;
   std::atomic<int> max_rows_{0};

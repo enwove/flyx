@@ -81,8 +81,8 @@ void OffloadRuntime::finish_prompt(cudaStream_t stream) {
   if (mapped_) mapped_->finish_prompt(stream);
 }
 
-void OffloadRuntime::request_boundary(bool begin) {
-  if (mapped_) mapped_->request_boundary(begin);
+void OffloadRuntime::request_boundary(bool begin, cudaStream_t stream) {
+  if (mapped_) mapped_->request_boundary(begin, stream);
 }
 
 std::shared_lock<std::shared_mutex> OffloadRuntime::expert_reads() {

@@ -544,7 +544,7 @@ int prefill_ex(flyx_plan* p, flyx_seq* s, const flyx_prefill_input* in, const fl
 int request_boundary(flyx_seq* s, int32_t begin) {
   if (!s || !s->m->offload) return 0;
   return guarded([&] {
-    s->m->offload->request_boundary(begin != 0);
+    s->m->offload->request_boundary(begin != 0, s->st);
     return 0;
   });
 }

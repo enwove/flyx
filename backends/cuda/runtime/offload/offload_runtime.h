@@ -26,7 +26,7 @@ class OffloadRuntime {
   void on_session_close(flyx_bmodel* m, const flyx_seq* sequence = nullptr);
   void maintain(flyx_bmodel* m);
   void finish_prompt(cudaStream_t stream);
-  void request_boundary(bool begin);
+  void request_boundary(bool begin, cudaStream_t stream);
   // Shared while a pass or round is enqueued (ExpertAddressSpace::reading); empty without mapped experts.
   std::shared_lock<std::shared_mutex> expert_reads();
   void report(FILE* file);

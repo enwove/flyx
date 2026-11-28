@@ -139,7 +139,7 @@ void ExpertAddressSpace::attach(flyx_bmodel* model, MoeBlock& block, int gate, i
     h.resident = model->alloc<uint8_t>(n);
     CK(cudaMemset(h.device, 0, 2 * n * sizeof(uint32_t)));
     CK(cudaMemcpy(h.slots, h.order.slot.data(), n * sizeof(int), cudaMemcpyHostToDevice));
-    model->host_bytes += n * (2 * sizeof(uint32_t) + 2 * sizeof(int) + 3 * sizeof(uint64_t));
+    model->host_bytes += n * (3 * sizeof(uint32_t) + 2 * sizeof(int) + 3 * sizeof(uint64_t));
     if (model->opt.expert_adapt && !scratch_) scratch_ = model->alloc<uint8_t>(vmm_granularity());
   }
   {
@@ -216,7 +216,21 @@ void ExpertAddressSpace::count_resident(size_t routes) {
   std::lock_guard lock(mutex_);
   full_routes_ += routes;
 }
-void ExpertAddressSpace::observe(bool learn) {
+// A single live session keeps the device counters until the next base placement observation.
+// Record only the increment since the last request; a prefix-only turn can leave both counters intact.
+bool ExpertAddressSpace::record_decode(Histogram& h) {
+  bool changed = false;
+  for (size_t i = 0; i < h.decode.size(); ++i) {
+    const uint32_t delta = h.decode[i] - h.recorded[i];
+    h.heat[i] = add_routes(h.heat[i], delta);
+    h.unsaved[i] = add_routes(h.unsaved[i], delta);
+    changed |= delta != 0;
+  }
+  h.recorded = h.decode;
+  return changed;
+}
+
+void ExpertAddressSpace::observe(bool between_requests) {
   uint64_t visited = full_routes_, resident = full_routes_;
   full_routes_ = 0;
   double sampled_rows = 0, remote_rows = 0;
@@ -225,15 +239,15 @@ void ExpertAddressSpace::observe(bool learn) {
     CK(cudaMemcpy(h.order.counts.data(), h.device, n * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     CK(cudaMemcpy(h.decode.data(), h.device + n, n * sizeof(uint32_t), cudaMemcpyDeviceToHost));
     CK(cudaMemset(h.device, 0, 2 * n * sizeof(uint32_t)));
+    if (user_started_) record_decode(h);
+    std::fill(h.recorded.begin(), h.recorded.end(), 0);
     uint64_t count = 0, cold = 0;
     for (size_t i = 0; i < n; ++i) {
       const uint32_t decode = h.decode[i];
-      if (learn) {
-        h.heat[i] = add_routes(h.heat[i], decode);
-        h.unsaved[i] = add_routes(h.unsaved[i], decode);
+      if (between_requests) {
         h.order.scores[i] = h.heat[i];
         pending_ |= decode != 0;
-      } else if (!guided_) {
+      } else if (user_started_ || !warm_start_) {
         h.order.scores[i] = h.order.scores[i] / 2 + uint64_t(h.order.counts[i]) + decode;
         pending_ |= h.order.counts[i] != 0 || decode != 0;
       }
@@ -253,7 +267,7 @@ void ExpertAddressSpace::observe(bool learn) {
     }
   }
   CK(cudaStreamSynchronize(nullptr));  // the last histogram reset precedes the next nonblocking reader stream
-  if (sampled_rows) {
+  if (sampled_rows && (user_started_ || !warm_start_)) {
     observed_rows_ = 0.5 * observed_rows_ + sampled_rows;
     observed_remote_rows_ = 0.5 * observed_remote_rows_ + remote_rows;
   }
@@ -374,9 +388,9 @@ void ExpertAddressSpace::promote(Placement mode) {
     for (auto& [pair, h] : histograms_) publish_residency(pair, h);
     CK(cudaStreamSynchronize(nullptr));
   }
-  // A cached slot frequency does not describe how many rows of a verification round touch a host page.
-  // Keep the loader's gather choice until this process observes rounds with the new placement.
-  if (mode != Placement::Load) select_gather();
+  // Neither a cached slot frequency nor a startup calibration round describes verification of
+  // a user reply. Keep the loader's gather choice until the warm placement has served real rows.
+  if (mode != Placement::Load && (!warm_start_ || observed_rows_)) select_gather();
   if (verbose_)
     std::fprintf(stderr, "flyx-cuda: redistributed %zu expert pages %s in %.1f ms\n", i,
                  mode == Placement::BetweenRequests ? "between requests" : "at quiescence",
@@ -392,7 +406,7 @@ std::shared_lock<std::shared_mutex> ExpertAddressSpace::reading() {
 void ExpertAddressSpace::finish_prompt(cudaStream_t stream) {
   std::unique_lock pages(pages_mu_);
   std::lock_guard lock(mutex_);
-  if (!scratch_ || sessions_ != 1 || guided_) return;
+  if (!scratch_ || sessions_ != 1 || (warm_start_ && !user_started_)) return;
   CK(cudaStreamSynchronize(stream));
   try {
     observe();
@@ -432,12 +446,13 @@ void ExpertAddressSpace::close(const flyx_seq* seq) noexcept {
   }
 }
 
-void ExpertAddressSpace::request_boundary(bool begin) {
+void ExpertAddressSpace::request_boundary(bool begin, cudaStream_t stream) {
   if (!scratch_) return;
   std::unique_lock pages(pages_mu_);
   std::lock_guard lock(mutex_);
   if (begin) {
     if (failed_) throw std::runtime_error("mapped expert placement failed");
+    user_started_ = true;
     ++requests_;
     return;
   }
@@ -446,12 +461,25 @@ void ExpertAddressSpace::request_boundary(bool begin) {
   try {
     // A request can leave speculative work queued. Raw backend callers can also enqueue from another thread.
     // Hold the submission lock through the fence, the exchanges, and publication of the resident mask.
+    if (sessions_ == 1) {
+      CK(cudaStreamSynchronize(stream));
+      bool changed = false;
+      for (auto& [_, h] : histograms_) {
+        const size_t n = h.decode.size();
+        CK(cudaMemcpy(h.decode.data(), h.device + n, n * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        changed |= record_decode(h);
+      }
+      if (changed) save_profile();
+      if (verbose_)
+        std::fprintf(stderr, "flyx-cuda: single-session expert recording %.1f ms\n",
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+      return;
+    }
     CK(cudaDeviceSynchronize());
     pending_ = false;
     observe(true);
     if (pending_) {
       promote(Placement::BetweenRequests);
-      guided_ = true;
       save_profile();
       if (verbose_)
         std::fprintf(stderr, "flyx-cuda: between-request expert maintenance %.1f ms\n",
@@ -491,7 +519,7 @@ void ExpertAddressSpace::load_profile() {
   if (!trained) return;
   size_t i = 0;
   for (auto& [_, h] : histograms_) h.order.scores = h.heat = std::move(layers[i++].scores);
-  guided_ = true;
+  warm_start_ = true;
   CK(cudaDeviceSynchronize());
   promote(Placement::Load);
   if (verbose_) std::fprintf(stderr, "flyx-cuda: loaded local decode expert profile\n");
