@@ -29,13 +29,15 @@ param(
 $ErrorActionPreference = 'Stop'
 $Here = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $Exe, $Zip, $Wheel, $Model = ($Exe, $Zip, $Wheel, $Model) | ForEach-Object { (Resolve-Path $_).Path }
-$Work = Join-Path ([IO.Path]::GetTempPath()) ("flyx-smoke-" + [guid]::NewGuid())
-New-Item -ItemType Directory -Force $Work | Out-Null
+# The tag first: one that names no version stops the script before anything is made.
+$Version = $Tag -replace '^v', ''
+$parsed = $null
+if (-not [version]::TryParse($Version, [ref]$parsed)) { throw "the tag '$Tag' names no version (v0.2.2)" }
+# From 0.2.2 on a CUDA package whose CUDA backend cannot run says so instead of falling back to cpu_ref.
+$RefusesCudaByDefault = $parsed -ge [version]'0.2.2'
 Set-Content -Path $Results -Value $null -Encoding utf8NoBOM
 $script:failed = $false
-$Version = $Tag -replace '^v', ''
-# From 0.2.2 on a CUDA package whose CUDA backend cannot run says so instead of falling back to cpu_ref.
-$RefusesCudaByDefault = [version]$Version -ge [version]'0.2.2'
+$Work = Join-Path ([IO.Path]::GetTempPath()) ("flyx-smoke-" + [guid]::NewGuid())
 
 function Write-Result([string] $Check, [string] $Status, [string] $Detail) {
   $line = ($Detail -replace '\s+', ' ').Trim()
@@ -139,36 +141,40 @@ function Test-Cli([string] $Name, [string] $Flyx, [string[]] $SmokeArgs) {
   }
 }
 
-$names = ($Exe, $Zip, $Wheel | ForEach-Object { Split-Path -Leaf $_ }) -join ', '
-if (@($Exe, $Zip, $Wheel | Where-Object { -not (Split-Path -Leaf $_).StartsWith("flyx-$Version-") }).Count) {
-  Write-Result 'package names' 'FAIL' "$names, the tag $Tag"
-} else { Write-Result 'package names' 'ok' $names }
-
-Test-Cli 'exe' $Exe @('--no-binding')
-
-$unpacked = Join-Path $Work 'zip'
+# The working directory (the zip unpacked, the venv) lives inside this try alone: removed however the checks end.
+New-Item -ItemType Directory -Force $Work | Out-Null
 try {
-  Expand-Archive -Path $Zip -DestinationPath $unpacked
-  $flyx = Get-ChildItem $unpacked -Recurse -Filter flyx.exe | Select-Object -First 1 -ExpandProperty FullName
-  if (-not $flyx) { throw 'no flyx.exe in it' }
-  Write-Result 'zip: unpack' 'ok' "Expand-Archive: $($flyx.Substring($unpacked.Length + 1))"
-  Test-Cli 'zip' $flyx @()
-} catch {
-  Write-Result 'zip: unpack' 'FAIL' "$_"
-}
+  $names = ($Exe, $Zip, $Wheel | ForEach-Object { Split-Path -Leaf $_ }) -join ', '
+  if (@($Exe, $Zip, $Wheel | Where-Object { -not (Split-Path -Leaf $_).StartsWith("flyx-$Version-") }).Count) {
+    Write-Result 'package names' 'FAIL' "$names, the tag $Tag"
+  } else { Write-Result 'package names' 'ok' $names }
 
-$venv = Join-Path $Work 'venv'
-& python -m venv $venv
-$py = Join-Path $venv 'Scripts\python.exe'
-$out = & $py -m pip install --disable-pip-version-check -q $Wheel 2>&1 | Out-String
-if ($LASTEXITCODE -ne 0) {
-  Write-Result 'wheel: pip install' 'FAIL' (($out -split "`n" | Where-Object { $_ -match 'error' } | Select-Object -Last 2) -join ' ')
-} else {
-  Write-Result 'wheel: pip install' 'ok' "$(& $py -m pip --version) installed $(Split-Path -Leaf $Wheel)"
-  $site = & $py -c "import sysconfig; print(sysconfig.get_paths()['platlib'])"
-  $out = & $py -I (Join-Path $Here 'packaging\smoke_binding.py') $site $Model 2>&1 | Out-String
-  Write-Result 'wheel: generate' ($LASTEXITCODE -eq 0 ? 'ok' : 'FAIL') $out
-}
+  Test-Cli 'exe' $Exe @('--no-binding')
 
-Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
+  $unpacked = Join-Path $Work 'zip'
+  try {
+    Expand-Archive -Path $Zip -DestinationPath $unpacked
+    $flyx = Get-ChildItem $unpacked -Recurse -Filter flyx.exe | Select-Object -First 1 -ExpandProperty FullName
+    if (-not $flyx) { throw 'no flyx.exe in it' }
+    Write-Result 'zip: unpack' 'ok' "Expand-Archive: $($flyx.Substring($unpacked.Length + 1))"
+    Test-Cli 'zip' $flyx @()
+  } catch {
+    Write-Result 'zip: unpack' 'FAIL' "$_"
+  }
+
+  $venv = Join-Path $Work 'venv'
+  & python -m venv $venv
+  $py = Join-Path $venv 'Scripts\python.exe'
+  $out = & $py -m pip install --disable-pip-version-check -q $Wheel 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    Write-Result 'wheel: pip install' 'FAIL' (($out -split "`n" | Where-Object { $_ -match 'error' } | Select-Object -Last 2) -join ' ')
+  } else {
+    Write-Result 'wheel: pip install' 'ok' "$(& $py -m pip --version) installed $(Split-Path -Leaf $Wheel)"
+    $site = & $py -c "import sysconfig; print(sysconfig.get_paths()['platlib'])"
+    $out = & $py -I (Join-Path $Here 'packaging\smoke_binding.py') $site $Model 2>&1 | Out-String
+    Write-Result 'wheel: generate' ($LASTEXITCODE -eq 0 ? 'ok' : 'FAIL') $out
+  }
+} finally {
+  Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
+}
 exit ($script:failed ? 1 : 0)

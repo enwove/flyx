@@ -25,7 +25,8 @@ WHEEL=$(readlink -f "$2")
 MODEL=$(readlink -f "$3")
 RESULTS=$4
 TAG=${5:?the release tag (v0.2.2) is the fifth argument}
-VERSION=${TAG#v}
+# Not VERSION: /etc/os-release has the distribution's under that name.
+RELEASE_VERSION=${TAG#v}
 HERE=$(cd "$(dirname "$0")/../.." && pwd)
 : > "$RESULTS"
 failed=0
@@ -41,12 +42,13 @@ crashed() { (( $1 >= 128 )) || grep -qiE 'segmentation fault|core dumped|aborted
 ms_since() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }
 
 # Whether this release's version is at least $1 (sort -V orders 0.2.10 after 0.2.9).
-at_least() { [[ $(printf '%s\n%s\n' "$1" "$VERSION" | sort -V | head -n 1) == "$1" ]]; }
+at_least() { [[ $(printf '%s\n%s\n' "$1" "$RELEASE_VERSION" | sort -V | head -n 1) == "$1" ]]; }
 
+# The distribution's name, read in a subshell: os-release's VERSION, ID, ... stay out of this script's variables.
 # shellcheck disable=SC1091
-. /etc/os-release
+distribution=$(. /etc/os-release && echo "${PRETTY_NAME:-$ID}")
 libc=$(getconf GNU_LIBC_VERSION 2>/dev/null || /lib64/libc.so.6 2>/dev/null | head -n 1)
-result system ok "${PRETTY_NAME:-$ID}, ${libc:-libc version unknown}"
+result system ok "${distribution:-distribution unknown}, ${libc:-libc version unknown}"
 
 # ldd is a script around the loader; a distribution without it still has the loader's --list.
 list_libs() { if command -v ldd > /dev/null; then ldd "$1"; else /lib64/ld-linux-x86-64.so.2 --list "$1"; fi; }
@@ -60,11 +62,11 @@ done
 out=$("$P/bin/flyx" --version 2>&1); rc=$?
 starts=$(( rc == 0 ))
 if (( ! starts )); then result "flyx --version" FAIL "exit $rc: $(one_line <<< "$out")"
-elif [[ $out != "flyx $VERSION" ]]; then result "flyx --version" FAIL "says $(one_line <<< "$out"), the tag v$VERSION"
+elif [[ $out != "flyx $RELEASE_VERSION" ]]; then result "flyx --version" FAIL "says $(one_line <<< "$out"), the tag $TAG"
 else result "flyx --version" ok "$(one_line <<< "$out")"; fi
 names="$(basename "$P") $(basename "$WHEEL")"
-if [[ $(basename "$P") != "flyx-$VERSION-"* || $(basename "$WHEEL") != "flyx-$VERSION-"* ]]; then
-  result "package names" FAIL "$names, the tag v$VERSION"
+if [[ $(basename "$P") != "flyx-$RELEASE_VERSION-"* || $(basename "$WHEEL") != "flyx-$RELEASE_VERSION-"* ]]; then
+  result "package names" FAIL "$names, the tag $TAG"
 else result "package names" ok "$names"; fi
 out=$("$P/bin/flyx" --help 2>&1); rc=$?
 if (( rc == 0 )); then result "flyx --help" ok "$(head -n 1 <<< "$out" | one_line)"

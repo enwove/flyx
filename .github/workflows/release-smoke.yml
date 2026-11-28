@@ -87,7 +87,13 @@ jobs:
           cd rel
           sha256sum -c --ignore-missing SHA256SUMS.txt | tee checked.txt
           test "$(grep -c ': OK$' checked.txt)" -eq 2
-          mkdir pkg && tar -C pkg -xzf ./*.tar.gz
+          # The tarball as published says the tag's version (the script checks the directory in it and the wheel).
+          tarballs=(./*.tar.gz)
+          if [[ ${#tarballs[@]} -ne 1 || $(basename "${tarballs[0]}") != "flyx-${TAG#v}-linux-x86_64-"*.tar.gz ]]; then
+            echo "::error::the Linux tarball ${tarballs[*]} is not flyx-${TAG#v}-linux-x86_64-*.tar.gz (tag $TAG)"
+            exit 1
+          fi
+          mkdir pkg && tar -C pkg -xzf "${tarballs[0]}"
       - uses: actions/download-artifact@v4
         with:
           name: tiny-model
