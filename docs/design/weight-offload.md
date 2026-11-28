@@ -49,6 +49,17 @@ Strata's Inkling hybrid dispatcher uses host-visible doorbells, CPU SIMD kernels
 
 ### Local decode profiles on RTX 5070 Ti
 
+On Inkling-2-Mini-UD-Q2_K_XL, a locally trained decode prior seeds the single-session prompt-end ranking. One open server handled a 16-token Hello followed by the six suite prompts with 256 output tokens each. The France prompt received a long-form instruction in both builds to reach that length. These engine measurements compare the prefill-kernel baseline `6a55a115` with warm placement on driver 610.88, DSpark width 3, exact KV, context 4096, chunk 1024 and lookup disabled. Each pair used both builds in one order. Four single-session pairs and two default-server pairs per cap alternated the order. Each warm run started from the same profile trained on 17 other prompts.
+
+| Server | Resident cap | Decode tok/s, base / warm | Mean engine ms/request, base / warm | Decode hit %, base / warm | First Hello TTFT ms, base / warm |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| One reused session | 71/128 | 114.80 / 118.01 | 2661.0 / 2552.8 | 83.21 / 84.64 | 617.4 / 182.0 |
+| One reused session | 74/128 | 118.19 / 121.06 | 2593.8 / 2493.8 | 85.12 / 86.07 | 614.9 / 172.1 |
+| Default, seven live sessions | 71/128 | 88.57 / 107.07 | 3171.0 / 2682.2 | 68.86 / 77.52 | 613.5 / 177.3 |
+| Default, seven live sessions | 74/128 | 89.99 / 110.10 | 3122.6 / 2612.4 | 69.40 / 78.88 | 605.5 / 163.0 |
+
+**The sixth town request at 74/128 took 8.9 ms longer (+0.33%) on one reused session.** Base ranged from 2746.2 to 2749.8 ms and warm from 2756.9 to 2758.4 ms across the four pairs. Mean time over all six requests fell 3.86% at this cap. The total includes prefill, decode and the end-of-request recording or page batch. The default server's word-sequence request also took 6.2% longer at 71/128 and 4.6% longer at 74/128. Its bounded batches took at most 7.8 ms. Empty-cache runs reproduced the base hit counts, with aggregate decode within 0.1% in all four configurations.
+
 An earlier policy used bounded page exchanges after every request, including runs with a single live session. Three of the six CLI prompts decoded more slowly with that policy and a warm profile. The table shows the baseline and warm resident hit rates on `bench/prompts/moe_offload.jsonl`, with 256 output tokens per prompt and DSpark width 3. The local profile learned from 17 other prompts. These three requests routed more often to experts left on host by that profile. The base placement had already adapted to preceding prompts in the suite. The eight-pair limit left many of those experts on host for the next request.
 
 | Prompt in suite order | 71/128 hit, base to warm | Decode change | 74/128 hit, base to warm | Decode change |
@@ -59,7 +70,7 @@ An earlier policy used bounded page exchanges after every request, including run
 
 The full Inkling-2-Mini-UD-Q2_K_XL suite improved from 113.59 to 122.84 decode tok/s at 71/128 and from 116.81 to 126.19 at 74/128 (driver 610.88, exact KV, context 4096, chunk 1024, greedy and lookup disabled). The CPU-cache explanation and the sea poem contributed the largest gains.
 
-A production HTTP sweep of that earlier policy sent a 16-token Hello followed by the six prompts at 256 output tokens each. The France question received a long-form instruction so it reached the same output length. With a single GPU session reused across requests, aggregate engine decode fell from 118.06 to 111.18 tok/s at 71/128 and from 121.41 to 114.36 at 74/128. Baseline prompt-end placement continued on this single-session path and retained higher hit rates. With the default session limit, the server kept seven sessions open. The base froze placement once multiple sessions were live, and warm placement improved aggregate decode from 90.27 to 105.69 tok/s and from 91.87 to 109.20 tok/s respectively.
+A production HTTP sweep of that earlier policy sent a 16-token Hello followed by the six prompts at 256 output tokens each. The France question received a long-form instruction so it reached the same output length. With a single GPU session reused across requests, aggregate engine decode fell from 118.06 to 111.18 tok/s at 71/128 and from 121.41 to 114.36 at 74/128. In that comparison the base retained higher hit rates by running prompt-end placement for its single session. With the default session limit, the server kept seven sessions open. The base froze placement once multiple sessions were live, and warm placement improved aggregate decode from 90.27 to 105.69 tok/s and from 91.87 to 109.20 tok/s respectively.
 
 ### Split graphs and mapped experts on RTX 5070 Ti
 
