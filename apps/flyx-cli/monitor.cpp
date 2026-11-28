@@ -101,6 +101,10 @@ std::string grouped(long long v) {
 }
 
 std::string gib(double bytes) { return num(bytes / 1073741824.0, bytes >= 1e11 ? 0 : 1); }
+// A few MiB to many GiB, in the unit that says it ("0.0 GiB" said nothing of a server's 40 MiB).
+std::string mem_text(double bytes) {
+  return bytes < 1073741824.0 ? num(bytes / 1048576.0, 0) + " MiB" : gib(bytes) + " GiB";
+}
 
 std::string seconds(double s) {
   if (s < 10) return num(s, 2) + " s";
@@ -442,7 +446,9 @@ struct TermStyle {
         tiles.push_back({title, paint(kDim, "-"), paint(kDim, loaded ? "no device figures" : "model not loaded"), ""});
     }
     tiles.push_back({"CPU", paint(kBold, cpu_pct < 0 ? "-" : num(cpu_pct, 1) + " %"),
-                     paint(kDim, "of a core · RSS " + gib(get(t["process"], "rss")) + " GiB"),
+                     // flyx's memory as the dashboard counts it: resident, and the page-locked memory the GPU reads
+                     // (process.ram), not the working set alone.
+                     paint(kDim, "of a core · RAM " + mem_text(get(t["process"], "ram", get(t["process"], "rss")))),
                      spark(vec(h.cpu), cw, 0, kCool)});
     for (size_t i = 0; i < tiles.size(); i += size_t(per_row))
       draw_tiles({tiles.begin() + long(i), tiles.begin() + long(std::min(tiles.size(), i + size_t(per_row)))}, tw, out);
