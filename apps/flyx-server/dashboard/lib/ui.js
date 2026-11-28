@@ -33,14 +33,14 @@ export function MemBar({ m, bare }) {
 export const Val = ({ v, unit }) => html`${v}${unit && v !== "-" ? html`<small>${unit}</small>` : ""}`;
 
 // A button that copies `get()` and says so for a moment.
-export function CopyButton({ get, label, cls, icon = true }) {
+export function CopyButton({ get, label, cls, title, icon = true }) {
   const [said, setSaid] = useState("");
   useEffect(() => { if (!said) return; const h = setTimeout(() => setSaid(""), 1400); return () => clearTimeout(h); }, [said]);
   const copy = async (e) => {
     e.stopPropagation();
     try { await navigator.clipboard.writeText(get()); setSaid("Copied"); } catch (x) { setSaid("Select it"); }
   };
-  return html`<button class=${cls || "btn ghost sm"} onClick=${copy}>${icon ? html`<${Icon} name="copy"/> ` : ""}${t(said || label || "Copy")}</button>`;
+  return html`<button class=${cls || "btn ghost sm"} title=${title || undefined} onClick=${copy}>${icon ? html`<${Icon} name="copy"/> ` : ""}${t(said || label || "Copy")}</button>`;
 }
 
 // The same string is shown and copied, including model names and paths with spaces.

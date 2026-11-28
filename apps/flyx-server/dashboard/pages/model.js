@@ -8,7 +8,7 @@
 import { html, useState, useEffect, useRef } from "../lib/html.js";
 import { saved, getJson, call } from "../lib/api.js";
 import { t, tErr } from "../lib/i18n.js";
-import { fmt, gib, gb, secs, shortDevice, baseName, psQuote, shQuote, compact, ago, contextLimit } from "../lib/format.js";
+import { fmt, gib, gb, secs, shortDevice, baseName, psQuote, psArg, shArg, compact, ago, contextLimit } from "../lib/format.js";
 import { Icon, CodeSnippet, CopyButton, confirmBox, defaultShell, ShellPicker } from "../lib/ui.js";
 import { live, poll, busyLoad } from "../lib/telemetry.js";
 import { unloadServed, reloadServed, stopFetch } from "../lib/actions.js";
@@ -260,7 +260,7 @@ function commandOf(b, shell) {
   const strings = [b.model, b.name, b.mmproj, b.lora, ...b.drafters];
   const native = ps && strings.some((s) => s && (s.includes('"') || (/\s/.test(s) && s.endsWith("\\"))));
   const nativeQuote = (s) => '"' + s.replace(/(\\*)"/g, '$1$1\\"').replace(/\\+$/, '$&$&') + '"';
-  const q = native ? nativeQuote : ps ? psQuote : shQuote;
+  const q = native ? nativeQuote : ps ? psArg : shArg;
   const parts = [b.model ? q(b.model) : "MODEL"];
   if (b.ctx) parts.push("--ctx " + b.ctx);
   if (b.kv !== "auto") parts.push("--kv " + b.kv);
@@ -1280,12 +1280,14 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     if (comps.some((c) => c.kind === "mtp")) chips.push(["+ MTP", "ok"]);
     if (rows.length && comps.some((c) => c.kind === "dflash2")) chips.push(["+ DFlash2", "ok"]);
     const [org, short] = repoSel.split("/");
+    const selectedRow = rows.find((r) => r.name === target && !r.off);
+    const copyName = selectedRow ? selectedRow.name : repoSel;
     return html`
       <div class="hub-scroll" id="hf-detail">
         <div class="dh">
           <div class="dh-icon"><${Icon} name="model"/></div>
           <div class="dh-t"><h3 id="hf-name">${short}</h3><span>${org}</span></div>
-          <${CopyButton} get=${() => repoSel} label="Copy name"/>
+          <${CopyButton} get=${() => copyName} title=${copyName} label="Copy name"/>
           <a class="btn ghost sm" href=${safeOrigin((j && j.endpoint) || hubEndpoint) + "/" + repoSel} target="_blank" rel="noopener noreferrer">
             <${Icon} name="ext"/>${t("Open on Hugging Face")}</a>
         </div>
