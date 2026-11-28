@@ -71,6 +71,7 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       n.moe_experts = std::max(n.moe_experts, e->n_experts);
       n.moe_topk = std::max(n.moe_topk, e->top_k);
       n.moe_inter = std::max(n.moe_inter, e->inter);
+      if (e->router_in) n.act = std::max(n.act, e->hidden);  // the router's own input rows (moe_layer)
       n.max_loop_rank = std::max(n.max_loop_rank, e->loop_rank);
       ks({e->hidden, e->inter, 2 * e->hidden, e->loop_rank});
     } else if (const auto* h = std::get_if<HeadBlock>(&blk)) {

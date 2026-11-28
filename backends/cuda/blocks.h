@@ -449,6 +449,16 @@ struct MoeBlock {
   int loop_rank = 0;
   LoopWeights loop_ctrl;
   int sconv = -1, sconv_offset = 0;
+  // Gemma 4's (ABI 58): the router's own input rmsnorm(x) * router_in (router_in: its scale times router_mul times
+  // the norm's weight, null: the router reads the experts' normed rows); the routed weights times expert_scale [E];
+  // the MLP block `shared` beside the experts (-1: none); the experts' output normed (post_norm), the sum normed
+  // (out_norm) before the residual add, x then times out_scale.
+  float* router_in = nullptr;
+  float router_eps = 0.f;
+  float* expert_scale = nullptr;
+  int shared = -1;
+  Norm post_norm, out_norm;
+  const float* out_scale = nullptr;
 };
 
 // DSpark companion drafter (Inkling-2): 3-layer DFlash with block-uniform SWA/Full + Markov RNN head.

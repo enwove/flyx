@@ -1952,9 +1952,9 @@ void l2_warm(const L2Ranges& r, cudaStream_t st);
 // selection alone.
 void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
                bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, const Launch& L,
-               const float* logit_bias = nullptr);
+               const float* logit_bias = nullptr, const float* expert_scale = nullptr);
 // The activation an expert's gate value g and up value u go through (kind a flyx_moe_act): SWIGLU silu(g) u; SITU
-// with a, b its betas; SWIGLU_OAI with a its alpha and b its limit.  bias (null: none): the experts' gate | up biases
+// with a, b its betas; SWIGLU_OAI with a its alpha and b its limit; GELU_TANH gelu_tanh(g) u.  bias (null: none): the experts' gate | up biases
 // [E, 2 I], gate's I then up's, added to g and u first.
 struct MoeAct {
   int kind = FLYX_MOE_SWIGLU;

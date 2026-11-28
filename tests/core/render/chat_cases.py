@@ -13,7 +13,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Template fixture -> the chat format the engine should recognise it as (models/formats).  MiniCPM5 writes its calls
 # as <function name=...> with no <tool_call> around them, a format this build does not read: "plain", tools refused.
-TEMPLATES = {"qwen3.5.jinja": "qwen35", "qwen3.jinja": "hermes", "minicpm5.jinja": "plain", "gemma4.jinja": "gemma4"}
+TEMPLATES = {"qwen3.5.jinja": "qwen35", "qwen3.jinja": "hermes", "minicpm5.jinja": "plain", "gemma4.jinja": "gemma4",
+             "gemma4_early.jinja": "gemma4"}
 
 WEATHER = {"type": "function", "function": {
     "name": "get_weather", "description": "查询天气 (current weather)",

@@ -680,14 +680,28 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
   for (int r = 0; r < R; ++r)
     norm(M, B.norm, cur.data() + size_t(r) * size_t(H), H, h.data() + size_t(r) * size_t(H));
   Vec r_logits(size_t(R) * size_t(E));
-  lin(M, B.router, h.data(), R, H, E, r_logits.data(), R);
+  if (B.has_router_norm) {  // the router's own input: router_norm(x) * router_in * router_mul (Gemma 4's)
+    Vec ri(size_t(R) * size_t(H));
+    const double* w = B.router_norm.w >= 0 ? M->vec(B.router_norm.w).data() : nullptr;
+    const double* in = B.router_in >= 0 ? M->vec(B.router_in).data() : nullptr;
+    const double mul = B.router_mul != 0.f ? double(B.router_mul) : 1.0;
+    for (int r = 0; r < R; ++r) {
+      double* y = ri.data() + size_t(r) * size_t(H);
+      flyx::ops::rmsnorm(cur.data() + size_t(r) * size_t(H), w, H, B.router_norm.eps, B.router_norm.offset, y);
+      for (int c = 0; c < H; ++c) y[c] *= (in ? in[c] : 1.0) * mul;
+    }
+    lin(M, B.router, ri.data(), R, H, E, r_logits.data(), R);
+  } else {
+    lin(M, B.router, h.data(), R, H, E, r_logits.data(), R);
+  }
   if (B.router_logit_b >= 0)
     for (int r = 0; r < R; ++r)
       for (int e = 0; e < E; ++e) r_logits[size_t(r) * size_t(E) + size_t(e)] += M->vec(B.router_logit_b)[size_t(e)];
   const double* r_bias = B.router_bias >= 0 ? M->vec(B.router_bias).data() : nullptr;
   if ((B.gate_up >= 0) == (B.gate >= 0) || (B.gate >= 0) != (B.up >= 0))
     throw std::runtime_error("an MoE block names its gate and up fused or apart, one way");
-  if (B.act == FLYX_MOE_SITU ? !(B.situ_beta > 0.f) : B.act != FLYX_MOE_SWIGLU && B.act != FLYX_MOE_SWIGLU_OAI)
+  if (B.act == FLYX_MOE_SITU ? !(B.situ_beta > 0.f)
+                              : B.act != FLYX_MOE_SWIGLU && B.act != FLYX_MOE_SWIGLU_OAI && B.act != FLYX_MOE_GELU_TANH)
     throw std::runtime_error("an MoE block's activation out of range");
   // an expert's bias row (b [E, n]), none where the block names none
   auto bias = [&](int bw, int e, int n) { return bw >= 0 ? M->vec(bw).data() + size_t(e) * size_t(n) : nullptr; };
@@ -699,6 +713,8 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
   for (int r = 0; r < R; ++r) {
     moe_route(&r_logits[size_t(r) * size_t(E)], r_bias, E, K, B.gating != 0, B.norm_weights != 0, B.norm_eps,
               B.route_scale, eidx.data(), ew.data());
+    if (B.has_expert_scale)  // each routed weight times its expert's scale, after the normalization
+      for (int k = 0; k < K; ++k) ew[size_t(k)] *= M->vec(B.expert_scale)[size_t(eidx[size_t(k)])];
     double* dst = &moe_raw[size_t(r) * size_t(H)];
     const double* hr = &h[size_t(r) * size_t(H)];
     for (int k = 0; k < K; ++k) {
@@ -714,8 +730,9 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
           for (int i = 0; i < I; ++i) gu[size_t(off + i)] += b[i];
       for (int i = 0; i < I; ++i) {
         const double g = gu[size_t(i)], u = gu[size_t(I + i)];
-        act[size_t(i)] = B.act == FLYX_MOE_SITU ? situ(g, u, B.situ_beta, B.situ_linear_beta)
+        act[size_t(i)] = B.act == FLYX_MOE_SITU         ? situ(g, u, B.situ_beta, B.situ_linear_beta)
                          : B.act == FLYX_MOE_SWIGLU_OAI ? swiglu_oai(g, u, B.act_alpha, B.act_limit)
+                         : B.act == FLYX_MOE_GELU_TANH  ? flyx::ops::gelu_tanh(g) * u
                                                         : silu(g) * u;
       }
       lin_expert(M, B.down, e, act.data(), I, H, down_out.data(), R);
@@ -731,6 +748,35 @@ void moe_ffn(RefSeq* s, const flyx_moe_block& B, bool verify) {
                         &moe_out);
   } else {
     moe_out = std::move(moe_raw);
+  }
+  if (B.has_post_norm)
+    for (int r = 0; r < R; ++r) norm(M, B.post_norm, &moe_out[size_t(r) * H], H, &moe_out[size_t(r) * H]);
+  if (B.has_shared) {  // the MLP beside the experts, on the same rows: its own norms, its output added to theirs
+    const flyx_mlp_block& F = M->block(B.shared).mlp;
+    if (F.hidden != H || F.act != FLYX_MLP_GELU_TANH && F.act != FLYX_MLP_SILU)
+      throw std::runtime_error("an MoE block's MLP beside its experts of another width or activation");
+    const int Is = F.inter;
+    Vec hs(H), g(Is), u(Is), y(H);
+    for (int r = 0; r < R; ++r) {
+      norm(M, F.norm, cur.data() + size_t(r) * size_t(H), H, hs.data());
+      lin(M, F.gate, hs.data(), 1, H, Is, g.data(), R);
+      lin(M, F.up, hs.data(), 1, H, Is, u.data(), R);
+      for (int i = 0; i < Is; ++i)
+        g[size_t(i)] = (F.act == FLYX_MLP_GELU_TANH ? flyx::ops::gelu_tanh(g[size_t(i)]) : silu(g[size_t(i)])) *
+                       u[size_t(i)];
+      lin(M, F.down, g.data(), 1, Is, H, y.data(), R);
+      if (F.has_post_norm) norm(M, F.post_norm, y.data(), H, y.data());
+      for (int c = 0; c < H; ++c) moe_out[size_t(r) * H + c] += y[size_t(c)];
+    }
+  }
+  if (B.has_out_norm) {  // x = (x + out_norm(the sum)) * out_scale
+    const double sc = B.out_scale >= 0 ? M->vec(B.out_scale)[0] : 1.0;
+    Vec y(H);
+    for (int r = 0; r < R; ++r) {
+      norm(M, B.out_norm, &moe_out[size_t(r) * H], H, y.data());
+      for (int c = 0; c < H; ++c) s->x[size_t(r) * H + c] = (ffn_inp[size_t(r) * H + c] + y[size_t(c)]) * sc;
+    }
+    return;
   }
   for (size_t i = 0; i < s->x.size(); ++i) s->x[i] = ffn_inp[i] + moe_out[i];
 }

@@ -53,7 +53,8 @@ __global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* logits
                                                              int gating_sigmoid, int norm_weights, float norm_eps,
                                                              float route_scale, int* __restrict__ idx_out,
                                                              float* __restrict__ w_out,
-                                                             const float* __restrict__ logit_bias) {
+                                                             const float* __restrict__ logit_bias,
+                                                             const float* __restrict__ expert_scale) {
   pdl_trigger();
   pdl_wait();
   const int r = blockIdx.x, tid = threadIdx.x;
@@ -117,7 +118,7 @@ __global__ void __launch_bounds__(kRouteThreads) k_moe_route(const float* logits
   float* out_w = w_out + size_t(r) * top_k;
   for (int k = tid; k < top_k; k += kRouteThreads) {
     out_i[k] = s_top_i[k];
-    out_w[k] = s_top_w[k] * s_norm;
+    out_w[k] = s_top_w[k] * s_norm * (expert_scale ? expert_scale[s_top_i[k]] : 1.f);
   }
 }
 
@@ -1340,13 +1341,14 @@ void l2_warm(const L2Ranges& r, cudaStream_t st) {
 
 void moe_route(const float* logits, const float* bias, int rows, int n_experts, int top_k, bool gating_sigmoid,
                bool norm_weights, float norm_eps, float route_scale, int* idx_out, float* w_out, const Launch& L,
-               const float* logit_bias) {
+               const float* logit_bias, const float* expert_scale) {
   if (rows <= 0 || n_experts <= 0 || n_experts > kMoeRouteMaxExperts || top_k <= 0 || top_k > n_experts ||
       top_k > kRouteTop)
     throw std::runtime_error("moe_route: invalid dimensions");
   const size_t smem = size_t(2) * size_t(n_experts) * sizeof(float);
   launch_dependent_smem(k_moe_route, dim3(rows), dim3(kRouteThreads), smem, L, logits, bias, n_experts, top_k,
-                        int(gating_sigmoid), int(norm_weights), norm_eps, route_scale, idx_out, w_out, logit_bias);
+                        int(gating_sigmoid), int(norm_weights), norm_eps, route_scale, idx_out, w_out, logit_bias,
+                        expert_scale);
 }
 
 void moe_act_rows(const float* gu, int ld_gu, int I, const MoeAct& act, const int* eidx, float* out, int ld_out,

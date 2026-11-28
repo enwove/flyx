@@ -1,7 +1,8 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // Gemma 4's assistant (google/gemma-4-*-it-assistant: transformers' Gemma4AssistantForCausalLM and
 // Gemma4UnifiedAssistantForCausalLM) beside its target, as the target's MTP drafter (backend_abi.h
-// flyx_gemma4_mtp_block): a drafter directory, its config.json and safetensors (core/modelfile/drafter_dir.cpp).
+// flyx_gemma4_mtp_block): a drafter directory, its config.json and safetensors (core/modelfile/drafter_dir.cpp), or
+// llama.cpp's GGUF of it (arch "gemma4-assistant": unsloth ships them as MTP/mtp-*.gguf beside the model's).
 #pragma once
 #include <nlohmann/json.hpp>
 

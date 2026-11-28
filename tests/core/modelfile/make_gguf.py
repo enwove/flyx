@@ -593,6 +593,8 @@ def main(out):
     tiny_gpt_oss.write(out, quant=False, stem="gpt_oss_f32")
     tiny_gemma4.write(out)
     tiny_gemma4.write(out, quant=False, stem="gemma4_f32")
+    tiny_gemma4.write(out, stem="gemma4_moe", moe=True)
+    tiny_gemma4.write(out, quant=False, stem="gemma4_moe_f32", moe=True)
     gemma4_tokenizer.write(out)
     print("wrote GGUF model, tokenizer and independent quantization fixtures")
 

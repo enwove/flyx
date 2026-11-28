@@ -71,6 +71,11 @@ bool supported(const flyx_bmodel* m, const Block& blk, std::string* why) {
   } else if (const auto* e = std::get_if<MoeBlock>(&blk)) {
     if (e->n_experts < 1 || e->top_k < 1 || e->top_k > e->n_experts || (e->post_conv && (e->conv < 2 || e->conv > 64)))
       return no("MoE dimensions outside what the CUDA kernels support");
+    if (e->shared >= 0) {  // Gemma 4's MLP beside the experts: of their width, its norm after it
+      const auto* sm = e->shared < int(m->blocks.size()) ? std::get_if<MlpBlock>(&m->blocks[size_t(e->shared)]) : nullptr;
+      if (!sm || sm->hidden != e->hidden || !sm->post_norm.w || sm->lora)
+        return no("an MoE block's MLP beside its experts: an MLP of their width with its norm after it");
+    }
     if (e->top_k > kMoeRouteMaxTopK || e->n_experts > kMoeRouteMaxExperts)
       return no("MoE routing outside what the CUDA kernels take (top_k up to " + std::to_string(kMoeRouteMaxTopK) +
                 ", up to " + std::to_string(kMoeRouteMaxExperts) + " experts)");

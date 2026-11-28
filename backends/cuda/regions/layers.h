@@ -34,8 +34,9 @@ void mtp_draft_attention(flyx_seq* s, const AttnBlock& a, const KvBuf& kv, int p
                          int ld_proj, float* q, float* out, float* part, const Launch& L);
 // add16 (the generic ops of a pass with a bf16 residual, residual16_pass): the down or out projection into h (H
 // wide), then added to x with the sum rounded once to bf16 (add_rows_bf16), as the fused producers add it.
+// branch (Gemma 4's MLP beside its experts): post_norm(down's output) written there, x read alone.
 void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_proj, float* act, int ld_act,
-              const Launch& L, bool fused, bool add16 = false);
+              const Launch& L, bool fused, bool add16 = false, float* branch = nullptr);
 void gdn_out_project(const RowView& v, const GdnBlock& g, int R, bool fused, bool add16 = false);
 void head_logits(const HeadBlock& h, const RowView& v, int r0, int n, bool cert, const CertScratch& cs,
                  const KernelOptions& ko, bool x16 = false);

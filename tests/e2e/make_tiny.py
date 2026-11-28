@@ -1433,8 +1433,13 @@ def write_chat_cases(tok_dir: str, out_json: str) -> int:
         src = open(os.path.join(chat_cases.HERE, "templates", name), encoding="utf-8").read()
         for case, msgs, tools in chat_cases.CASES:
             for thinking in (True, False):
+                try:
+                    want = chat_cases.expected(tok, src, msgs, tools, thinking)
+                except Exception as e:  # a case the template itself cannot render (Jinja2 raises): none to compare
+                    print(f"chat_cases: {name} {case!r} thinking={thinking}: left out ({type(e).__name__}: {e})")
+                    continue
                 rows.append({"template": name, "format": fmt, "case": case, "messages": msgs, "tools": tools,
-                             "thinking": thinking, **chat_cases.expected(tok, src, msgs, tools, thinking)})
+                             "thinking": thinking, **want})
     json.dump(rows, open(out_json, "w", encoding="utf-8"), ensure_ascii=False, indent=0)
     return len(rows)
 

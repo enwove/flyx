@@ -185,9 +185,10 @@ def canonical_dense_config(tc: dict) -> dict:
 def canonical_gemma4_config(tc: dict) -> dict:
     """Gemma 4's dense layers (models/gemma4): sliding and global layers, each kind its head width, K/V heads,
     rotary and theta; v from k's projection on the global ones (attention_k_eq_v); GELU (tanh) MLPs; the final logits
-    softcapped.  Per-layer embeddings (E2B, E4B), shared K/V layers and experts (26B-A4B) are refused for now."""
+    softcapped; experts beside every layer's MLP (26B-A4B: enable_moe_block).  Per-layer embeddings (E2B, E4B) and
+    shared K/V layers are refused for now."""
     for key, what in (("hidden_size_per_layer_input", "per-layer embeddings (E2B, E4B)"),
-                      ("num_kv_shared_layers", "shared K/V layers"), ("enable_moe_block", "experts (26B-A4B)"),
+                      ("num_kv_shared_layers", "shared K/V layers"),
                       ("use_double_wide_mlp", "a double-wide MLP"), ("attention_bias", "attention biases")):
         if tc.get(key):
             raise ValueError(f"Gemma 4 with {what} is not supported yet")
@@ -198,12 +199,17 @@ def canonical_gemma4_config(tc: dict) -> dict:
     if full.get("rope_type", "proportional") != "proportional" or swa.get("rope_type", "default") != "default" or \
             swa.get("partial_rotary_factor", 1.0) != 1.0 or full.get("factor", 1.0) != 1.0:
         raise ValueError(f"unsupported Gemma 4 rotary: {rp}")
-    hd, hd_full = tc["head_dim"], tc.get("global_head_dim") or tc["head_dim"]
-    k_eq_v = bool(tc.get("attention_k_eq_v", False))
-    n_kv_full = tc.get("num_global_key_value_heads") if k_eq_v else None
     lt = tc["layer_types"]
     if len(lt) != tc["num_hidden_layers"] or any(t not in ("sliding_attention", "full_attention") for t in lt):
         raise ValueError("Gemma 4 layer_types: sliding_attention or full_attention, one a layer")
+    k_eq_v = bool(tc.get("attention_k_eq_v", False))
+    # The global layers' heads: global_head_dim and num_global_key_value_heads (as Google's configs give them), or a
+    # global layer's own entries in per_layer_config (as transformers writes them since)
+    plc = tc.get("per_layer_config") or {}
+    full_own = next((plc.get(str(i)) or {} for i, t in enumerate(lt) if t == "full_attention"), {})
+    hd = tc["head_dim"]
+    hd_full = full_own.get("head_dim") or tc.get("global_head_dim") or hd
+    n_kv_full = full_own.get("num_key_value_heads") or (tc.get("num_global_key_value_heads") if k_eq_v else None)
     return {
         "hidden": tc["hidden_size"], "layers": tc["num_hidden_layers"], "vocab": tc["vocab_size"],
         "inter": tc["intermediate_size"], "n_heads": tc["num_attention_heads"],
@@ -215,6 +221,8 @@ def canonical_gemma4_config(tc: dict) -> dict:
         "rot_dim_full": 2 * int(full.get("partial_rotary_factor", 0.25) * hd_full // 2),
         "k_eq_v": k_eq_v, "eps": tc["rms_norm_eps"], "softcap": float(tc.get("final_logit_softcapping") or 0.0),
         "tie_embed": bool(tc.get("tie_word_embeddings", True)), "max_pos": tc.get("max_position_embeddings", 131072),
+        **({"experts": tc["num_experts"], "top_k": tc["top_k_experts"], "moe_inter": tc["moe_intermediate_size"]}
+           if tc.get("enable_moe_block") else {}),
     }
 
 
@@ -412,7 +420,18 @@ _G4_RULES = [
     (r"layers\.(\d+)\.self_attn\.(q|k|v|o)_proj\.weight", "L{0}.attn.{1}"),
     (r"layers\.(\d+)\.self_attn\.(q|k)_norm\.weight", "L{0}.attn.{1}_norm"),
     (r"layers\.(\d+)\.mlp\.(gate|up|down)_proj\.weight", "L{0}.mlp.{1}"),
+    # a layer's experts beside its MLP (26B-A4B)
+    (r"layers\.(\d+)\.post_feedforward_layernorm_1\.weight", "L{0}.mlp.post_norm_1"),
+    (r"layers\.(\d+)\.pre_feedforward_layernorm_2\.weight", "L{0}.moe.norm"),
+    (r"layers\.(\d+)\.post_feedforward_layernorm_2\.weight", "L{0}.moe.post_norm"),
+    (r"layers\.(\d+)\.router\.proj\.weight", "L{0}.moe.router"),
+    (r"layers\.(\d+)\.router\.scale", "L{0}.moe.router_in"),
+    (r"layers\.(\d+)\.router\.per_expert_scale", "L{0}.moe.expert_scale"),
+    (r"layers\.(\d+)\.experts\.gate_up_proj", "L{0}.moe.gate_up"),
+    (r"layers\.(\d+)\.experts\.down_proj", "L{0}.moe.down"),
 ]
+_G4_MOE_KEYS = ("mlp.post_norm_1", "moe.norm", "moe.post_norm", "moe.router", "moe.router_in", "moe.expert_scale",
+                "moe.gate_up", "moe.down")
 _G4_LAYER_KEYS = ("in_norm", "attn.post_norm", "post_norm", "mlp.post_norm", "layer_scalar", "attn.q", "attn.k",
                   "attn.o", "attn.q_norm", "attn.k_norm", "mlp.gate", "mlp.up", "mlp.down")
 _D_RULES = DRAFT_LAYER_RULES + [
@@ -759,6 +778,8 @@ def _check_gemma4(cfg, seen):
     need = {"embed", "norm"}
     for i, t in enumerate(cfg["layer_types"]):
         need |= {f"L{i}.{n}" for n in _G4_LAYER_KEYS}
+        if cfg.get("experts"):
+            need |= {f"L{i}.{n}" for n in _G4_MOE_KEYS}
         if t == "sliding" or not cfg["k_eq_v"]:
             need.add(f"L{i}.attn.v")
     check_tensors("target", need, seen)

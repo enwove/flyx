@@ -107,16 +107,18 @@ bool residual16_pass(const Pass& ps) {
 bool residual16(const Pass& ps) { return ps.s->m->opt.fusion && residual16_pass(ps); }
 
 void mlp_body(float* x, const MlpBlock& f, int R, float* h, float* proj, int ld_proj, float* act, int ld_act,
-              const Launch& L, bool fused, bool add16) {
+              const Launch& L, bool fused, bool add16, float* branch) {
   const int H = f.hidden, I = f.inter;
   const Norm& n = f.norm;
   // Gemma's: down's output into h (H wide: free past the gate|up GEMM, which the generic path's h fed), normed and
-  // added to x (norm_add), then x times its scalar
+  // added to x (norm_add), then x times its scalar; or, beside its experts, normed into branch (x read alone)
   const bool post = f.post_norm.w != nullptr;
   if (add16 && post) throw std::logic_error("cuda: a bf16 residual's MLP with a norm after down");
+  if (branch && (!post || add16)) throw std::logic_error("cuda: an MLP beside experts without its norm after down");
   float* const down_y = post ? h : x;
   auto finish = [&] {
-    if (post) norm_add(x, H, h, H, f.post_norm.w, f.post_norm.offset, f.post_norm.eps, f.out_scale, R, H, L.st);
+    if (branch) rmsnorm(h, H, f.post_norm.w, f.post_norm.offset, f.post_norm.eps, branch, H, R, H, L.st);
+    else if (post) norm_add(x, H, h, H, f.post_norm.w, f.post_norm.offset, f.post_norm.eps, f.out_scale, R, H, L.st);
   };
   if (fused) {
     rmsnorm_split(x, H, n.w, n.offset, n.eps, R, H, L, f.w_gu.q8_inputs());
@@ -1730,15 +1732,26 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     }
   }
 
+  // Gemma 4's MLP beside the experts, first: its normed output into post_raw (free: no ShortConv after these
+  // experts), its scratch (h, proj, act) theirs after it
+  float* const shared_y = f.shared >= 0 ? rv.b.post_raw : nullptr;
+  if (shared_y)
+    mlp_body(const_cast<float*>(cur), block<MlpBlock>(s->m, f.shared), R, rv.b.h, rv.b.proj, rv.ld_proj, rv.b.act,
+             rv.ld_act, L, fused, false, shared_y);
   if (!norm_done) {
     if (round_q8)
       rmsnorm_moe_q8(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, *msc, moe_q8_mins(f.gate_up), st);
     else
       rmsnorm(cur, H, f.norm.w, f.norm.offset, f.norm.eps, rv.b.h, H, R, H, st);
   }
-  gemm(rv.b.h, H, f.router, E, H, rv.b.proj, E, R, false, L);
+  if (f.router_in) {  // the router's own input (act: free here)
+    rmsnorm(cur, H, f.router_in, 0.f, f.router_eps, rv.b.act, H, R, H, st);
+    gemm(rv.b.act, H, f.router, E, H, rv.b.proj, E, R, false, L);
+  } else {
+    gemm(rv.b.h, H, f.router, E, H, rv.b.proj, E, R, false, L);
+  }
   moe_route(rv.b.proj, f.router_bias, R, E, K, f.gating_sigmoid, f.norm_weights, f.norm_eps, f.route_scale,
-            rv.b.moe_idx, rv.b.moe_w, L, f.router_logit_b);
+            rv.b.moe_idx, rv.b.moe_w, L, f.router_logit_b, f.expert_scale);
 
   bf16* act_bf16 =
       round_q8 && moe_round_bf16_down(f.down, R, K, I, msc, L) ? reinterpret_cast<bf16*>(rv.b.moe_act) : nullptr;
@@ -1767,6 +1780,13 @@ void moe_layer(const Pass& ps, const MoeBlock& f, bool fused) {
     float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
     shortconv_pass(rv.b.post_raw, H, f.post_conv, nullptr, sc.win, sc.w_stride, kSlotCur, next_sel, skip, rep,
                    rep_stride, kSlotCur, f.sconv_offset, sc.channels, H, f.conv, 0, s->P, R, x_cur, H, st, true);
+  } else if (shared_y) {
+    // Gemma 4's: the experts' output into h (free past the gate|up GEMM), normed and added to the MLP's, the sum
+    // normed and added to x, x then times the layer's scalar
+    moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, rv.b.h, H, false, msc, L, act_bf16,
+             grouped);
+    norm_add(shared_y, H, rv.b.h, H, f.post_norm.w, f.post_norm.offset, f.post_norm.eps, nullptr, R, H, st);
+    norm_add(rv.b.x, H, shared_y, H, f.out_norm.w, f.out_norm.offset, f.out_norm.eps, f.out_scale, R, H, st);
   } else {
     float* x_cur = (ps.res && ps.res->x_cur) ? ps.res->x_cur : rv.b.x;
     moe_down(rv.b.moe_act, I, f.down, rv.b.moe_idx, rv.b.moe_w, R, K, H, I, x_cur, H, true, msc, L, act_bf16,

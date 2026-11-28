@@ -833,7 +833,7 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   f.route_scale = b.route_scale;
   f.norm_eps = b.norm_eps;
   expect(b.act == FLYX_MOE_SWIGLU || (b.act == FLYX_MOE_SITU && b.situ_beta > 0.f) ||
-             (b.act == FLYX_MOE_SWIGLU_OAI && b.act_limit > 0.f),
+             (b.act == FLYX_MOE_SWIGLU_OAI && b.act_limit > 0.f) || b.act == FLYX_MOE_GELU_TANH,
          "an MoE block's activation out of range");
   const bool oai = b.act == FLYX_MOE_SWIGLU_OAI;
   f.act = MoeAct{b.act, oai ? b.act_alpha : b.situ_beta, oai ? b.act_limit : b.situ_linear_beta, nullptr};
@@ -873,6 +873,40 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   if (b.sconv >= 0) {
     f.sconv = state_of(sm.sconv, b.sconv, "ShortConv");
     f.sconv_offset = b.sconv_offset;
+  }
+  // Gemma 4's (ABI 58): its MLP beside the experts, the norms after both and after their sum, together
+  const bool gemma = b.has_shared || b.has_post_norm || b.has_out_norm;
+  expect(!gemma || (b.has_shared && b.has_post_norm && b.has_out_norm && b.post_conv < 0 && b.res_query < 0 &&
+                    b.loop_rank == 0 && b.down_b < 0),
+         "an MoE block with some of Gemma 4's MLP beside its experts and norms after them, not all");
+  if (gemma) {
+    f.shared = b.shared;
+    f.post_norm = norm(L, b.post_norm);
+    f.out_norm = norm(L, b.out_norm);
+    if (b.out_scale >= 0) f.out_scale = L.vec(b.out_scale);
+  }
+  if (b.has_router_norm) {  // its norm's weight, its scale and router_mul in one weight of the router's norm
+    expect(b.router_norm.w >= 0 || b.router_norm.offset == 0.0, "a weightless router norm with an offset");
+    std::vector<float> w(H, 1.f);
+    if (b.router_norm.w >= 0) {
+      const std::vector<float> v = L.host_f32(b.router_norm.w);
+      expect(v.size() == H, "an MoE block's router norm is not [H]");
+      for (size_t c = 0; c < H; ++c) w[c] = float(b.router_norm.offset) + v[c];
+    }
+    if (b.router_in >= 0) {
+      const std::vector<float> v = L.host_f32(b.router_in);
+      expect(v.size() == H, "an MoE block's router scale is not [H]");
+      for (size_t c = 0; c < H; ++c) w[c] *= v[c];
+    }
+    if (b.router_mul != 0.f)
+      for (float& x : w) x *= b.router_mul;
+    f.router_in = L.model()->alloc<float>(H);
+    CK(cudaMemcpy(f.router_in, w.data(), H * sizeof(float), cudaMemcpyHostToDevice));
+    f.router_eps = float(b.router_norm.eps);
+  }
+  if (b.has_expert_scale) {
+    expect(L.host_f32(b.expert_scale).size() == E, "an MoE block's expert scales are not [E]");
+    f.expert_scale = L.vec(b.expert_scale);
   }
   return f;
 }

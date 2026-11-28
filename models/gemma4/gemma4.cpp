@@ -7,10 +7,13 @@
 // rope_freqs.weight as llama.cpp writes it (a factor 1 for a pair that turns, 1e30 for one that does not).  What
 // the file does not say, the architecture does (Hugging Face's Gemma4ForCausalLM): plain RMSNorm weights, v normed
 // without one, q.k unscaled, GELU's tanh form, and the embedding times sqrt(hidden) rounded to bf16 as the
-// checkpoints' bf16 forward rounds it.  Per-layer embeddings, shared K/V layers and experts (E2B, E4B, 26B-A4B) are
-// refused here for now.
+// checkpoints' bf16 forward rounds it.  A layer with experts (26B-A4B: one with a router, ffn_gate_inp) runs its
+// dense MLP beside them (models/model.h's MoE block: its shared MLP), each between norms of its own, the sum normed
+// again before the residual add.  Per-layer embeddings and shared K/V layers (E2B, E4B) are refused here for now.
 #include "models/gemma4/gemma4.h"
 
+#include <algorithm>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -28,6 +31,7 @@ struct Layer {
   int n_kv = 0, head_dim = 0, rot_dim = 0, inter = 0;
   double theta = 0;
   bool v_from_k = false;
+  bool moe = false;  // experts beside its MLP
 };
 
 struct Config {
@@ -36,6 +40,7 @@ struct Config {
   float softcap = 0.f;
   int trained_ctx = 0;
   bool gguf = false;
+  int n_experts = 0, top_k = 0, moe_inter = 0;
   std::vector<Layer> layers;
 };
 
@@ -49,6 +54,11 @@ void validate(const Config& c, int hd_full, int hd_swa) {
     if (l.n_kv < 1 || c.n_heads % l.n_kv || l.inter < 1 || l.inter > kMaxWidth || l.rot_dim < 2 ||
         l.rot_dim > l.head_dim || l.rot_dim % 2 || !(l.theta > 0))
       throw std::runtime_error("invalid Gemma 4 layer configuration");
+  const bool moe = std::any_of(c.layers.begin(), c.layers.end(), [](const Layer& l) { return l.moe; });
+  if (moe && (c.n_experts < 1 || int64_t(c.n_experts) * std::max(c.moe_inter, c.hidden) > INT_MAX || c.top_k < 1 ||
+              c.top_k > c.n_experts ||
+              c.moe_inter < 1 || c.moe_inter > kMaxWidth))
+    throw std::runtime_error("invalid Gemma 4 experts' configuration");
 }
 
 // A .flyx file's config (python/convert canonical_gemma4_config).
@@ -67,6 +77,9 @@ Config read_flyx_config(const ModelFile& file) {
   const int inter = j.at("inter"), rot_full = j.at("rot_dim_full");
   const double theta = j.at("rope_theta"), theta_swa = j.at("rope_theta_swa");
   const bool k_eq_v = j.at("k_eq_v");
+  c.n_experts = j.value("experts", 0);
+  c.top_k = j.value("top_k", 0);
+  c.moe_inter = j.value("moe_inter", 0);
   const auto& types = j.at("layer_types");
   if (!types.is_array() || int(types.size()) != j.at("layers").get<int>())
     throw std::runtime_error("Gemma 4 layer_types: not one a layer");
@@ -80,6 +93,7 @@ Config read_flyx_config(const ModelFile& file) {
     l.theta = l.sliding ? theta_swa : theta;
     l.inter = inter;
     l.v_from_k = !l.sliding && k_eq_v;
+    l.moe = c.n_experts > 0;  // Hugging Face's enable_moe_block: every layer's
     c.layers.push_back(l);
   }
   validate(c, hd_full, hd);
@@ -142,13 +156,16 @@ Config read_config(const ModelFile& file) {
   c.trained_ctx = m.count_or("context_length", 0, 0);
   for (const char* key : {"attention.layer_norm_rms_epsilon", "rope.freq_base", "rope.freq_base_swa"})
     if (!m.has(key)) throw std::runtime_error(std::string("GGUF without gemma4.") + key);
-  // What this build does not run yet: per-layer embeddings (E2B, E4B), layers reading another's K/V, experts.
+  // What this build does not run yet: per-layer embeddings (E2B, E4B), layers reading another's K/V.
   if (m.count_or("embedding_length_per_layer_input", 0, 0) != 0)
     throw std::runtime_error("Gemma 4 with per-layer embeddings (E2B, E4B) is not supported yet");
   if (m.count_or("attention.shared_kv_layers", 0, 0) != 0)
     throw std::runtime_error("Gemma 4 with shared K/V layers is not supported yet");
-  if (m.count_or("expert_count", 0, 0) != 0)
-    throw std::runtime_error("Gemma 4 with experts (26B-A4B) is not supported yet");
+  if (m.count_or("expert_count", 0, 0) != 0) {
+    c.n_experts = m.count("expert_count");
+    c.top_k = m.count("expert_used_count");
+    c.moe_inter = m.count("expert_feed_forward_length");
+  }
   const int hd_full = m.count("attention.key_length"), hd_swa = m.count("attention.key_length_swa");
   if (m.count("attention.value_length") != hd_full || m.count("attention.value_length_swa") != hd_swa)
     throw std::runtime_error("Gemma 4 attention key and value lengths differ");
@@ -174,6 +191,8 @@ Config read_config(const ModelFile& file) {
     l.theta = l.sliding ? theta_swa : theta;
     l.inter = inter[size_t(i)];
     l.v_from_k = !file.tensor("blk." + std::to_string(i) + ".attn_v.weight");
+    l.moe = file.tensor("blk." + std::to_string(i) + ".ffn_gate_inp.weight") != nullptr;
+    if (l.moe && c.n_experts == 0) throw std::runtime_error("GGUF Gemma 4 router without gemma4.expert_count");
     if (l.sliding && l.v_from_k) throw std::runtime_error("Gemma 4 sliding layer without a v projection");
     if (c.n_heads % l.n_kv) throw std::runtime_error("Gemma 4 query heads not a multiple of a layer's K/V heads");
     c.layers.push_back(l);
@@ -191,6 +210,16 @@ std::string gguf_name(const std::string& name) {
   if (suffix == "attn.post_norm") return layer + "post_attention_norm.weight";
   if (suffix == "mlp.post_norm") return layer + "post_ffw_norm.weight";
   if (suffix == "layer_scalar") return layer + "layer_output_scale.weight";
+  // a layer with experts: the dense MLP's norm after it, the experts' and the router's tensors
+  static const std::pair<std::string_view, const char*> kMoe[] = {
+      {"mlp.post_norm_1", "post_ffw_norm_1.weight"},  {"moe.norm", "pre_ffw_norm_2.weight"},
+      {"moe.post_norm", "post_ffw_norm_2.weight"},    {"moe.router", "ffn_gate_inp.weight"},
+      {"moe.router_in", "ffn_gate_inp.scale"},        {"moe.expert_scale", "ffn_down_exps.scale"},
+      {"moe.gate_up", "ffn_gate_up_exps.weight"},     {"moe.gate", "ffn_gate_exps.weight"},
+      {"moe.up", "ffn_up_exps.weight"},               {"moe.down", "ffn_down_exps.weight"},
+  };
+  for (const auto& [c, f] : kMoe)
+    if (suffix == c) return layer + f;
   // "post_norm" is the MLP's own norm before it (Hugging Face's pre_feedforward_layernorm)
   if (const char* mapped = gguf_dense_layer_name(suffix, "ffn_norm.weight")) return layer + mapped;
   throw std::out_of_range("unknown Gemma 4 GGUF tensor: " + name);
@@ -205,6 +234,7 @@ class Gemma4 final : public Model {
 
  private:
   void add_layers(std::vector<flyx_node>* p) const;
+  int moe_block(const std::string& p, const Config& c, int shared, const Tables::NameFn& n);
 
   int embed_ = -1, head_ = -1;
   std::vector<int> layers_;  // per layer: attention block, MLP block
@@ -215,6 +245,7 @@ bool Gemma4::build(const ModelFile& file, const ModelOptions& o, std::string* er
   const Config c = read_config(file);
   trained_ctx_ = c.trained_ctx;
   kv_fp8_by_default_ = false;  // binary16 K/V until a real model's measures say FP8 costs nothing
+  verify_scales_with_width_ = c.n_experts > 0;  // with experts, every row reads its own
   drafters::TargetSpec target{};
   target.arch = file.arch();
   target.hidden = c.hidden;
@@ -264,10 +295,15 @@ bool Gemma4::build(const ModelFile& file, const ModelOptions& o, std::string* er
     flyx_mlp_block& f = T.blocks[size_t(mlp)].mlp;
     f.act = FLYX_MLP_GELU_TANH;
     f.has_post_norm = 1;
-    f.post_norm = T.norm(n(p + "mlp.post_norm"), H, 0.0, c.eps);
-    f.has_out_scale = 1;
-    f.out_scale = T.weight(n(p + "layer_scalar"), {1});
-    layers_.push_back(mlp);
+    if (!l.moe) {
+      f.post_norm = T.norm(n(p + "mlp.post_norm"), H, 0.0, c.eps);
+      f.has_out_scale = 1;
+      f.out_scale = T.weight(n(p + "layer_scalar"), {1});
+      layers_.push_back(mlp);
+    } else {
+      f.post_norm = T.norm(n(p + "mlp.post_norm_1"), H, 0.0, c.eps);
+      layers_.push_back(moe_block(p, c, mlp, n));
+    }
     const flyx_attn_block& ab = T.blocks[size_t(layers_[layers_.size() - 2])].attn;
     (l.sliding ? at.kv_sliding : at.kv_full) = ab.kv;  // its last layer of each kind's, by the end
     (l.sliding ? at.n_kv_sliding : at.n_kv_full) = l.n_kv;
@@ -287,6 +323,58 @@ bool Gemma4::build(const ModelFile& file, const ModelOptions& o, std::string* er
   }
   finish(H, c.vocab);
   return true;
+}
+
+// A layer's experts (Hugging Face's Gemma4TextRouter and Gemma4TextExperts), the dense MLP `shared` beside them:
+// the router over the weightless RMSNorm of the layer's input times its scale and 1 / sqrt(hidden), a softmax over
+// every expert, the top_k normalized and each times its expert's scale; the experts' GELU (tanh) GLU over their own
+// normed input; their output normed and added to the MLP's normed output, the sum normed before the residual add,
+// the layer times its scalar.
+int Gemma4::moe_block(const std::string& p, const Config& c, int shared, const Tables::NameFn& n) {
+  Tables& T = tables_;
+  const int H = c.hidden, E = c.n_experts, I = c.moe_inter;
+  flyx_block mb{};
+  mb.kind = FLYX_BLOCK_MOE;
+  auto& m = mb.moe;
+  m.hidden = H;
+  m.inter = I;
+  m.n_experts = E;
+  m.top_k = c.top_k;
+  m.gating = 0;
+  m.norm_weights = 1;
+  m.norm_eps = 0.f;
+  m.route_scale = 1.f;
+  m.act = FLYX_MOE_GELU_TANH;
+  m.norm = T.norm(n(p + "moe.norm"), H, 0.0, c.eps);
+  m.router = T.weight(n(p + "moe.router"), {E, H});
+  m.router_bias = m.router_logit_b = -1;
+  if (T.has(n(p + "moe.gate_up"))) {
+    m.gate_up = T.weight(n(p + "moe.gate_up"), {E, 2 * I, H});
+    m.gate = m.up = -1;
+  } else {
+    m.gate_up = -1;
+    m.gate = T.weight(n(p + "moe.gate"), {E, I, H});
+    m.up = T.weight(n(p + "moe.up"), {E, I, H});
+  }
+  m.down = T.weight(n(p + "moe.down"), {E, H, I});
+  m.gate_b = m.up_b = m.down_b = -1;
+  m.post_conv = m.res_query = -1;
+  m.loop_ctrl_down = m.loop_ctrl_gain = m.loop_ctrl_forget = -1;
+  m.sconv = -1;
+  m.has_router_norm = 1;
+  m.router_norm = flyx_norm{-1, 0, 0.0, c.eps};
+  m.router_in = T.weight(n(p + "moe.router_in"), {H});
+  m.router_mul = float(1.0 / std::sqrt(double(H)));
+  m.has_expert_scale = 1;
+  m.expert_scale = T.weight(n(p + "moe.expert_scale"), {E});
+  m.has_shared = 1;
+  m.shared = shared;
+  m.has_post_norm = 1;
+  m.post_norm = T.norm(n(p + "moe.post_norm"), H, 0.0, c.eps);
+  m.has_out_norm = 1;
+  m.out_norm = T.norm(n(p + "mlp.post_norm"), H, 0.0, c.eps);
+  m.out_scale = T.weight(n(p + "layer_scalar"), {1});
+  return T.block(mb);
 }
 
 void Gemma4::add_layers(std::vector<flyx_node>* p) const {

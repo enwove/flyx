@@ -793,8 +793,9 @@ typedef struct {
 
 /* An expert's activation on its gate and up rows (ABI 56).  SWIGLU: silu(gate) * up.  SITU: Inkling-2's
  * (situ_beta, situ_linear_beta).  SWIGLU_OAI (gpt-oss): g = min(gate, act_limit), u = clamp(up, -act_limit,
- * act_limit), (u + 1) * g * sigmoid(act_alpha * g).  ops/activation/ref.h. */
-typedef enum { FLYX_MOE_SWIGLU = 0, FLYX_MOE_SITU = 1, FLYX_MOE_SWIGLU_OAI = 2 } flyx_moe_act;
+ * act_limit), (u + 1) * g * sigmoid(act_alpha * g).  GELU_TANH (ABI 58, Gemma 4): gelu_tanh(gate) * up.
+ * ops/activation/ref.h. */
+typedef enum { FLYX_MOE_SWIGLU = 0, FLYX_MOE_SITU = 1, FLYX_MOE_SWIGLU_OAI = 2, FLYX_MOE_GELU_TANH = 3 } flyx_moe_act;
 
 /* Sparse Mixture-of-Experts block (ABI 45): optional depth-residual mix and cross-pass FFN controller,
  * RMSNorm, F32 router (softmax or sigmoid + optional bias), top-k routing with optional normalization & scale,
@@ -822,6 +823,24 @@ typedef struct {
   int32_t gate, up;
   int32_t gate_b, up_b, down_b;
   int32_t router_logit_b;
+  /* ABI 58 (Gemma 4's 26B-A4B), each off in a block built zeroed.  has_router_norm 1: the router reads
+   * router_norm(x) (its weight -1: none) * router_in [H] (-1: none) * router_mul, not the experts' normed rows;
+   * has_expert_scale 1: the routed weights times expert_scale [E] after their normalization; has_shared 1: the MLP
+   * block `shared` (FLYX_BLOCK_MLP: its own norm before it, its post_norm after, never its out_scale) runs beside the
+   * experts on the same rows, its output added to theirs; has_post_norm 1: the experts' output normed (post_norm)
+   * before that sum; has_out_norm 1: x = (x + out_norm(the sum)) * out_scale ([1], -1: 1) in place of x += it. */
+  int32_t has_router_norm;
+  flyx_norm router_norm;
+  int32_t router_in;
+  float router_mul;
+  int32_t has_expert_scale, expert_scale;
+  int32_t has_shared, shared;
+  int32_t has_post_norm;
+  flyx_norm post_norm;
+  int32_t has_out_norm;
+  flyx_norm out_norm;
+  int32_t out_scale;
+  int32_t pad1;
 } flyx_moe_block;
 
 /* One layer of a DSpark parallel block drafter (ABI 45): per-layer context tap mix + K/V projection,

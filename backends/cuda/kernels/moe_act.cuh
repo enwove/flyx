@@ -19,6 +19,7 @@ __device__ __forceinline__ float moe_act_val(const MoeAct& mact, float g, float 
     const float gc = fminf(g, mact.b), uc = fminf(fmaxf(u, -mact.b), mact.b);
     return (uc + 1.f) * gc * sigm(mact.a * gc);
   }
+  if (mact.kind == FLYX_MOE_GELU_TANH) return gelu_tanh(g) * u;
   if (mact.kind == FLYX_MOE_SITU && mact.a > 0.f) {
     const float act = mact.a * tanhf(g / mact.a) * sigm(g);
     return act * (mact.b > 0.f ? mact.b * tanhf(u / mact.b) : u);

@@ -424,12 +424,72 @@ void gemma4(const std::string& dir, const std::string& backend) {
                              " of 24 places (8-bit inputs)");
     }
   }
+  // With experts beside every MLP (26B-A4B's layers): transformers' tokens on float32 weights, and its tokens teacher
+  // forced in passes of 64 rows (bf16 tensor cores) and on Q8_0 weights (half-precision inputs).  A row's experts
+  // are the router's two best of eight: of the hundreds of choices a case makes some nearly tie, and the rounding of
+  // an input moves an expert there, which can move a token.  Prompt lookup's rounds and the unfused kernels give
+  // plain decoding's tokens; the float64 backend's, teacher forced, at 8-bit inputs.
+  {
+    const std::string moe = dir + "/tiny_gemma4_moe.gguf", moe32 = dir + "/tiny_gemma4_moe_f32.gguf";
+    std::ifstream fm(dir + "/golden_gemma4_moe.json"), fm32(dir + "/golden_gemma4_moe_f32.json");
+    const json gm = json::parse(fm), gm32 = json::parse(fm32);
+    auto f32_exact = engine(moe32, backend, {.activations = "exact"});
+    auto f32_long = engine(moe32, backend, {.prefill_chunk = 64, .activations = "exact"});
+    auto q8_exact = engine(moe, backend, {.activations = "exact"});
+    for (const auto& item : gm32.at("cases")) {
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      const auto want = item.at("tokens").get<std::vector<int32_t>>();
+      if (backend == "cpu_ref") {
+        check(same_tokens(tokens_of(*f32_exact, p, int(want.size())), want), "tiny gemma4_moe_f32: transformers' tokens");
+      } else {  // a pass's 1..16-row GEMMs read float32 inputs as two bf16 halves: a routing tie closer than that moves
+        const int short_agree = forced_agreement(*f32_exact, p, want);
+        check(short_agree + 1 >= int(want.size()), "tiny gemma4_moe_f32: transformers' tokens teacher forced, at " +
+                                                       std::to_string(short_agree) + " of " +
+                                                       std::to_string(want.size()));
+      }
+      const int agree = forced_agreement(*f32_long, p, want);
+      check(agree + 1 >= int(want.size()), "tiny gemma4_moe_f32: transformers' tokens teacher forced in passes of up "
+                                           "to 64 rows, at " + std::to_string(agree) + " of " +
+                                           std::to_string(want.size()));
+    }
+    for (const auto& item : gm.at("cases")) {
+      const auto p = item.at("prompt").get<std::vector<int32_t>>();
+      const auto want = item.at("tokens").get<std::vector<int32_t>>();
+      const int agree = forced_agreement(*q8_exact, p, want);
+      check(agree + 2 >= int(want.size()), "tiny gemma4_moe: transformers' tokens teacher forced, at " +
+                                           std::to_string(agree) + " of " + std::to_string(want.size()));
+    }
+    auto m_plain = engine(moe, backend);
+    auto m_lookup = engine(moe, backend, {.speculative = true, .drafter = "none", .lookup = true});
+    std::unique_ptr<Engine> m_unfused, m_ref;
+    if (backend != "cpu_ref") {
+      m_unfused = engine(moe, backend, {.options = "fusion=0"});
+      m_ref = engine(moe, "cpu_ref");
+    }
+    for (const auto& item : gm.at("cases")) {
+      auto p = item.at("prompt").get<std::vector<int32_t>>();
+      const size_t n = p.size();
+      for (size_t i = 0; i < 2 * n; ++i) p.push_back(p[i % n]);
+      const auto want = tokens_of(*m_plain, p, 24);
+      check(tokens_of(*m_lookup, p, 24) == want, "tiny gemma4 MoE: prompt lookup's rounds give plain decoding's");
+      if (m_unfused) {
+        check(tokens_of(*m_unfused, p, 24) == want, "tiny gemma4 MoE: fusion=0 gives the fused kernels' tokens");
+        const int agree = forced_agreement(*m_plain, p, tokens_of(*m_ref, p, 24));
+        check(agree >= 18, "tiny gemma4 MoE: teacher forced, the float64 backend's tokens at " +
+                               std::to_string(agree) + " of 24 places (8-bit inputs)");
+      }
+    }
+  }
   // Its assistant beside it (models/gemma4/assistant.h): the first round drafts what transformers' assistant drafts
   // on the same K/V (its drafts of a clear margin), and its rounds give plain decoding's tokens, greedy and seeded.
   const std::string assistant = dir + "/tiny_gemma4_assistant";
   auto mtp = engine(path, backend, {.speculative = true, .drafter = "mtp", .drafter_files = {assistant}});
   auto mtp_exact = engine(path, backend, {.speculative = true, .drafter = "mtp", .drafter_files = {assistant},
                                           .options = "draft_weights=exact", .activations = "exact"});
+  // the same assistant as llama.cpp's GGUF of it (unsloth's MTP/mtp-*.gguf)
+  auto mtp_gguf = engine(path, backend, {.speculative = true, .drafter = "mtp",
+                                         .drafter_files = {assistant + ".gguf"}, .options = "draft_weights=exact",
+                                         .activations = "exact"});
   size_t compared = 0;
   for (const auto& item : golden.at("cases")) {
     const auto p = item.at("prompt").get<std::vector<int32_t>>();
@@ -445,8 +505,42 @@ void gemma4(const std::string& dir, const std::string& backend) {
     check(first && first->n_drafts > 0 && std::equal(drafts.begin(), drafts.begin() + std::ptrdiff_t(n), first->drafts),
           "tiny gemma4: its assistant's first drafts are transformers'");
     compared += n;
+    std::vector<int32_t> got_gguf;
+    const auto trace_gguf = traced(*mtp_gguf, p, 24, &got_gguf);
+    check(got_gguf == got && trace_gguf.size() > 1 && trace_gguf[1].n_drafts == first->n_drafts &&
+              std::equal(first->drafts, first->drafts + first->n_drafts, trace_gguf[1].drafts),
+          "tiny gemma4: its assistant's GGUF drafts as its directory does");
   }
   check(compared >= 10, "tiny gemma4: " + std::to_string(compared) + " of its assistant's drafts compared");
+
+  // The same weights from transformers' layout through python/convert (tiny_gemma4.flyx: float32, the blocks' values)
+  // give transformers' tokens; its MLPs in NVFP4 as NVIDIA's checkpoints (tiny_gemma4_nvfp4.flyx) decode as their
+  // own plain decoding under prompt lookup and the assistant, and the float64 backend's tokens teacher forced.
+  auto flyx_exact = engine(dir + "/tiny_gemma4.flyx", backend, {.activations = "exact"});
+  for (const auto& item : golden.at("cases")) {
+    const auto p = item.at("prompt").get<std::vector<int32_t>>();
+    const auto want = item.at("tokens").get<std::vector<int32_t>>();
+    check(same_tokens(tokens_of(*flyx_exact, p, int(want.size())), want),
+          "tiny gemma4 .flyx (python/convert): transformers' tokens");
+  }
+  const std::string fp4 = dir + "/tiny_gemma4_nvfp4.flyx";
+  auto fp4_plain = engine(fp4, backend);
+  auto fp4_lookup = engine(fp4, backend, {.speculative = true, .drafter = "none", .lookup = true});
+  auto fp4_mtp = engine(fp4, backend, {.speculative = true, .drafter = "mtp", .drafter_files = {assistant}});
+  std::unique_ptr<Engine> fp4_ref = backend != "cpu_ref" ? engine(fp4, "cpu_ref") : nullptr;
+  for (const auto& item : golden.at("cases")) {
+    auto p = item.at("prompt").get<std::vector<int32_t>>();
+    const size_t n = p.size();
+    for (size_t i = 0; i < 2 * n; ++i) p.push_back(p[i % n]);
+    const auto want = tokens_of(*fp4_plain, p, 24);
+    check(tokens_of(*fp4_lookup, p, 24) == want, "tiny gemma4 NVFP4: prompt lookup's rounds give plain decoding's");
+    check(tokens_of(*fp4_mtp, p, 24) == want, "tiny gemma4 NVFP4: its assistant's rounds give plain decoding's");
+    if (fp4_ref) {
+      const int agree = forced_agreement(*fp4_plain, p, tokens_of(*fp4_ref, p, 24));
+      check(agree >= 20, "tiny gemma4 NVFP4: teacher forced, the float64 backend's tokens at " +
+                             std::to_string(agree) + " of 24 places");
+    }
+  }
 }
 
 // The MTP layer in a file of its own (EngineOptions::drafter_files; unsloth ships the 27B's so): the quantized tiny
