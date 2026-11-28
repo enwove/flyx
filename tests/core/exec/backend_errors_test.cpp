@@ -7,6 +7,10 @@
 #include "core/exec/engine.h"
 #include "core/os/path.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 extern "C" void flyx_test_delegate(const flyx_backend_api*);
 
 int main() {
@@ -48,7 +52,19 @@ int main() {
   const std::string path = opt.backend_dir + "/../lib/flyx/" + file;
   os::DynLib broken;
   std::string loader_error;
+#ifdef _WIN32
+  // Exercise the load even when the parent process has suppressed Windows error dialogs.
+  DWORD previous;
+  if (!SetThreadErrorMode(0, &previous)) return 1;
+  struct RestoreErrorMode {
+    DWORD mode;
+    ~RestoreErrorMode() { SetThreadErrorMode(mode, nullptr); }
+  } restore{previous};
+#endif
   if (broken.open(path, &loader_error) || loader_error.empty()) return 1;
+#ifdef _WIN32
+  if (GetThreadErrorMode() != 0) return 1;
+#endif
   expect_error("no usable backend\n  " + path + ": " + loader_error);
   fs::remove_all(tmp);
   return failures ? 1 : 0;

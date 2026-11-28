@@ -60,8 +60,7 @@ std::wstring wide(const std::string& s) { return win::to_wide(s); }
 std::string narrow(const std::wstring& w) { return win::to_utf8(w); }
 
 // The text of GetLastError()'s code.
-std::string last_error() {
-  const DWORD code = GetLastError();
+std::string last_error(DWORD code = GetLastError()) {
   char* text = nullptr;
   const DWORD n = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
                                  nullptr, code, 0, reinterpret_cast<char*>(&text), 0, nullptr);
@@ -202,9 +201,14 @@ bool DynLib::open(const std::string& path, std::string* err) {
   std::error_code ec;
   const auto full = std::filesystem::absolute(wide(path), ec);
   if (ec) return *err = ec.message(), false;
+  // A malformed DLL can otherwise block an unattended caller on a Windows Bad Image dialog.
+  DWORD previous = GetThreadErrorMode();
+  const BOOL mode_set = SetThreadErrorMode(previous | SEM_FAILCRITICALERRORS, &previous);
   handle_ = LoadLibraryExW(full.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+  const DWORD code = GetLastError();
+  if (mode_set) SetThreadErrorMode(previous, nullptr);
   if (!handle_) {
-    *err = last_error();
+    *err = last_error(code);
     return false;
   }
   return true;
