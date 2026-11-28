@@ -2018,6 +2018,14 @@ void moe_mxfp4_bf16_mma(bool fuse_act, bool is_down, int bm, const bf16* xa, con
 void moe_mxfp4_bf16_pass(bool fuse_act, bool is_down, int tok, const bf16* xa, const ExpertMat& W, int N_work,
                          int I_or_H, int K, const MoeScratch& sc, int max_tiles, int top_k, MoeAct mact, float* out,
                          int ld_out, const Launch& L);
+// MXFP4 experts with 8-bit inputs (FLYX_ACT_Q8) in a prefill pass (moe_mxfp4_q8.cu): the rows as moe_stage_q8 stages
+// them (xa int8 [rows][K], xs a float32 scale a block of 32), the GGML values in int8 on mma.sync s8, a unit's exact
+// sum times both scales added unit after unit in K's order: every tile shape the same bits; the rows a task
+// (moe_mxfp4_q8_pass_rows: 16, 64 or 128 by the rows an expert averages), the tasks grouped so.
+int moe_mxfp4_q8_pass_rows(int pairs, int n_experts);
+void moe_mxfp4_q8_pass(bool fuse_act, bool is_down, int tok, const int8_t* xa, const float* xs, const ExpertMat& W,
+                       int N_work, int I_or_H, int K, const MoeScratch& sc, int max_tiles, int top_k, MoeAct mact,
+                       float* out, int ld_out, const Launch& L);
 // The rows a task of the MXFP4 pass kernels for `pairs` (row, expert) pairs over n_experts, by the rows an expert has
 // on average: moe_mxfp4_bf16_pass's (32, 64 or 128) and moe_mxfp4_mxfp8_pass's (16, 64 or 128).
 int moe_mxfp4_bf16_pass_rows(int pairs, int n_experts);

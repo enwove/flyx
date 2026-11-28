@@ -139,12 +139,15 @@ void moe_case(int E, int top_k, int H, int I, int R, In in) {
   expect("gpt-oss experts' activation fused in the GEMM, as moe_act_rows' " + tag, fused, unfused, 0.0);
   // MXFP8: the down GEMM's inputs rounded from the float32 activations here, from float64 ones there: a value at an
   // e4m3 tie of one is 2^-4 of itself off in the other
-  expect("gpt-oss experts' output " + tag, down(d_y, want_y.size()), want_y, pass_in == In::mxfp8 ? 1e-4 : 5e-5);
-  // The rows' bits: a round's (16 rows or fewer) each row's alone, in every mode.  A pass's (more rows): bf16 and MXFP8
-  // inputs take the pass kernels (one sum an output in K's order, every tile shape), so a pass's rows are those of a
-  // pass of its first 17 rows (tiles of another shape where the rows an expert has differ); 8-bit inputs each row's
-  // alone.
-  const bool pass_kernels = R > FLYX_MAX_ROWS && (in == In::bf16 || in == In::mxfp8 || in == In::mxfp8_q8);
+  // A pass on the pass kernels: the down GEMM's 8-bit inputs round from float32 activations here, float64 ones there,
+  // a value at a step's tie in one a step off in the other (1/127 of its block's largest)
+  const double tol_y = pass_in == In::mxfp8 ? 1e-4 : pass_in == In::q8 && R > FLYX_MAX_ROWS ? 3e-4 : 5e-5;
+  expect("gpt-oss experts' output " + tag, down(d_y, want_y.size()), want_y, tol_y);
+  // The rows' bits: a round's (16 rows or fewer) each row's alone, in every mode.  A pass's (more rows): 8-bit, bf16 and
+  // MXFP8 inputs take the pass kernels (one sum an output in K's order, every tile shape), so a pass's rows are those of
+  // a pass of its first 17 rows (tiles of another shape where the rows an expert has differ); binary16 pairs (exact
+  // inputs) each row's alone.
+  const bool pass_kernels = R > FLYX_MAX_ROWS && in != In::a16h;
   const int R2 = pass_kernels ? FLYX_MAX_ROWS + 1 : 1;  // rows a call of the comparison
   if (R > 1) {
     float* d_act1 = dev<float>(size_t(R2) * top_k * I);

@@ -2061,7 +2061,25 @@ void test_inkling2_moe() {
              nullptr, TL);
     Vec got_y1 = down(d_y_1, size_t(H));
     Vec got_ygrp_rr(got_y_grp.begin() + ptrdiff_t(rr) * H, got_y_grp.begin() + ptrdiff_t(rr + 1) * H);
-    expect_bits("moe R=1 direct == R=37 grouped " + label, got_y1, got_ygrp_rr);
+    // MXFP4 experts with 8-bit inputs take the pass kernels in a pass (moe_mxfp4_q8_pass: within float32 sums of a
+    // round's): there a pass's row is that of another pass holding it (17 rows from 16: rr at 3), not a round's
+    const bool pass_kernels = w_gu.packed() && w_gu.blk.dtype == FLYX_DT_GGML_MXFP4 && w_gu.blk.q8;
+    if (pass_kernels) {
+      float* d_act_p = dev<float>(size_t(17) * top_k * I);
+      float* d_y_p = dev<float>(size_t(17) * H);
+      const int g = moe_gate_up(d_x + size_t(16) * H, H, w_gu, d_eidx + size_t(16) * top_k, 17, top_k, I, H,
+                                MoeAct{FLYX_MOE_SITU, beta, lb}, true, d_act_p, I, &msc, TL);
+      moe_down(d_act_p, I, w_dn, d_eidx + size_t(16) * top_k, d_ew + size_t(16) * top_k, 17, top_k, H, I, d_y_p, H,
+               false, &msc, TL, nullptr, g);
+      const Vec y17 = down(d_y_p, size_t(17) * H);
+      expect_bits("moe a pass of 17 rows == R=37 grouped " + label,
+                  Vec(y17.begin() + ptrdiff_t(rr - 16) * H, y17.begin() + ptrdiff_t(rr - 15) * H), got_ygrp_rr);
+      expect("moe R=1 direct ~ R=37 grouped " + label, got_y1, got_ygrp_rr, tol);
+      cudaFree(d_act_p);
+      cudaFree(d_y_p);
+    } else {
+      expect_bits("moe R=1 direct == R=37 grouped " + label, got_y1, got_ygrp_rr);
+    }
 
     moe_gate_up(d_x + size_t(rr) * H, H, w_gu, d_eidx + size_t(rr) * top_k, 1, top_k, I, H, MoeAct{FLYX_MOE_SITU,
                 beta, lb}, true, d_act_1, I,
@@ -2069,7 +2087,7 @@ void test_inkling2_moe() {
     moe_down(d_act_1, I, w_dn, d_eidx + size_t(rr) * top_k, d_ew + size_t(rr) * top_k, 1, top_k, H, I, d_y_1, H, false,
              &msc, TL);
     const Vec got_y1_staged = down(d_y_1, size_t(H));
-    expect_bits("moe R=1 staged == R=37 grouped " + label, got_y1_staged, got_ygrp_rr);
+    if (!pass_kernels) expect_bits("moe R=1 staged == R=37 grouped " + label, got_y1_staged, got_ygrp_rr);
 
     const int r8_0 = 16;  // covers rr = 19 at offset 3
     float* d_act_8 = dev<float>(size_t(16) * top_k * I);  // 16 rows: the grouping checks below
@@ -2087,7 +2105,7 @@ void test_inkling2_moe() {
       expect("NVFP4 R=8 down vs float64", got_y8, Vec(y, y + 8 * H), 1.5e-4);
     }
     Vec got_y8_rr(got_y8.begin() + ptrdiff_t(rr - r8_0) * H, got_y8.begin() + ptrdiff_t(rr - r8_0 + 1) * H);
-    expect_bits("moe R=8 grouped == R=37 grouped " + label, got_y8_rr, got_ygrp_rr);
+    if (!pass_kernels) expect_bits("moe R=8 grouped == R=37 grouped " + label, got_y8_rr, got_ygrp_rr);
     expect_bits("moe R=8 grouped == R=1 staged " + label, got_y8_rr, got_y1_staged);
 
     if (w_gu.q && !w_gu.packed() && vec_nvfp4) {

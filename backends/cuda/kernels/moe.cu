@@ -1434,6 +1434,26 @@ int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, in
     }
     return grouped;
   }
+  // MXFP4 experts with 8-bit inputs in a prefill pass: the pass kernels (one sum an output in K's order, any tile)
+  if (W.packed() && pass && W.blk.dtype == FLYX_DT_GGML_MXFP4 && W.blk.q8 && !q8_ready && !act_bf16) {
+    if (!sc || !sc->tasks || !sc->pairs || !sc->q8_a || !sc->q8_d || W.n_experts > sc->max_experts ||
+        top_k > sc->max_top_k)
+      throw std::runtime_error("moe_gate_up: 8-bit inputs on MXFP4 experts in a pass with the MoE scratch alone");
+    const int chunk = std::max(1, sc->chunk_rows);
+    int grouped = 0;
+    for (int r0 = 0; r0 < rows; r0 += chunk) {
+      const int rc = std::min(chunk, rows - r0), M = rc * top_k;
+      if (sc->stage_elems < size_t(rc) * size_t(K))
+        throw std::runtime_error("moe_gate_up: 8-bit rows past the scratch");
+      moe_stage_q8(x + size_t(r0) * ldx, ldx, K, rc, *sc, false, st);
+      const int bm = moe_mxfp4_q8_pass_rows(M, W.n_experts);
+      group_tasks(eidx + size_t(r0) * top_k, M, W.n_experts, bm, sc, st);
+      grouped = rc == rows ? bm : 0;
+      moe_mxfp4_q8_pass(fuse_act, false, bm, sc->q8_a, sc->q8_d, W, N_work, I, K, *sc,
+                        max_work_tiles(M, W.n_experts, bm), top_k, mact, out + size_t(r0) * top_k * ld_out, ld_out, L);
+    }
+    return grouped;
+  }
   if (W.packed()) {
     blocks_init();
     const MoeBlockOps* ops = moe_block_ops(W.blk.dtype);
@@ -1552,6 +1572,27 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
       if (pass)
         moe_mxfp4_bf16_pass(false, true, bm, sc->bf16_a, W, H, H, K, *sc, mt, top_k, MoeAct{}, sc->down_buf, H, L);
       else moe_mxfp4_bf16_mma(false, true, bm, sc->bf16_a, W, H, H, K, *sc, mt, top_k, MoeAct{}, sc->down_buf, H, L);
+      k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
+                                                                     out + size_t(r0) * ld_out, ld_out,
+                                                                     int(accumulate), ec, bias);
+    }
+    return;
+  }
+  if (W.packed() && pass && W.blk.dtype == FLYX_DT_GGML_MXFP4 && W.blk.q8 && !act_bf16) {  // as moe_gate_up
+    const bool has_down = sc && sc->down_buf && sc->tasks && sc->pairs && sc->q8_a && sc->q8_d &&
+                          W.n_experts <= sc->max_experts && top_k <= sc->max_top_k;
+    if (!has_down)
+      throw std::runtime_error("moe_down: 8-bit inputs on MXFP4 experts in a pass with the MoE scratch alone");
+    const int chunk = std::max(1, sc->chunk_rows);
+    for (int r0 = 0; r0 < rows; r0 += chunk) {
+      const int rc = std::min(chunk, rows - r0), M = rc * top_k;
+      if (sc->stage_elems < size_t(M) * size_t(K)) throw std::runtime_error("moe_down: 8-bit rows past the scratch");
+      const int* ec = eidx + size_t(r0) * top_k;
+      moe_stage_q8(act + size_t(r0) * top_k * ld_act, ld_act, K, M, *sc, false, st);
+      const int bm = moe_mxfp4_q8_pass_rows(M, W.n_experts);
+      if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st);
+      moe_mxfp4_q8_pass(false, true, bm, sc->q8_a, sc->q8_d, W, H, H, K, *sc, max_work_tiles(M, W.n_experts, bm),
+                        top_k, MoeAct{}, sc->down_buf, H, L);
       k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ew + size_t(r0) * top_k, top_k, H,
                                                                      out + size_t(r0) * ld_out, ld_out,
                                                                      int(accumulate), ec, bias);
