@@ -88,8 +88,7 @@ enum AttnImpl : int { kAttnAuto = 0, kAttnSplit = 1, kAttnPerHead = 2 };
 // moe_dp4a; tools/codegen/gen_gemm_tables.py's MOE_DP4A_TYPES says the same): the other types the original tiles
 // alone.  Also those cuda_bench and cuda_op_test exercise.
 inline constexpr int kMoeDp4aTypes[] = {FLYX_DT_GGML_IQ3_XXS, FLYX_DT_GGML_IQ2_S, FLYX_DT_GGML_IQ2_XXS,
-                                        FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q4_K,
-                                        FLYX_DT_GGML_MXFP4};
+                                        FLYX_DT_GGML_IQ2_XS, FLYX_DT_GGML_IQ4_NL, FLYX_DT_GGML_Q4_K};
 #ifdef __CUDACC__
 __host__ __device__
 #endif
@@ -100,8 +99,7 @@ constexpr bool has_moe_dp4a_variants(int dtype) {
     case FLYX_DT_GGML_IQ2_XXS:
     case FLYX_DT_GGML_IQ2_XS:
     case FLYX_DT_GGML_IQ4_NL:
-    case FLYX_DT_GGML_Q4_K:
-    case FLYX_DT_GGML_MXFP4: return true;
+    case FLYX_DT_GGML_Q4_K: return true;
     default: return false;
   }
 }

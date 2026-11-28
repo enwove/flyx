@@ -543,18 +543,19 @@ chunk apart, 24.6 -> 30.6 tok/s on this GPU (the 27B's decode GEMMs 1.1-1.35 -> 
 
 ## 8. gpt-oss-20b against llama.cpp, vLLM and SGLang (RTX PRO 6000)
 
-One RTX PRO 6000 Blackwell Server Edition (96 GB, driver `595.112.07`; flyx at this section's commit, `cmake --preset
-dev -DFLYX_CUDA_ARCHS=120-real` with CUDA 13.0's `nvcc`), greedy, up to 1024 new tokens a prompt, each prompt alone
-and in a fresh session, section 6's prompt sets (the same files and md5), the chat template as flyx renders it
-(harmony, its default reasoning), every engine fed the same token ids:
+One RTX PRO 6000 Blackwell Server Edition on Modal (96 GB, driver `620.70.06`), every engine on the same kind of
+machine, one at a time; flyx at this section's commit (`cmake --preset dev -DFLYX_CUDA_ARCHS=120-real`, CUDA 13.0);
+greedy, up to 1024 new tokens a prompt, each prompt alone and in a fresh session, section 6's prompt sets (the same
+files and md5), the chat template as flyx renders it (harmony, its default reasoning), every engine fed the same token
+ids:
 
-- **flyx** and **llama.cpp** (`7b74cb9`; `llama-server -ngl 999 -c 8192 -np 1 -fa on`, no prompt cache):
+- **flyx** and **llama.cpp** (`2a8bf0f5`, CUDA 12.9; `llama-server -ngl 999 -c 8192 -np 1 -fa on`, no prompt cache):
   `ggml-org/gpt-oss-20b-GGUF` at `41e8a94d`, `gpt-oss-20b-MXFP4.gguf` (sha256 `27cd6c43...6ae35901`: MXFP4 experts,
   Q8_0 attention, embedding and head).
-- **vLLM** 0.34.0 (FlashInfer attention, its Marlin MXFP4 MoE) and **SGLang** 0.5.23: `openai/gpt-oss-20b` at
-  `6cee5e81` (the same MXFP4 experts, bf16 elsewhere), each with its prefix cache (the defaults) and without
-  (`--no-enable-prefix-caching`, `--disable-radix-cache`): the harmony system message every prompt starts with is
-  about half of a prompt's tokens.
+- **vLLM** 0.34.0 (FlashInfer attention, the Marlin MXFP4 MoE) and **SGLang** 0.5.23 (FlashInfer's CUTLASS MXFP4 MoE),
+  CUDA 12.9: `openai/gpt-oss-20b` at `6cee5e81` (the same MXFP4 experts, bf16 elsewhere), each with its prefix cache
+  (the defaults) and without (`--no-enable-prefix-caching`, `--disable-radix-cache`): the harmony system message every
+  prompt starts with is about half of a prompt's tokens.
 
 Decode, tok/s (flyx bench's `decode_tok_s`: the tokens after the first over the time from the first to the last;
 the others through `bench/ab/server_bench.py`, streamed; with prompt lookup, tokens a round in brackets; every lookup
@@ -562,49 +563,63 @@ answer is plain decoding's, token for token; the other engines' answers are thei
 
 | set | flyx plain | flyx lookup | llama.cpp | vLLM | SGLang |
 |---|---|---|---|---|---|
-| GSM8K | 374.6 | **394.2 (1.08)** | 321.3 | 259.4 | 248.5 |
-| MATH-500 | 380.3 | **385.6 (1.06)** | 319.8 | 260.7 | 248.8 |
-| HumanEval | 380.4 | **393.2 (1.06)** | 319.9 | 260.8 | 248.8 |
-| MBPP | 380.2 | **389.2 (1.06)** | 320.9 | 260.8 | 249.1 |
-| MT-Bench | 380.4 | **444.7 (1.24)** | 318.6 | 260.5 | 248.9 |
-| chat | 380.5 | **409.0 (1.11)** | 303.3 | 260.8 | 249.1 |
+| GSM8K | 381.8 | **392.6 (1.07)** | 322.3 | 253.2 | 244.5 |
+| MATH-500 | 386.4 | **395.2 (1.07)** | 321.6 | 254.4 | 243.8 |
+| HumanEval | 386.5 | **395.2 (1.05)** | 321.1 | 254.5 | 243.8 |
+| MBPP | 386.4 | **401.7 (1.08)** | 324.4 | 254.4 | 244.1 |
+| MT-Bench | 386.5 | **435.2 (1.19)** | 323.3 | 254.5 | 243.9 |
+| chat | 386.6 | **410.1 (1.10)** | 322.9 | 254.5 | 244.1 |
 
 Prefill, ms a prompt: flyx's `prefill_ms` (in the process: the pass and the first token, no HTTP); the others' time
 to the first streamed token over HTTP on the same machine, which also holds their request handling (a millisecond
-or two):
+or two). The first prompt of the first set a server (or flyx bench) ran is left out of every engine's GSM8K, its
+first pass loading the engine's kernels (llama.cpp: 6.9 s):
 
-| set (prompts, tokens a prompt) | flyx plain | llama.cpp | vLLM | vLLM, no prefix cache | SGLang | SGLang, no radix cache |
+| set (prompts, tokens a prompt) | flyx | llama.cpp | vLLM | vLLM, no prefix cache | SGLang | SGLang, no radix cache |
 |---|---|---|---|---|---|---|
-| GSM8K (30, 138) | **17.9** | 43.4 | 20.9 | 21.8 | 24.9 | 18.5 |
-| MATH-500 (30, 165) | 19.5 | 57.8 | 23.2 | 25.9 | 24.4 | **18.0** |
-| HumanEval (30, 178) | 19.6 | 43.3 | 23.8 | 24.5 | **18.2** | 18.5 |
-| MBPP (30, 150) | 18.1 | 39.4 | 21.4 | 22.9 | **18.0** | 18.3 |
-| MT-Bench (30, 121) | **16.2** | 38.1 | 19.5 | 21.0 | 16.8 | 16.8 |
-| chat (24, 82) | **13.8** | 38.3 | 20.2 | 19.8 | 16.0 | 16.8 |
+| GSM8K (30, 138) | 17.4 | 30.4 | **16.9** | 18.1 | 19.9 | 17.3 |
+| MATH-500 (30, 165) | 21.7 | 32.5 | **17.1** | 17.8 | 20.2 | 19.3 |
+| HumanEval (30, 178) | 19.3 | 33.4 | 17.6 | 18.2 | **16.7** | 17.4 |
+| MBPP (30, 150) | 17.8 | 30.8 | 17.1 | 17.4 | **16.9** | 17.4 |
+| MT-Bench (30, 121) | 16.0 | 30.3 | 15.0 | 16.3 | **15.0** | 16.3 |
+| chat (24, 82) | **13.8** | 28.8 | 13.9 | 15.6 | 14.4 | 15.9 |
 
-flyx decodes 17-25% faster than llama.cpp, 44-46% faster than vLLM and 51-53% faster than SGLang (plain decoding;
-prompt lookup adds 1-17%). Its prefill is the fastest on GSM8K, MT-Bench and chat, even with SGLang's on MBPP, and
-7-8% behind SGLang's on MATH-500 and HumanEval, the longest prompts, although SGLang's time holds its HTTP round trip
-and flyx's does not: there flyx's MoE tiles of 16 rows pad an expert's 20-odd rows to 32 (a follow-up).
+flyx decodes 18-20% faster than llama.cpp, 51-52% faster than vLLM and 56-59% faster than SGLang (plain decoding;
+prompt lookup adds 2-13%). Its prefill is the fastest on chat, 3% behind the fastest on GSM8K, 5-7% on MBPP and
+MT-Bench, 13-16% on MATH-500 (without the one-time cost below) and HumanEval, although the others' times hold an HTTP
+round trip and flyx's does not. 72 ms of MATH-500's sum is a one-time cost: the first pass of more than 384 rows (its 406-token
+prompt) launches kernels no shorter pass does, whose modules CUDA loads then (`CUDA_MODULE_LOADING=EAGER`: 41.0 ms
+for that pass, not 113.9; 19.3 ms a prompt). What is left is the experts' tensor-core GEMM: its 8-bit inputs with a
+float32 scale per 32 values, summed and scaled 32 values at a time in the order the one-row kernels sum them (prefill
+and decoding the same bits), cost it more than the MXFP8 activations on Blackwell's block-scaled MMA (SGLang) or bf16
+ones on dequantized weights (vLLM) cost them.
 
 What made the difference, measured with `CUDA_INJECTION64_PATH=.../libflyx-trace.so FLYX_TRACE=t.tsv flyx bench ...`
-(a round: `python -I bench/trace/gaps.py t.tsv`; 341.5 -> 374.6 tok/s on GSM8K, a round 2914 -> 2700 us against a
-1625 us read of its 2.6 GB; a 145-token prompt's pass 28.8 -> 18.2 ms):
+(a round: `python -I bench/trace/gaps.py t.tsv`; an RTX PRO 6000 on RunPod, driver `595.112.07`, before them: GSM8K
+341.5 tok/s, a round 2914 us against a 1625 us read of its 2.6 GB, a 145-token prompt's pass 28.8 ms; after them on
+Modal 381.8 tok/s, a round 2674 us, the pass 17.1 ms):
 
 - **The experts' activation and biases in the GEMMs** (`MoeAct`): the clamped SwiGLU and each expert's gate and up
   biases in the gate and up GEMM's epilogue (the same bits as `moe_act_rows` after it), its rows staged in 8 bits by
-  the norm before it; the down biases in the weighted sum: 4 launches a layer fewer, 2914 -> 2801 us a round.
+  the norm before it; the down biases where each kernel weighs an expert's output, `w (down + b)` (one row alone or a
+  pass's tiles: the same bits): 4 launches a layer fewer, 2914 -> 2801 us a round.
 - **The router**: `linear_f32` with 8 warps an output where a matrix has 128 outputs or fewer (5.2 -> 2.0 us a
-  round's layer), and in prefill passes too for matrices of 64 or fewer (48 + 50 -> 15 + 8 us a layer at 145 rows,
-  the routing after it no longer waiting on a GEMM of 3 blocks).
-- **MXFP4 among the dp4a types**, `cuda_bench tune moe_gate_up` on the file (`rtxpro6000.toml`): one pair a warp, one
-  unit in flight, at 1-4 rows (one-row passes of the file's 24 gate and up GEMMs 681 against 716 us).
+  round's layer), and in prefill passes of up to 384 rows for matrices of 64 or fewer (48 + 50 -> 15 + 8 us a layer at
+  145 rows, the routing after it no longer waiting on a GEMM of 3 blocks).
+- **MXFP4's codes in registers** (`mxfp4_s8`: one byte permutation and the signs, not two lookups a word of a table in
+  shared memory): the expert GEMMs 279 against 295 us a pass's, the down GEMM of a round 15.8 against 17.2 us
+  (prefill 4% faster, decoding 2%).
 - **The MMA expert kernel 64 columns a block for MXFP4** (`kMoeMmaCT`): a tile's rows staged once for 64 columns
   instead of 16, 437 -> 291 us an expert GEMM at 145 rows (the other types keep 16: their units spill at the 64
   registers 1024 threads leave).
-- **Q8_0 passes of 129-512 rows in tiles of 64 rows** (`rtxpro6000.toml`): q|k|v and out 63 -> 45 and 69 -> 40 us.
+- **Q8_0 passes in this GPU's tiles** (`rtxpro6000.toml`, `cuda_bench tune blocks_q8`): q|k|v and out 63 -> 45 and
+  69 -> 40 us at 145 rows.
 - **Sliding-window prefill on tensor cores** (`k_flash_prefill` with the window and its ring): the even layers'
   attention 58 -> 10 us at 145 rows.
+
+Measured and left out: 32-row MMA tiles (437 -> 623 us), the MMA's operands swapped for tiles of 8 rows (293 -> 380),
+a ring of 2-8 units in flight a lane (spills at 64 registers: 293 -> 356-362), a third span buffer (291 -> 384), the
+weights staged in shared memory as the rows are (277 against 278), K in 4 runs for the out projection (38 -> 46).
 
 ```sh
 # flyx (S: each set of section 6's sets/)
@@ -620,4 +635,3 @@ python -m sglang.launch_server --model-path gpt-oss-20b --context-length 8192 --
   [--disable-radix-cache]
 python -I bench/ab/server_bench.py flyx_S.json --api sglang --json sglang_S.json
 ```
-

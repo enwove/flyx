@@ -117,6 +117,24 @@ void moe_case(int E, int top_k, int H, int I, int R, bool q8) {
   expect("gpt-oss experts' activation " + tag, unfused, want_act, 5e-5);
   expect("gpt-oss experts' activation fused in the GEMM, as moe_act_rows' " + tag, fused, unfused, 0.0);
   expect("gpt-oss experts' output " + tag, down(d_y, want_y.size()), want_y, 5e-5);
+  if (R > FLYX_MAX_ROWS) {  // the grouped MMA kernel's rows: the bits of each row alone (R = 1, dp4a)
+    float* d_act1 = dev<float>(size_t(top_k) * I);
+    float* d_y1 = dev<float>(size_t(H));
+    Vec act1(want_act.size()), y1(want_y.size());
+    for (int r = 0; r < R; ++r) {
+      const int g1 = moe_gate_up(d_x + size_t(r) * H, H, w_gu, d_eidx + size_t(r) * top_k, 1, top_k, I, H, act, true,
+                                 d_act1, I, &msc, TL);
+      moe_down(d_act1, I, w_dn, d_eidx + size_t(r) * top_k, d_ew + size_t(r) * top_k, 1, top_k, H, I, d_y1, H, false,
+               &msc, TL, nullptr, g1, d_dnb);
+      const Vec a1 = down(d_act1, size_t(top_k) * I), o1 = down(d_y1, size_t(H));
+      std::copy(a1.begin(), a1.end(), act1.begin() + ptrdiff_t(r) * top_k * I);
+      std::copy(o1.begin(), o1.end(), y1.begin() + ptrdiff_t(r) * H);
+    }
+    expect("gpt-oss experts' activation in one pass, as each row alone " + tag, fused, act1, 0.0);
+    expect("gpt-oss experts' output in one pass, as each row alone " + tag, down(d_y, want_y.size()), y1, 0.0);
+    CK(cudaFree(d_act1));
+    CK(cudaFree(d_y1));
+  }
   for (void* p : {static_cast<void*>(d_x), static_cast<void*>(d_gub), static_cast<void*>(d_dnb),
                   static_cast<void*>(d_ew), static_cast<void*>(d_eidx), static_cast<void*>(d_gu),
                   static_cast<void*>(d_act), static_cast<void*>(d_fused), static_cast<void*>(d_y)})

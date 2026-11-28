@@ -688,7 +688,7 @@ __global__ void __launch_bounds__(128)
     k_moe_blocks_down_nostage(Tables T, const float* __restrict__ act, int ld_act, const uint8_t* __restrict__ W,
                               const uint16_t* __restrict__ D, const float* __restrict__ RS, int H, int K,
                               const int* __restrict__ eidx, const float* __restrict__ ew, int top_k,
-                              float* __restrict__ out, int ld_out, int accumulate) {
+                              float* __restrict__ out, int ld_out, int accumulate, const float* __restrict__ bias) {
   pdl_trigger();
   __shared__ typename F::Local local;
   F::tables(T, local);
@@ -730,7 +730,8 @@ __global__ void __launch_bounds__(128)
       __syncthreads();
     }
     if (col < H) {
-      const float v = warp_tree_sum(acc[0]) * rs;
+      float v = warp_tree_sum(acc[0]) * rs;
+      if (bias) v += bias[size_t(e) * H + col];  // as k_moe_weighted_sum adds it
       if (lane == 0) total = __fmaf_rn(ew[r * top_k + k_slot], v, total);
     }
   }
@@ -940,7 +941,7 @@ void moe_blocks_gu(const float* x, int ldx, const ExpertMat& W, const int* eidx,
 template <class F>
 bool moe_blocks_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows,
                      int top_k, int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc,
-                     int max_tiles, bool use_mma, int dp4a, cudaStream_t st) {
+                     int max_tiles, bool use_mma, int dp4a, cudaStream_t st, const float* bias) {
   const Tables T = block_tables();
   const bool has_q8 =
       W.blk.q8 && sc && sc->q8_a && sc->down_buf && sc->stage_elems >= size_t(rows) * size_t(top_k) * size_t(K);
@@ -963,10 +964,12 @@ bool moe_blocks_down(const float* act, int ld_act, const ExpertMat& W, const int
   const dim3 grid(ceil_div(H, 4), rows);
   if (W.blk.q8)
     k_moe_blocks_down_nostage<F, true><<<grid, 128, 0, st>>>(
-        T, act, ld_act, W.blk.data, W.blk.scales, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate));
+        T, act, ld_act, W.blk.data, W.blk.scales, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate),
+        bias);
   else
     k_moe_blocks_down_nostage<F, false><<<grid, 128, 0, st>>>(
-        T, act, ld_act, W.blk.data, W.blk.scales, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate));
+        T, act, ld_act, W.blk.data, W.blk.scales, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate),
+        bias);
   return false;
 }
 

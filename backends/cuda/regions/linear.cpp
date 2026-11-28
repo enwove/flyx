@@ -47,10 +47,12 @@ void gemm_on_glu(const Lin& W, int N, int K, float* y, int ldy, int rows, bool a
 void gemm(const float* x, int ldx, const Lin& W, int N, int K, float* y, int ldy, int rows, bool accumulate,
           const Launch& L) {
   // Control projections read exact weights and float32 inputs in rounds of any width, in short prefill passes, and
-  // at any length where they have 64 outputs or fewer (gpt-oss-20b's router of 32 experts: the tensor-core GEMM's
-  // tiles of 64 rows leave the GPU all but idle there: at 145 rows 48 -> 15 us a layer, and its routing after it
-  // 50 -> 8 us, RTX PRO 6000).  Larger prefill passes of the others use the usual bf16 GEMM below.
-  if ((W.round.f32 || W.round.b16) && (rows <= 16 || L.round_rows || N <= 64)) {
+  // in passes of up to 384 rows where they have 64 outputs or fewer: the tensor-core GEMM's tiles of 64 rows leave the
+  // GPU all but idle there (gpt-oss-20b's router of 32 experts at 145 rows: 48 -> 15 us a layer, its routing after it
+  // 50 -> 8 us), while linear_f32 reads a row's inputs once an output.  RTX PRO 6000, a pass against the bf16 GEMM:
+  // Inkling-2-Mini's sinks and dynamic taps 0.92-0.96 of the time at 150-250 rows, 0.98-1.00 at 325-400, 0.99-1.01
+  // at 475, 1.02-1.03 from 1,146 to 4,673.  Longer passes use the usual bf16 GEMM below.
+  if ((W.round.f32 || W.round.b16) && (rows <= 16 || L.round_rows || (N <= 64 && rows <= 384))) {
     log_shape(L.opt, "f32", N, K, rows);
     return linear_f32(x, ldx, W.round, N, K, y, ldy, rows, accumulate, L.st);
   }

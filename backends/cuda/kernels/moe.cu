@@ -132,24 +132,6 @@ __global__ void k_moe_act_rows(const float* __restrict__ gu, int ld_gu, int I, M
   out[size_t(r) * ld_out + i] = moe_act_val(mact, row[i], row[I + i], mact.bias ? eidx[r] : 0, i, I);
 }
 
-// x[r] += sum_k w[r, k] bias[eidx[r, k]]: the experts' down biases, weighted as their outputs.
-__global__ void k_moe_down_bias(float* __restrict__ x, int ldx, const int* __restrict__ eidx,
-                                const float* __restrict__ ew, int top_k, const float* __restrict__ bias, int H) {
-  pdl_trigger();
-  const int c = blockIdx.x * blockDim.x + threadIdx.x;
-  const int r = blockIdx.y;
-  if (c >= H) return;
-  float acc = 0.f;
-  for (int k = 0; k < top_k; ++k) acc += ew[r * top_k + k] * bias[size_t(eidx[r * top_k + k]) * H + c];
-  x[size_t(r) * ldx + c] += acc;
-}
-
-void moe_down_bias(float* x, int ldx, const int* eidx, const float* ew, int rows, int top_k, const float* bias, int H,
-                   cudaStream_t st) {
-  if (rows <= 0 || H <= 0) return;
-  k_moe_down_bias<<<dim3(ceil_div(H, 256), rows), 256, 0, st>>>(x, ldx, eidx, ew, top_k, bias, H);
-}
-
 // ---- Compacted work-tile grouping & one-pass activation staging ---------------------------
 // Sorts M = rc * top_k pairs into per-expert ranges in pairs[] and emits load-balanced BM-row
 // tiles into tasks[0 .. *n_tasks) so hot experts split across SMs and empty experts consume
@@ -666,7 +648,7 @@ __global__ void __launch_bounds__(32 * kVecWarps)
 // With no per-expert output scratch, keep one row's weighted sum in registers.
 __global__ void k_moe_nvfp4_vec_sum(const float* act, int ld, const uint8_t* Q, const uint8_t* S, const float* RS,
                                     const int* ids, const float* weights, int top_k, int H, int K,
-                                    float* out, int ld_out, bool accumulate) {
+                                    float* out, int ld_out, bool accumulate, const float* bias) {
   pdl_trigger();
   pdl_wait();
   const int row = blockIdx.y, lane = threadIdx.x & 31;
@@ -678,8 +660,10 @@ __global__ void k_moe_nvfp4_vec_sum(const float* act, int ld, const uint8_t* Q, 
     float dot[1][kVecRows];
     nvfp4_vec_products<false, true>(act, ld, Q, S, RS, H, H, K, top_k, ids[pid[0]], pid, 1, c0, dot);
     if (lane == 0) {
+      const float* b = bias ? bias + size_t(ids[pid[0]]) * H : nullptr;  // as k_moe_weighted_sum adds it
 #pragma unroll
-      for (int j = 0; j < kVecRows; ++j) sum[j] = __fmaf_rn(weights[pid[0]], dot[0][j], sum[j]);
+      for (int j = 0; j < kVecRows; ++j)
+        sum[j] = __fmaf_rn(weights[pid[0]], b && c0 + j < H ? dot[0][j] + b[c0 + j] : dot[0][j], sum[j]);
     }
   }
   if (lane == 0) {
@@ -703,7 +687,7 @@ __global__ void __launch_bounds__(32 * NW)
     k_moe_nvfp4_down_serial(const float* __restrict__ act, int ld_act, const uint8_t* __restrict__ Q,
                             const uint8_t* __restrict__ S, const float* __restrict__ RS, int H, int K,
                             const int* __restrict__ eidx, const float* __restrict__ ew, int top_k,
-                            float* __restrict__ out, int ld_out, int accumulate) {
+                            float* __restrict__ out, int ld_out, int accumulate, const float* __restrict__ bias) {
   pdl_trigger();
   static constexpr int VPL = SPAN / 4, STEPS = VPL / 4, WORDS = VPL / 8, BW = VPL / 2;
   __shared__ alignas(16) bf16 sm_x[SPAN];
@@ -780,8 +764,12 @@ __global__ void __launch_bounds__(32 * NW)
     if (g == 0 && n_base < H) {
 #pragma unroll
       for (int i = 0; i < NT; ++i) {
-        total[i][0] = __fmaf_rn(w_e, acc[i][0] * rs, total[i][0]);
-        total[i][1] = __fmaf_rn(w_e, acc[i][1] * rs, total[i][1]);
+        const int col = n_base + i * 8 + 2 * t4;  // as k_moe_weighted_sum adds the bias
+        float v0 = acc[i][0] * rs, v1 = acc[i][1] * rs;
+        if (bias && col < H) v0 += bias[size_t(e) * H + col];
+        if (bias && col + 1 < H) v1 += bias[size_t(e) * H + col + 1];
+        total[i][0] = __fmaf_rn(w_e, v0, total[i][0]);
+        total[i][1] = __fmaf_rn(w_e, v1, total[i][1]);
       }
     }
   }
@@ -898,8 +886,7 @@ void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const i
   const bool vec = !act_bf16 && opts(L).moe_vec;
   if (!vec && !has_down) {
     k_moe_nvfp4_down_serial<SPAN, 4, 2><<<dim3(ceil_div(H, 64), rows), 128, 0, st>>>(
-        act, ld_act, W.q, W.s, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate));
-    if (bias) moe_down_bias(out, ld_out, eidx, ew, rows, top_k, bias, H, st);
+        act, ld_act, W.q, W.s, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate), bias);
     return;
   }
   const int capacity = has_down ? std::max(1, sc->chunk_rows) : rows;
@@ -913,8 +900,8 @@ void launch_nvfp4_down(const float* act, int ld_act, const ExpertMat& W, const i
       const int gx = ceil_div(H, kVecWarps * kVecRows);
       if (!has_down) {
         launch_dependent(k_moe_nvfp4_vec_sum, dim3(gx, rc), dim3(32 * kVecWarps), L, ac, ld_act, W.q, W.s, W.rs,
-                         ec, ew + size_t(r0) * top_k, top_k, H, K, out + size_t(r0) * ld_out, ld_out, accumulate);
-        if (bias) moe_down_bias(out + size_t(r0) * ld_out, ld_out, ec, ew + size_t(r0) * top_k, rc, top_k, bias, H, st);
+                         ec, ew + size_t(r0) * top_k, top_k, H, K, out + size_t(r0) * ld_out, ld_out, accumulate,
+                         bias);
         continue;
       }
       if (rc == 1) {
@@ -1016,7 +1003,7 @@ __global__ void __launch_bounds__(32 * kMoeWarps)
     k_moe_bf16_down_decode(const float* __restrict__ act, int ld_act, const bf16* __restrict__ W,
                            const float* __restrict__ RS, int H, int K, const int* __restrict__ eidx,
                            const float* __restrict__ ew, int top_k, float* __restrict__ out, int ld_out,
-                           int accumulate) {
+                           int accumulate, const float* __restrict__ bias) {
   pdl_trigger();
   __shared__ float sm[1][kMoeKT];
   const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -1037,7 +1024,8 @@ __global__ void __launch_bounds__(32 * kMoeWarps)
       __syncthreads();
     }
     if (col < H) {
-      const float v = warp_tree_sum(acc[0]) * rs;
+      float v = warp_tree_sum(acc[0]) * rs;
+      if (bias) v += bias[size_t(e) * H + col];  // as k_moe_weighted_sum adds it
       if (lane == 0) total = __fmaf_rn(ew[r * top_k + k_slot], v, total);
     }
   }
@@ -1474,12 +1462,10 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
         if (rc != rows || !tiles_serve(grouped, bm, rc)) group_tasks(ec, M, W.n_experts, bm, sc, st);
       }
       const bool wrote_buf = ops->down(ac, ld_act, W, ec, ewc, rc, top_k, H, K, oc, ld_out, accumulate, sc, mt,
-                                       use_mma, moe_dp4a_cfg(opts(L), W.blk.dtype, rc, false), st);
+                                       use_mma, moe_dp4a_cfg(opts(L), W.blk.dtype, rc, false), st, bias);
       if (wrote_buf)
         k_moe_weighted_sum<<<dim3(ceil_div(H, 256), rc), 256, 0, st>>>(sc->down_buf, ewc, top_k, H, oc, ld_out,
                                                                        int(accumulate), ec, bias);
-      else if (bias)
-        moe_down_bias(oc, ld_out, ec, ewc, rc, top_k, bias, H, st);
     }
     return;
   }
@@ -1498,8 +1484,7 @@ void moe_down(const float* act, int ld_act, const ExpertMat& W, const int* eidx,
                      top_k <= sc->max_top_k;
   if (!tiled) {
     k_moe_bf16_down_decode<<<dim3(ceil_div(H, kMoeWarps), rows), 32 * kMoeWarps, 0, st>>>(
-        act, ld_act, W.w, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate));
-    if (bias) moe_down_bias(out, ld_out, eidx, ew, rows, top_k, bias, H, st);
+        act, ld_act, W.w, W.rs, H, K, eidx, ew, top_k, out, ld_out, int(accumulate), bias);
     return;
   }
   const int chunk = std::max(1, sc->chunk_rows);

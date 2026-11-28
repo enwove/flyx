@@ -123,9 +123,8 @@ inline void destroy_side(SideStream& s) {
 //                         fusion=0 and round_glu=0, whose producers round their own outputs per 32)
 //   act_fp4=1|2           measurement: inputs first rounded as NVFP4 (1) or MXFP8 (2) activations would be
 //   moe_dp4a=default|original|1x1|1x2|2x1|2x2|4x1|4x2  measurement: every staged IQ3_XXS, IQ2_S, IQ2_XXS,
-//                         IQ2_XS, IQ4_NL, Q4_K and MXFP4 expert dp4a GEMM in one configuration
-//                         (variants/candidates.toml, moe_dp4a): columns per warp x K/32 units in flight per lane, a
-//                         fused column a gate/up pair;
+//                         IQ2_XS, IQ4_NL and Q4_K expert dp4a GEMM in one configuration (variants/candidates.toml,
+//                         moe_dp4a): columns per warp x K/32 units in flight per lane, a fused column a gate/up pair;
 //                         these specialize one-row grouped tiles.  default: the tables' rules (moe_gate_up) for fused
 //                         gate|up GEMMs, the original tiles elsewhere; original: those tiles everywhere.  A release
 //                         build compiles non-original configurations only for fused gate|up in the row bands and

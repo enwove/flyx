@@ -89,7 +89,7 @@ struct MoeBlockOps {
              int max_tiles, bool use_mma, int dp4a, cudaStream_t st, bf16* act_bf16);
   bool (*down)(const float* act, int ld_act, const ExpertMat& W, const int* eidx, const float* ew, int rows, int top_k,
                int H, int K, float* out, int ld_out, bool accumulate, const MoeScratch* sc, int max_tiles, bool use_mma,
-               int dp4a, cudaStream_t st);
+               int dp4a, cudaStream_t st, const float* bias);
 };
 
 const MoeBlockOps* moe_block_ops_legacy(int dtype);   // Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 MXFP4 Q2_0

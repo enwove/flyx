@@ -448,6 +448,17 @@ struct FIQ4_NL {  // q = the 16-value table's entry of the code
 };
 static_assert(sizeof(block_iq4_nl) == 18 && offsetof(block_iq4_nl, qs) == 2, "block_iq4_nl");
 
+// MXFP4's int8 values (kvalues_mxfp4: 0 1 2 3 4 6 8 12, negated where the code's bit 3 is set) of the low nibbles
+// of x's four bytes, in registers: the magnitudes through one byte permutation, the signs per byte (what
+// nibbles_through(pair_mxfp4_s8) gives, without its two shared-memory lookups and their bank conflicts).
+__device__ __forceinline__ uint32_t mxfp4_s8(uint32_t x) {
+  const uint32_t y = x & 0x0F0F0F0Fu;
+  const uint32_t sel = (y & 0x7u) | ((y >> 4) & 0x70u) | ((y >> 8) & 0x700u) | ((y >> 12) & 0x7000u);
+  const uint32_t mag = __byte_perm(0x03020100u, 0x0C080604u, sel);
+  const uint32_t neg = ((y >> 3) & 0x01010101u) * 0xFFu;
+  return (mag & ~neg) | (__vsub4(0u, mag) & neg);
+}
+
 // MXFP4 (32 weights): E8M0 scale stored as exact bfloat16 in the scales plane (blocks_pack),
 // 16 bytes of E2M1 nibble pairs (kvalues_mxfp4 = 2 * e2m1, scale = 0.5 * 2^(e - 127)).
 struct FMXFP4 {
@@ -456,22 +467,16 @@ struct FMXFP4 {
   static constexpr int kFlatRun = 0;
   static constexpr bool kScaleBf16 = true;
   using Local = Iq4Table;
-  static __device__ __forceinline__ void unit_tables(const Tables& T, Local& L) {
-    fetch(L.pairs8, T.pair_mxfp4_s8, 256);
-  }
-  static __device__ __forceinline__ void tables(const Tables& T, Local& L) {
-    fetch(L.pairs, T.pair_mxfp4, 256);
-    unit_tables(T, L);
-  }
+  static __device__ __forceinline__ void tables(const Tables& T, Local& L) { fetch(L.pairs, T.pair_mxfp4, 256); }
   FLYX_NIBBLES32
   static __device__ __forceinline__ void words(const Local& L, const Lane& n, int, uint32_t* w0, uint32_t*) {
     words_of_nibbles(L.pairs, n, w0);
   }
   static __device__ __forceinline__ float coef(int, float d0, float) { return d0; }
   static constexpr int kSub = 32;
-  static __device__ __forceinline__ void codes(const Tables&, const Local& L, const Lane& n, int, uint32_t* w) {
-    w[0] = nibbles_through(L.pairs8, n.q[0] >> n.shift);
-    w[1] = nibbles_through(L.pairs8, n.q[1] >> n.shift);
+  static __device__ __forceinline__ void codes(const Tables&, const Local&, const Lane& n, int, uint32_t* w) {
+    w[0] = mxfp4_s8(n.q[0] >> n.shift);
+    w[1] = mxfp4_s8(n.q[1] >> n.shift);
   }
   static __device__ __forceinline__ void factors(const Lane&, int, float d0, float, float* f, float* m) {
     *f = d0, *m = 0.f;
@@ -480,11 +485,11 @@ struct FMXFP4 {
     uint4 q;
   };
   static __device__ __forceinline__ Unit unit(const uint8_t* p, int) { return {ld128(p)}; }
-  static __device__ __forceinline__ void unit_codes(const Tables&, const Local& L, const Unit& u, int, uint32_t* w) {
+  static __device__ __forceinline__ void unit_codes(const Tables&, const Local&, const Unit& u, int, uint32_t* w) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      w[i] = nibbles_through(L.pairs8, word(u.q, i));
-      w[4 + i] = nibbles_through(L.pairs8, word(u.q, i) >> 4);
+      w[i] = mxfp4_s8(word(u.q, i));
+      w[4 + i] = mxfp4_s8(word(u.q, i) >> 4);
     }
   }
   static __device__ __forceinline__ void unit_factors(const Unit&, int, float d0, float, float* f, float* m) {
