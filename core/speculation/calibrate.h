@@ -38,6 +38,13 @@ void time_rounds(const flyx_backend_api* api, flyx_bmodel* bm, flyx_plan* prefil
 bool costs_plausible(const std::vector<double>& at_short, const std::vector<double>& at_long, size_t plain,
                      double tolerance = 0.02);
 
+// Prefill passes of these lengths on a scratch sequence, untimed: a kernel's first launch loads its module (CUDA's
+// lazy loading), and a process's first prompt of that length waited for it, where a server that warmed up at start
+// (vLLM's and SGLang's profile runs) does not (gpt-oss-20b on an RTX PRO 6000: 72 ms in its first pass of more than
+// 384 rows).  The tokens: `prompt` over and over.  What failed, or "" (a warm-up only: a request that fails the same
+// way says so).
+std::string warm_prefill(const flyx_backend_api* api, flyx_bmodel* bm, flyx_plan* prefill,
+                         const std::vector<int>& lengths, const std::vector<int32_t>& prompt);
 // Each of `rounds` once on a scratch sequence that first prefills `prompt`, untimed: a kernel's first launch loads its
 // module (CUDA loads them as first used), which would otherwise wait in a request's first rounds.
 void warm_rounds(const flyx_backend_api* api, flyx_bmodel* bm, flyx_plan* prefill,

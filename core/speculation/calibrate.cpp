@@ -146,6 +146,27 @@ bool costs_plausible(const std::vector<double>& at_short, const std::vector<doub
   return true;
 }
 
+std::string warm_prefill(const flyx_backend_api* api, flyx_bmodel* bm, flyx_plan* prefill,
+                         const std::vector<int>& lengths, const std::vector<int32_t>& prompt) {
+  int most = 0;
+  for (int n : lengths) most = std::max(most, n);
+  if (most <= 0 || prompt.empty()) return "";
+  flyx_seq* seq = nullptr;
+  if (api->seq_new(bm, most + 64, &seq) != 0) return std::string("a sequence of ") + std::to_string(most) + " tokens: " +
+                                                   api->last_error();
+  std::vector<int32_t> tokens;
+  tokens.reserve(static_cast<size_t>(most) + prompt.size());
+  while (static_cast<int>(tokens.size()) < most) tokens.insert(tokens.end(), prompt.begin(), prompt.end());
+  std::string why;
+  for (int n : lengths)  // no token chosen (no sampling parameters): nothing to read
+    if (api->rewind(seq, 0, 0) < 0 || api->prefill(prefill, seq, tokens.data(), n, nullptr) != 0) {
+      why = "a pass of " + std::to_string(n) + " tokens: " + api->last_error();
+      break;
+    }
+  api->seq_free(seq);
+  return why;
+}
+
 void warm_rounds(const flyx_backend_api* api, flyx_bmodel* bm, flyx_plan* prefill,
                  const std::vector<flyx_plan*>& rounds, const std::vector<int32_t>& prompt) {
   if (rounds.empty()) return;

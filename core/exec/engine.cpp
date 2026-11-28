@@ -452,6 +452,19 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
   } else {
     spec::warm_rounds(api_, bm_, plans_.prefill, plans_.rounds, prompt);
   }
+  // Prefill passes past the rounds' rows (these prefilled the prompt's 64), where the device loads kernels on their
+  // first launch (a GPU): 256 rows, then twice as many up to the longest pass, the kernels' configurations changing
+  // with the rows (gpt-oss-20b: its router's bf16 GEMM past 384).
+  if (device_.sm_major > 0) {
+    std::vector<int> lengths;
+    for (int n = 256; n < 2 * prefill_chunk_; n *= 2) {
+      const int len = std::min(n, prefill_chunk_) / prefill_align_ * prefill_align_;
+      if (len > 64 && (lengths.empty() || len > lengths.back())) lengths.push_back(len);
+    }
+    if (const std::string why = spec::warm_prefill(api_, bm_, plans_.prefill, lengths, prompt);
+        !why.empty() && opt_.verbose)
+      log::info("flyx: prefill warm-up stopped at %s", why.c_str());
+  }
   // The costs the controller chooses by from here: these timings, then what the rounds read teach (RoundCosts),
   // where they choose (one plan and no lookup: nothing timed, nothing to learn).  A drafter's wider chain costs no
   // less than its next narrower one; so does a lookup round of more drafts (given_widths ascend).
