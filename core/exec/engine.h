@@ -169,10 +169,8 @@ void apply_environment(EngineOptions* o);
 bool open_backend(const EngineOptions& o, std::unique_ptr<os::DynLib>* lib, const flyx_backend_api** api,
                   flyx_device_info* info, std::string* err);
 // The device a model would run on, before one is named (flyx serve: which files fit).  The library stays loaded for
-// the process: an engine opening it later shares it, and *api (when asked for) stays good, its device_stats the
-// device's live figures while no model is loaded.
-bool probe_device(const EngineOptions& o, std::string* backend, flyx_device_info* info, std::string* err,
-                  const flyx_backend_api** api = nullptr);
+// the process: an engine opening it later shares it.
+bool probe_device(const EngineOptions& o, std::string* backend, flyx_device_info* info, std::string* err);
 
 class Engine {
  public:

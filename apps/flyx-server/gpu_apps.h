@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "flyx/backend_abi.h"
+
 namespace flyx::server {
 
 struct GpuApp {
@@ -95,6 +97,11 @@ DeviceMatch match_device(const std::vector<DeviceSeen>& devices, const std::stri
 // Windows: the readings of the adapter DXGI chose are the hinted device's where its enumeration says so and NVML's
 // (when NVML answered: `nvml_unique`) agrees; NVML unavailable, DXGI's alone.
 bool readings_unique(bool adapter_unique, std::optional<bool> nvml_unique);
+// The GPU's live figures (load, memory, temperature, power, clocks, PCIe, fan) from NVML alone, for telemetry with no
+// model loaded: no CUDA context is made (the backend's device_stats makes one for its memory figure on Windows, and a
+// server that unloaded its model is to give the GPU back).  The device `device_hint` names (match_device: the only one
+// without a hint); *name its name.  False where NVML is missing or names no such device.
+bool nvml_device_stats(const std::string& device_hint, flyx_device_stats* out, std::string* name = nullptr);
 bool is_system_gpu_process(const std::string& proc_name, const std::string& exe_path);
 std::string clean_gpu_app_name(const std::string& proc_name, const std::string& product_name,
                                const std::string& file_desc);

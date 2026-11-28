@@ -22,6 +22,7 @@
 #include "apps/common/chat_options.h"
 #include "apps/common/version.h"
 #include "apps/flyx-server/agent_launch.h"
+#include "apps/flyx-server/gpu_apps.h"
 #include "apps/flyx-server/server.h"
 #include "core/os/os.h"
 #include "core/plan/budget.h"
@@ -80,19 +81,13 @@ ojson snapshot_json(const Server& s, int recent) {
     s.host->telemetry(&t);  // what the models before counted
     t.loaded = false;
     t.phase = TelemetrySnapshot::kUnloaded;
-    // The GPU's live figures all the same, from the backend the probe opened (Server::idle_device): probed here the
-    // first time no model is served if the start, naming a model, did not.
-    std::lock_guard<std::mutex> lock(s.idle_device.mu);
-    if (!s.idle_device.tried) {
-      s.idle_device.tried = true;
-      std::string backend, err;
-      flyx_device_info info{};
-      const flyx_backend_api* api = nullptr;
-      if (probe_device(s.base, &backend, &info, &err, &api)) s.idle_device.api = api, s.idle_device.name = info.name;
-    }
-    const flyx_backend_api* api = s.idle_device.api;
-    device_ok = api && api->device_stats && api->device_stats(&d) == 0;
-    if (device_ok) t.model.device = s.idle_device.name;
+    // The GPU's live figures all the same, from NVML alone (nvml_device_stats): no backend call, which would make a
+    // CUDA context and hold GPU memory a server without a model has given back.  The device the start-up probe
+    // found, else the one the models before ran on.
+    const std::string hint = s.device_probe.is_object() ? s.device_probe.value("name", t.model.device) : t.model.device;
+    std::string name;
+    device_ok = nvml_device_stats(hint, &d, &name);
+    if (device_ok) t.model.device = name;
   }
   t.started_at = s.started_at;  // the server's, not the served model's
   const double now = os::unix_seconds();
