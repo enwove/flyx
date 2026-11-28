@@ -364,6 +364,12 @@ void test_round_costs_learned(const char* model, const flyx_backend_api* cpu) {
   round.adaptive = true;
   check(!round.measures_fixed_cost(dspark.model()) && round.measures_fixed_cost(engine.model()),
         "a stopped parallel DSpark round has paid for the full block; a stopped sequential MTP round has not");
+  // A wide round's calibrated price can stay at its narrower neighbour's floor even after an observation.
+  // Start below the duration of a cpu_ref round so every timed sample changes the price deterministically.
+  for (RoundCosts* costs : {engine.lookup_costs(), engine.round_costs()}) {
+    if (!costs) { check(false, "missing learned cost table"); return; }
+    costs->reset(std::vector<double>(costs->size(), 0.001), nullptr, 0);
+  }
   const std::vector<double> lookup_before = costs_of(engine.lookup_costs()), before = costs_of(engine.round_costs());
   GenerateResult res;
   const int rc = generate(s, rq, [](std::string_view, const int32_t*, int) { return true; }, &res, &err);
