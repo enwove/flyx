@@ -775,7 +775,9 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   int auto_from = opt_.kv_gpu >= 0 && opt_.kv_ram != 0 ? opt_.kv_gpu : INT32_MAX;
   auto make_open_options = [&]() {
     flyx_open_options oo{};
-    oo.max_ctx = opt_.max_ctx;
+    oo.max_ctx = ple && opt_.ctx_max
+                     ? (model_->trained_ctx() > 0 ? model_->trained_ctx() : kCtxMaxUnnamed)
+                     : opt_.max_ctx;
     oo.verbose = opt_.verbose;
     oo.ple_placement = ple_placement;
     oo.ple_hot_bytes = opt_.ple_hot_bytes;
