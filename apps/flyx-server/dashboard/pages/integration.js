@@ -174,7 +174,7 @@ export function Integration({ active }) {
         </div>
 
         <h3>${t("Model management")}</h3>
-        ${Lead(String.raw`From this machine only, or with <code>--api-key</code> for the key's holder.`)}
+        ${Lead(String.raw`From this machine only, with <code>--api-key</code> for the key's holder, or with <code>--no-auth</code>.`)}
         <div class="eps">
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/load</span><span class="what">${t("Load state")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>
@@ -192,6 +192,7 @@ export function Integration({ active }) {
               <tr><td><code>ctx</code></td>${Td(String.raw`context per session, or <code>"max"</code>; left out (auto): the model's own, or the longest the GPU and host memory hold`)}</tr>
               <tr><td><code>drafter</code>, <code>speculative</code></td>${Td(String.raw`<code>mtp</code> | <code>dflash2</code> | <code>dflash</code> | <code>dspark</code> | <code>dspine</code> | <code>eagle4</code> | <code>all</code> | <code>none</code>; <code>false</code> for plain decoding`)}</tr>
               <tr><td><code>kv</code>, <code>kv_ram</code>, <code>kv_gpu</code></td>${Td(String.raw`as <code>--kv</code>, <code>--kv-ram</code> (GB or <code>"auto"</code>), <code>--kv-gpu</code>`)}</tr>
+              <tr><td><code>vram_reserve</code>, <code>ram_reserve</code></td>${Td(String.raw`as <code>--vram-reserve</code>, <code>--ram-reserve</code> (GB to leave free, <code>0</code> for minimum/all, or <code>"auto"</code>)`)}</tr>
               <tr><td><code>name</code></td>${Td(String.raw`the model id the API reports`)}</tr>
               <tr><td><code>lora</code></td>${Td(String.raw`a LoRA adapter beside the model, as <code>--lora</code>: a PEFT folder or a Hub name (<code>org/name</code>, <code>org/name:FOLDER</code>); <code>null</code> for none`)}</tr>
             </tbody></table>
@@ -201,7 +202,7 @@ export function Integration({ active }) {
         <details class="ep"><summary><span class="method delete">DELETE</span><span class="path">/v1/load</span><span class="what">${t("Stop a fetch")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>${Li(String.raw`What came stays in the cache; loading the same name again goes on from there.`)}</ul></div></details>
         <details class="ep"><summary><span class="method get">GET / POST</span><span class="path">/v1/settings/network</span><span class="what">${t("Serve on local network")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
-          <div class="body"><code>{"lan_access": true}</code><p>${t("Restart flyx to apply changes.")}</p></div></details>
+          <div class="body"><code>{"lan_access": true, "remote_manage": false}</code><p>${t("lan_access applies on restart; remote_manage applies immediately.")}</p></div></details>
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/hub/config</span><span class="what">${t("Hub mirror setting")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>${Li(String.raw`Active Hugging Face endpoint (<code>endpoint</code>), default endpoint, <code>source</code> (<code>setting</code>, <code>HF_ENDPOINT</code>, or <code>default</code>), and <code>offline</code> flag.`)}</ul></div></details>
         <details class="ep"><summary><span class="method post">POST</span><span class="path">/v1/hub/config</span><span class="what">${t("Set the Hub mirror")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
@@ -235,12 +236,12 @@ export function Integration({ active }) {
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/requests</span><span class="what">${t("Recent prompts and answers")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>
             ${Li(String.raw`The last 50 finished requests, newest first (<code>?limit=N</code>): the request body as sent, the thinking, the answer, tool calls, usage and time to first token.`)}
-            ${Li(String.raw`Kept in the server's memory only; readable from this machine or with the API key. <code>--no-request-log</code> keeps none (<code>"enabled": false</code>).`)}
+            ${Li(String.raw`Kept in the server's memory only; readable from this machine, with the API key, or over direct LAN when <code>--no-auth</code> or <code>remote_manage</code> is enabled. <code>--no-request-log</code> keeps none (<code>"enabled": false</code>).`)}
           </ul></div></details>
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/v1/logs</span><span class="what">${t("The server's log lines")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>
             ${Li(String.raw`What the server process wrote to standard error, numbered: <code>?after=SEQ</code> gives the lines after one already seen, oldest first (<code>?limit=N</code>, default 500). Answers <code>lines</code> (<code>seq</code>, <code>t</code>, <code>text</code>), <code>next</code> and <code>missed</code>.`)}
-            ${Li(String.raw`The last 2,000 lines, in memory only; readable from this machine or with the API key. <code>--no-system-log</code> keeps none.`)}
+            ${Li(String.raw`The last 2,000 lines, in memory only; readable from this machine, with the API key, or over direct LAN when <code>--no-auth</code> or <code>remote_manage</code> is enabled. <code>--no-system-log</code> keeps none.`)}
           </ul></div></details>
         <details class="ep"><summary><span class="method get">GET</span><span class="path">/health</span><span class="what">${t("Status, model, queue length")}</span><svg class="i"><use href="#i-chev"/></svg></summary>
           <div class="body"><ul>${Li(String.raw`<code>{"status": "ok", "model": ..., "queued": 0, "loaded": true}</code>`)}</ul></div></details>
@@ -296,6 +297,7 @@ export function Integration({ active }) {
           <tr><td><code>--host H</code>, <code>--port P</code></td>${Td(String.raw`where it listens, default <code>127.0.0.1:8080</code>`)}</tr>
           <tr><td><code>--name NAME</code></td>${Td(String.raw`the model id the API reports (default: the file's name)`)}</tr>
           <tr><td><code>--api-key KEY</code></td>${Td(String.raw`require <code>Authorization: Bearer KEY</code> or <code>x-api-key</code>`)}</tr>
+          <tr><td><code>--no-auth</code></td>${Td(String.raw`allow LAN dashboard and management without an API key (trusted networks only; ignores <code>FLYX_API_KEY</code>)`)}</tr>
           <tr><td><code>--cors ORIGIN</code></td>${Td(String.raw`let the pages of ORIGIN (<code>https://host[:port]</code>, an extension's origin, <code>null</code>) call the inference API from a browser; repeatable; <code>'*'</code>: any page; <code>none</code>: not even this machine's own pages, which may by default. The model panel, the request log and the logs are never another origin's`)}</tr>
           <tr><td><code>--threads N</code></td>${Td(String.raw`HTTP worker threads (64): one per request in flight, queued or running`)}</tr>
           <tr><td><code>--models-dir DIR</code></td>${Td(String.raw`also list the <code>.gguf</code> / <code>.flyx</code> files under DIR on the Model page (repeatable; also <code>FLYX_MODELS_DIR</code>)`)}</tr>
@@ -328,6 +330,8 @@ export function Integration({ active }) {
           <tr><td><code>--kv fp8|16</code></td>${Td(String.raw`the K/V cache: fp8 holds twice the context; 16 is llama.cpp's binary16 (the default where 32 GB of GPU memory are left after the weights and on Llama models, else fp8)`)}</tr>
           <tr><td><code>--kv-ram GB|auto</code></td>${Td(String.raw`host memory for the K/V past the GPU's part (auto; 0: the context shrinks to fit the GPU)`)}</tr>
           <tr><td><code>--kv-gpu N</code></td>${Td(String.raw`at most N tokens' K/V on the GPU, the rest in host memory`)}</tr>
+          <tr><td><code>--vram-reserve GB|auto</code></td>${Td(String.raw`GPU memory kept free outside FLYX (auto; 0: minimum allowed by the backend/OS)`)}</tr>
+          <tr><td><code>--ram-reserve GB|auto</code></td>${Td(String.raw`host RAM kept free outside KV (auto; 0: use all available RAM)`)}</tr>
           <tr><td><code>--kv-method M</code></td>${Td(String.raw`<code>auto</code> = <code>auto:2</code> (default), <code>exact</code>, <code>strata</code> = <code>strata:2</code>. <code>auto:3</code> uses a 3-bit scan after the switch.`)}</tr>
           <tr><td><code>--drafter D</code></td><td><code>mtp</code> | <code>dflash2</code> | <code>dflash</code> | <code>dspark</code> | <code>dspine</code> | <code>eagle4</code> | <code>dv</code> | <code>all</code> | <code>none</code></td></tr>
           <tr><td><code>--drafter-file F</code></td>${Td(String.raw`a drafter in a file or Hub repository of its own (repeatable): an MTP GGUF, DFlash2, DFlash, DSpark, DSpine or EAGLE-4`)}</tr>

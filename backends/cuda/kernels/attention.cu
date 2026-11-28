@@ -253,6 +253,7 @@ __global__ void k_attn_prep(const float* qkv, int ld, int q_off, int k_off, int 
       }
     }
   }
+  if (kv.host_writes) host_writes_done();  // the row and its copy where the kernel after reads them
 }
 
 // Partial attention over one split of the keys for up to RT rows of one head.

@@ -659,9 +659,13 @@ def telemetry_checks(cl: Client, model: str):
     check(proc["ram"] >= proc["rss"] and proc["ram"] >= t["memory"]["host_mapped"] >= 0,
           "the host memory flyx holds in all: at least its resident memory and the K/V's mapped host memory",
           json.dumps(proc))
+    # Each figure null where the device does not say it (an RTX PRO 6000's MIG slice: no utilization, memory or
+    # power), else in range.
     d = t["device"]
-    check(d is None or (0 <= d["util"] <= 100 and d["mem_total"] > d["mem_used"] > 0 and d["power_w"] > 0),
-          "device figures", json.dumps(d))
+    check(d is None or ((d["util"] is None or 0 <= d["util"] <= 100) and
+                        (d["mem_total"] is None or d["mem_used"] is None or d["mem_total"] > d["mem_used"] > 0) and
+                        (d["power_w"] is None or d["power_w"] > 0)),
+          "device figures, each where the device has it", json.dumps(d))
     check(t["memory"]["sessions"] and t["memory"]["ledger_used"] > 0 and t["process"]["rss"] > 0 and
           t["system"]["ram_total"] > 0 and t["system"]["cpus"] > 0 and t["system"]["cpu_s"] >= 0,
           "sessions, memory, process, system")

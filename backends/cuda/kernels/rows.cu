@@ -519,6 +519,7 @@ __global__ void k_kv_drain_pageable(const PageDrainLayer* layers, int n_layers, 
       L.drain_vs[dst_row * size_t(L.nkv) + size_t(h)] = L.vs[size_t(cell) * size_t(L.nkv) + size_t(h)];
     }
   }
+  host_writes_done();  // the drain is page-locked host memory the host reads after the round
 }
 
 }  // namespace

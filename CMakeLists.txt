@@ -190,6 +190,7 @@ add_library(flyx_core STATIC
   core/exec/telemetry.cpp
   core/resources/ledger.cpp
   core/speculation/controller.cpp
+  core/speculation/round_costs.cpp
   core/speculation/confidence.cpp
   core/speculation/lookup.cpp
   core/speculation/chooser.cpp

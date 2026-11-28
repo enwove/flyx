@@ -22,8 +22,10 @@ double prior_tokens(int width) {
 
 void SpecController::reset(const std::vector<int>* widths, const std::vector<int>* drafters,
                            const std::vector<double>* cost_ms, const std::vector<int>* trunks,
-                           const std::vector<double>* cost_per_token, int cost_at, SharedTokens* shared) {
+                           const std::vector<double>* cost_per_token, int cost_at, SharedTokens* shared,
+                           const RoundCostModel* costs) {
   widths_ = widths;
+  costs_ = costs;
   drafters_ = drafters;
   cost_ = cost_ms;
   per_token_ = cost_per_token;
@@ -79,6 +81,10 @@ void SpecController::reply() {
 bool SpecController::keeps_state(size_t i) const { return restarts((*drafters_)[i]); }
 
 double SpecController::cost(size_t i, int context) const {
+  return std::max(kLeastMs, costs_ ? costs_->cost(i, context) : load_cost(i, context));
+}
+
+double SpecController::load_cost(size_t i, int context) const {
   const double more = per_token_ ? (*per_token_)[i] * std::max(0, context - cost_at_) : 0.0;
   return (*cost_)[i] + more;
 }

@@ -12,6 +12,7 @@
 
 #include "apps/common/model_source.h"
 #include "core/modelfile/readers.h"
+#include "core/os/env.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
 #include "tests/common/check.h"
@@ -212,6 +213,339 @@ int main() {
               fs::file_size(lsnap / "adapters" / "small" / "adapter_config.json") == config.size() &&
               fs::file_size(lsnap / "adapters" / "small" / "adapter_model.safetensors") == 64,
           "one within it is fetched with its weights" + (ok ? std::string() : ": " + err));
+    // Expose the cached LoRA snapshot via refs/main so offline fetch_lora can resolve its Hub name.
+    const fs::path lrefs = lsnap.parent_path().parent_path() / "refs";
+    fs::create_directories(lrefs);
+    std::ofstream(lrefs / "main", std::ios::binary) << lora.commit;
+    ok = flyx::apps::fetch_lora("'" + lora.id + ":small'", {}, nullptr, &path, &err);
+    check(ok && to_path(path) == lsnap / "adapters" / "small",
+          "single-quoted Hub LoRA name resolves via fallback" + (ok ? std::string() : ": " + err));
+  }
+
+  // Leading ~ expansion (HOME and USERPROFILE) and outer single-quote fallback (cmd.exe paste).
+  {
+    const std::string saved_home = flyx::os::getenv_str("HOME");
+    const std::string saved_profile = flyx::os::getenv_str("USERPROFILE");
+    const fs::path fake_home = tmp / "home";
+    const fs::path home_model = fake_home / "models" / "Home-Tiny-Q4_K_M.gguf";
+    const fs::path home_lora = fake_home / "adapters" / "tiny-lora";
+    write_gguf(home_model, "inkling2_loop");
+    fs::create_directories(home_lora);
+    std::ofstream(home_lora / "adapter_config.json", std::ios::binary) << R"({"peft_type":"LORA","r":8})";
+
+    set_env("HOME", from_path(fake_home));
+    ok = fetched("~/models/Home-Tiny-Q4_K_M.gguf", {}, false, &f, &err);
+    check(ok && fs::weakly_canonical(to_path(f.model), ec) == fs::weakly_canonical(home_model, ec),
+          "fetch_model expands ~/ via HOME" + (ok ? std::string() : ": " + err));
+#if defined(_WIN32)
+    ok = fetched("~\\models\\Home-Tiny-Q4_K_M.gguf", {}, false, &f, &err);
+    check(ok && fs::weakly_canonical(to_path(f.model), ec) == fs::weakly_canonical(home_model, ec),
+          "fetch_model expands ~\\ via HOME" + (ok ? std::string() : ": " + err));
+#endif
+    std::string lora_path;
+    ok = flyx::apps::fetch_lora("~/adapters/tiny-lora", {}, nullptr, &lora_path, &err);
+    check(ok && fs::weakly_canonical(to_path(lora_path), ec) == fs::weakly_canonical(home_lora, ec),
+          "fetch_lora expands ~/ via HOME" + (ok ? std::string() : ": " + err));
+
+    // When HOME is empty, USERPROFILE is used.
+    set_env("HOME", "");
+    set_env("USERPROFILE", from_path(fake_home));
+    ok = fetched("~/models/Home-Tiny-Q4_K_M.gguf", {}, false, &f, &err);
+    check(ok && fs::weakly_canonical(to_path(f.model), ec) == fs::weakly_canonical(home_model, ec),
+          "fetch_model expands ~/ via USERPROFILE when HOME is unset" + (ok ? std::string() : ": " + err));
+
+    // Outer single-quote fallback for local paths (including ~/) and Hub specs.
+    ok = fetched("'" + from_path(model) + "'", {}, false, &f, &err);
+    check(ok && f.model == from_path(model),
+          "fetch_model strips outer single quotes around a local path" + (ok ? std::string() : ": " + err));
+    ok = fetched("'~/models/Home-Tiny-Q4_K_M.gguf'", {}, false, &f, &err);
+    check(ok && fs::weakly_canonical(to_path(f.model), ec) == fs::weakly_canonical(home_model, ec),
+          "fetch_model strips outer single quotes and expands ~/" + (ok ? std::string() : ": " + err));
+    ok = fetched("'" + repo + ":Q4_K_M'", {}, false, &f, &err);
+    check(ok && fs::path(to_path(f.model)).filename() == "Ink-Tiny-Q4_K_M.gguf",
+          "fetch_model strips outer single quotes around a Hub name" + (ok ? std::string() : ": " + err));
+    ok = flyx::apps::fetch_lora("'" + from_path(home_lora) + "'", {}, nullptr, &lora_path, &err);
+    check(ok && fs::weakly_canonical(to_path(lora_path), ec) == fs::weakly_canonical(home_lora, ec),
+          "fetch_lora strips outer single quotes around a local directory" + (ok ? std::string() : ": " + err));
+    for (const std::string bad : {"''", "'", "'no-such-file'"}) {
+      ok = fetched(bad, {}, false, &f, &err);
+      check(!ok && err.find(bad + ": no such file, and not a Hugging Face name") != std::string::npos,
+            "invalid quoted spec still reports crisp error: " + err);
+    }
+
+    // Remote path policy must be checked on tilde-expanded and single-quote-stripped paths before probing disk.
+    auto deny_expanded_home = [&](std::string_view p) {
+      return p.find(from_path(fake_home)) == std::string_view::npos;
+    };
+    auto deny_unc_after_unquote = [](std::string_view p) {
+      return !p.starts_with("\\\\") && !p.starts_with("//");
+    };
+    ok = flyx::apps::fetch_model("~/models/Home-Tiny-Q4_K_M.gguf", {}, false, {}, nullptr, &f, &err, "", true, true, "",
+                                 deny_expanded_home);
+    check(!ok && err.find("remote path policy") != std::string::npos,
+          "fetch_model checks allow_path on tilde-expanded path before disk access: " + err);
+    ok = flyx::apps::fetch_model("'~/models/Home-Tiny-Q4_K_M.gguf'", {}, false, {}, nullptr, &f, &err, "", true, true,
+                                 "", deny_expanded_home);
+    check(!ok && err.find("remote path policy") != std::string::npos,
+          "fetch_model checks allow_path on single-quoted tilde-expanded path before disk access: " + err);
+    ok = flyx::apps::fetch_model("'\\\\attacker\\share\\model.gguf'", {}, false, {}, nullptr, &f, &err, "", true, true,
+                                 "", deny_unc_after_unquote);
+    check(!ok && err.find("remote path policy") != std::string::npos,
+          "fetch_model checks allow_path on single-quote-stripped UNC path before disk access: " + err);
+    ok = flyx::apps::fetch_lora("'\\\\attacker\\share\\lora'", {}, nullptr, &lora_path, &err, deny_unc_after_unquote);
+    check(!ok && err.find("remote path policy") != std::string::npos,
+          "fetch_lora checks allow_path on single-quote-stripped UNC path before disk access: " + err);
+
+    set_env("HOME", saved_home);
+    set_env("USERPROFILE", saved_profile);
+  }
+  // expand_user_path and scan_model_dirs: nested non-HF layouts, mixed/unsupported files, tilde, symlinks + cycles.
+  {
+    const std::string home = flyx::os::home_dir();
+    if (!home.empty()) {
+      check(flyx::apps::expand_user_path("~") == home, "expand_user_path(\"~\") returns home_dir");
+      check(flyx::apps::expand_user_path("~/") == home && flyx::apps::expand_user_path("~///") == home,
+            "expand_user_path(\"~/\") and \"~///\" return home_dir");
+      const fs::path expected = to_path(home) / "models";
+      check(to_path(flyx::apps::expand_user_path("~/models")) == expected,
+            "expand_user_path(\"~/models\") expands tilde");
+#if defined(_WIN32)
+      check(to_path(flyx::apps::expand_user_path("~//models")) == expected &&
+                to_path(flyx::apps::expand_user_path("~\\\\models")) == expected,
+            "expand_user_path strips repeated slashes after ~ instead of escaping home");
+#else
+      check(to_path(flyx::apps::expand_user_path("~//models")) == expected,
+            "expand_user_path strips repeated slashes after ~ instead of escaping home");
+      check(flyx::apps::expand_user_path("~\\models") == "~\\models",
+            "expand_user_path preserves literal backslash after ~ on POSIX");
+#endif
+      check(flyx::apps::expand_user_path("/abs/models") == "/abs/models",
+            "expand_user_path leaves non-tilde paths untouched");
+    }
+#if !defined(_WIN32)
+    // POSIX path preservation: backslashes are literal filename characters, and symlink/.. follows the real parent.
+    {
+      const fs::path plain_dir = tmp / "posix_dir";
+      const fs::path slash_dir = tmp / "posix_dir\\";
+      const fs::path target_sub = tmp / "real_parent" / "child";
+      const fs::path link_path = tmp / "link_to_child";
+      fs::create_directories(plain_dir);
+      fs::create_directories(slash_dir);
+      fs::create_directories(target_sub);
+      std::error_code sym_ec;
+      fs::create_directory_symlink(target_sub, link_path, sym_ec);
+      check(flyx::apps::canonical_model_dir(from_path(plain_dir)) !=
+                flyx::apps::canonical_model_dir(from_path(slash_dir)),
+            "canonical_model_dir keeps /dir and /dir\\ distinct on POSIX");
+      if (!sym_ec) {
+        const std::string via_link_parent = flyx::apps::canonical_model_dir(from_path(link_path) + "/..");
+        const std::string lexical_parent = flyx::apps::canonical_model_dir(from_path(tmp));
+        const std::string real_parent = flyx::apps::canonical_model_dir(from_path(tmp / "real_parent"));
+        std::error_code eq_ec;
+        const bool resolves_real = fs::equivalent(to_path(via_link_parent), to_path(real_parent), eq_ec) && !eq_ec;
+        check(via_link_parent != lexical_parent && resolves_real,
+              "canonical_model_dir preserves symlink/.. (resolving to real parent, not lexical parent): " +
+                  via_link_parent);
+      }
+    }
+#endif
+    const fs::path scan_root = tmp / "scan_root";
+    const fs::path nested = scan_root / "Author" / "Model" / "Nested-Q4_K_M.gguf";
+    const fs::path unsupported = scan_root / "Other" / "Unsupported-Q4.gguf";
+    const fs::path ext_dir = tmp / "external_models";
+    const fs::path linked_model = ext_dir / "Linked-Q4_K_M.gguf";
+    const fs::path hidden_target = scan_root / "z-real";
+    const fs::path hidden_target_model = hidden_target / "Real-Q4_K_M.gguf";
+    const fs::path deep_target = scan_root / "z-deep-real";
+    const fs::path deep_target_model = deep_target / "sub" / "Deep-Q4_K_M.gguf";
+    write_gguf(nested, "qwen35");
+    write_gguf(unsupported, "some_future_arch");
+    write_gguf(linked_model, "qwen3");
+    write_gguf(hidden_target_model, "qwen3");
+    write_gguf(deep_target_model, "qwen3");
+    std::ofstream(scan_root / "README.txt", std::ios::binary) << "ignore me";
+
+    // Create directory symlinks: external target, cycle, hidden alias to z-real, and deep alias to z-deep-real.
+    std::error_code sym_ec;
+    fs::create_directory_symlink(ext_dir, scan_root / "linked", sym_ec);
+    const bool symlinks_ok = !sym_ec;
+    if (symlinks_ok) {
+      std::error_code e1, e2, e3;
+      fs::create_directory_symlink(scan_root, scan_root / "Author" / "loop", e1);
+      fs::create_directory_symlink(hidden_target, scan_root / ".alias-hidden", e2);
+      fs::create_directories(scan_root / "a" / "b" / "c", e3);
+      fs::create_directory_symlink(deep_target, scan_root / "a" / "b" / "c" / "deep-link", e3);
+    }
+
+    const auto found = flyx::apps::scan_model_dirs({from_path(scan_root), from_path(tmp / "does_not_exist")}, 4);
+    bool saw_nested = false, saw_unsupported = false, saw_linked = false, saw_hidden_real = false,
+         saw_deep_real = false;
+    for (const auto& m : found) {
+      const fs::path p = to_path(m.path);
+      if (p.filename() == "Nested-Q4_K_M.gguf") saw_nested = true;
+      if (p.filename() == "Unsupported-Q4.gguf") saw_unsupported = true;
+      if (p.filename() == "Linked-Q4_K_M.gguf") saw_linked = true;
+      if (p.filename() == "Real-Q4_K_M.gguf") saw_hidden_real = true;
+      if (p.filename() == "Deep-Q4_K_M.gguf") saw_deep_real = true;
+    }
+    check(saw_nested && saw_unsupported,
+          "scan_model_dirs finds nested GGUFs and does not break on unsupported architectures or non-GGUF files");
+    const std::string want_root = flyx::apps::canonical_model_dir(from_path(scan_root));
+    check(!found.empty(), "scan_model_dirs found at least one entry");
+    for (const auto& m : found) {
+      check(m.root == want_root, "scan_model_dirs stamps LocalModel::root with canonical root: " + m.root);
+    }
+    if (symlinks_ok) {
+      check(saw_linked, "scan_model_dirs follows directory symlinks and survives symlink cycles");
+      check(saw_hidden_real, "excluded hidden symlink does not prevent scanning its real target directory");
+      check(saw_deep_real, "deep symlink visit does not prevent shallower scan of its real target directory");
+    }
+
+    // Security regression: scan_model_dirs with allow_path + ScanFs must NEVER call any target-following filesystem
+    // operation (is_directory, weakly_canonical, is_regular_file, file_size, last_write_time, classify_gguf) on a
+    // blocked symlink/reparse root or child entry.
+    {
+      std::vector<std::string> touched_blocked;
+      auto record_if_blocked = [&](const fs::path& p, const char* op) {
+        const std::string s = from_path(p);
+        if (s.find("to_unc") != std::string::npos || s.find("blocked_root") != std::string::npos)
+          touched_blocked.push_back(std::string(op) + ":" + s);
+      };
+      flyx::apps::ScanFs fake_fs;
+      fake_fs.is_directory = [&](const fs::path& p, std::error_code&) {
+        record_if_blocked(p, "is_directory");
+        const std::string s = from_path(p);
+        return s == "/safe" || s == "/safe/sub";
+      };
+      fake_fs.weakly_canonical = [&](const fs::path& p, std::error_code&) {
+        record_if_blocked(p, "weakly_canonical");
+        return p;
+      };
+      fake_fs.for_each_dir_entry = [&](const fs::path& p, const std::function<bool(const fs::path&)>& visit,
+                                       std::error_code&) {
+        record_if_blocked(p, "for_each_dir_entry");
+        const std::string s = from_path(p);
+        std::vector<fs::path> entries;
+        if (s == "/safe") entries = {fs::path("/safe/to_unc_dir"), fs::path("/safe/to_unc_file.gguf"), fs::path("/safe/sub")};
+        else if (s == "/safe/sub") entries = {fs::path("/safe/sub/good-Q4_K_M.gguf")};
+        for (const auto& e : entries)
+          if (!visit(e)) break;
+      };
+      fake_fs.is_regular_file = [&](const fs::path& p, std::error_code&) {
+        record_if_blocked(p, "is_regular_file");
+        return from_path(p) == "/safe/sub/good-Q4_K_M.gguf";
+      };
+      fake_fs.file_size = [&](const fs::path& p, std::error_code&) -> uint64_t {
+        record_if_blocked(p, "file_size");
+        return 1024;
+      };
+      fake_fs.last_write_time = [&](const fs::path& p, std::error_code&) -> fs::file_time_type {
+        record_if_blocked(p, "last_write_time");
+        return fs::file_time_type::clock::now();
+      };
+      fake_fs.classify_gguf = [&](const std::string& p, const std::string&, uint64_t,
+                                  fs::file_time_type) -> flyx::apps::GgufClassification {
+        record_if_blocked(to_path(p), "classify_gguf");
+        return {"gguf", "", "", -1};
+      };
+      auto allow = [](std::string_view p) {
+        return p.find("to_unc") == std::string_view::npos && p.find("blocked_root") == std::string_view::npos;
+      };
+      const auto gated = flyx::apps::scan_model_dirs({"/blocked_root", "/safe"}, 4, allow, &fake_fs);
+      check(touched_blocked.empty(),
+            "scan_model_dirs never invokes target-following fs ops on blocked roots/children (touched=" +
+                std::to_string(touched_blocked.size()) + ")");
+      check(gated.size() == 1 && gated[0].file == "good-Q4_K_M.gguf",
+            "scan_model_dirs still discovers allowed siblings when blocked links are skipped");
+    }
+
+    // Streamed entry cap: scan_model_dirs stops iterating huge directories immediately at max_entries.
+    {
+      int yielded = 0;
+      flyx::apps::ScanFs cap_fs;
+      cap_fs.is_directory = [](const fs::path& p, std::error_code&) { return from_path(p) == "/big"; };
+      cap_fs.weakly_canonical = [](const fs::path& p, std::error_code&) { return p; };
+      cap_fs.for_each_dir_entry = [&](const fs::path& p, const std::function<bool(const fs::path&)>& visit,
+                                      std::error_code&) {
+        if (from_path(p) != "/big") return;
+        for (int i = 0; i < 200; ++i) {
+          ++yielded;
+          if (!visit(fs::path("/big/file_" + std::to_string(i) + ".txt"))) break;
+        }
+      };
+      cap_fs.is_regular_file = [](const fs::path&, std::error_code&) { return true; };
+      cap_fs.file_size = [](const fs::path&, std::error_code&) -> uint64_t { return 1; };
+      cap_fs.last_write_time = [](const fs::path&, std::error_code&) { return fs::file_time_type::clock::now(); };
+      (void)flyx::apps::scan_model_dirs({"/big"}, 4, {}, &cap_fs, /*max_entries=*/10);
+      check(yielded == 10,
+            "scan_model_dirs streams directory entries and halts at max_entries (yielded=" + std::to_string(yielded) + ")");
+    }
+
+    // Dependent-path allow_path enforcement across dspark_beside, split GGUF shards, LoRA PEFT dirs, and drafter dirs.
+    {
+      // 1. dspark_beside skips sibling DSpark files blocked by allow_path.
+      auto deny_dspark = [](std::string_view p) { return p.find("dspark-") == std::string_view::npos; };
+      check(flyx::apps::dspark_beside(from_path(model), deny_dspark).empty(),
+            "dspark_beside refuses sibling drafter blocked by allow_path");
+
+      // 2. Split GGUF shard 2 blocked by allow_path fails ModelFile::open before mapping shard 2.
+      const fs::path split_dir = tmp / "split_guard";
+      const fs::path shard1 = split_dir / "demo-00001-of-00002.gguf";
+      const fs::path shard2 = split_dir / "demo-00002-of-00002.gguf";
+      auto write_split_gguf = [](const fs::path& p, uint32_t split_no, uint32_t split_count) {
+        std::string b = "GGUF";
+        auto u32 = [&](uint32_t v) { b.append(reinterpret_cast<const char*>(&v), 4); };
+        auto u64 = [&](uint64_t v) { b.append(reinterpret_cast<const char*>(&v), 8); };
+        auto str = [&](const std::string& s) { u64(s.size()), b += s; };
+        u32(3);
+        u64(0);  // tensors
+        u64(3);  // metadata keys
+        str("general.architecture"), u32(8), str("qwen3");
+        str("split.no"), u32(4), u32(split_no);
+        str("split.count"), u32(4), u32(split_count);
+        fs::create_directories(p.parent_path());
+        std::ofstream(p, std::ios::binary) << b;
+      };
+      write_split_gguf(shard1, 0, 2);
+      write_split_gguf(shard2, 1, 2);
+      flyx::ModelFile mf;
+      std::string open_err;
+      auto deny_shard2 = [](std::string_view p) { return p.find("00002-of-00002") == std::string_view::npos; };
+      check(!mf.open(from_path(shard1), &open_err, deny_shard2) &&
+                open_err.find("remote path policy") != std::string::npos,
+            "ModelFile::open blocks split GGUF shard 2 rejected by allow_path: " + open_err);
+
+      // 3. LoRA PEFT directory: ModelFile::add blocks adapter_model.safetensors rejected by allow_path.
+      const fs::path lora_dir = tmp / "lora_guard";
+      fs::create_directories(lora_dir);
+      std::ofstream(lora_dir / "adapter_config.json", std::ios::binary)
+          << R"({"peft_type":"LORA","r":4,"lora_alpha":8})";
+      std::ofstream(lora_dir / "adapter_model.safetensors", std::ios::binary) << "stub";
+      std::string add_err;
+      auto deny_adapter_weights = [](std::string_view p) {
+        return p.find("adapter_model.safetensors") == std::string_view::npos;
+      };
+      check(!mf.add(from_path(lora_dir), &add_err, deny_adapter_weights) &&
+                add_err.find("remote path policy") != std::string::npos,
+            "ModelFile::add blocks LoRA adapter weights rejected by allow_path: " + add_err);
+
+      // 4. Drafter directory: drafter_source_kind and ModelFile::add respect allow_path for config.json and shards.
+      const fs::path drafter_dir = tmp / "drafter_guard";
+      fs::create_directories(drafter_dir);
+      std::ofstream(drafter_dir / "config.json", std::ios::binary)
+          << R"({"architectures":["DFlash2DraftModel"],"dflash_config":{}})";
+      std::ofstream(drafter_dir / "model.safetensors", std::ios::binary) << "stub";
+      auto deny_config = [](std::string_view p) { return p.find("config.json") == std::string_view::npos; };
+      auto deny_shard = [](std::string_view p) { return p.find("model.safetensors") == std::string_view::npos; };
+      check(flyx::drafter_source_kind(from_path(drafter_dir)) == "dflash2",
+            "drafter_source_kind reads allowed drafter directory");
+      check(flyx::drafter_source_kind(from_path(drafter_dir), deny_config).empty(),
+            "drafter_source_kind skips config.json rejected by allow_path");
+      add_err.clear();
+      check(!mf.add(from_path(drafter_dir), &add_err, deny_shard) &&
+                add_err.find("remote path policy") != std::string::npos,
+            "ModelFile::add blocks drafter safetensors shard rejected by allow_path: " + add_err);
+    }
   }
   set_env("HF_HUB_OFFLINE", "");
   set_env("HF_HUB_CACHE", "");

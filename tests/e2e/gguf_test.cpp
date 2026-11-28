@@ -28,6 +28,7 @@
 #include "nlohmann/json.hpp"
 #include "ops/dtype/ref.h"
 #include "tests/common/check.h"
+#include "tests/common/gpu.h"
 
 using namespace flyx;
 using json = nlohmann::json;
@@ -380,6 +381,9 @@ bool same_rounds(const std::vector<flyx_round_result>& a, const std::vector<flyx
   return true;
 }
 
+// Size both rings at a context where even the tiny FP8 MTP cache saves more than a 2 MiB VMM allocation granule.
+constexpr int ring_sizing_ctx = 32768;
+
 // A sliding-window DFlash2 drafter's context cache as a ring of slots (backend option dflash_ring, on by default)
 // beside the same cache a slot a position (dflash_ring=0): at max_ctx 512, prefill passes of 64 rows and rounds of 16,
 // the window of 8 in a ring of 128 slots (256 with wide rounds) that a 300-token prompt and its reply wrap around.
@@ -415,7 +419,7 @@ void dflash_ring(const std::string& dir, const std::string& backend, const std::
       uint64_t b = 0;
       return e.api()->seq_bytes(e.bmodel(), ctx, &b) == 0 ? b : uint64_t(0);
     };
-    const uint64_t ring_bytes = bytes(*ring_eng, 512), flat_bytes = bytes(*flat_eng, 512);
+    const uint64_t ring_bytes = bytes(*ring_eng, ring_sizing_ctx), flat_bytes = bytes(*flat_eng, ring_sizing_ctx);
     check(ring_bytes > 0 && ring_bytes < flat_bytes,
           which + ": the ring shrinks a session (" + std::to_string(ring_bytes) + " < " + std::to_string(flat_bytes) +
               " bytes)");
@@ -598,8 +602,8 @@ void mtp_ring(const std::string& dir, const std::string& backend, const std::vec
     auto flat_eng = engine(model, backend, flat_load);
     const auto* api = ring_eng->api();
     uint64_t ring_bytes = 0, flat_bytes = 0;
-    const bool sized = api->seq_bytes(ring_eng->bmodel(), 800, &ring_bytes) == 0 &&
-                       flat_eng->api()->seq_bytes(flat_eng->bmodel(), 800, &flat_bytes) == 0;
+    const bool sized = api->seq_bytes(ring_eng->bmodel(), ring_sizing_ctx, &ring_bytes) == 0 &&
+                       flat_eng->api()->seq_bytes(flat_eng->bmodel(), ring_sizing_ctx, &flat_bytes) == 0;
     check(sized && ring_bytes < flat_bytes,
           which + ": a ring of slots (" + std::to_string(ring_bytes) + " < " + std::to_string(flat_bytes) + " bytes)");
     // The flat cache's continuation of a fresh prefill of the prompt to `at`, in the same passes.
@@ -628,9 +632,13 @@ void mtp_ring(const std::string& dir, const std::string& backend, const std::vec
             "  a checkpoint restored before the rows past it went round the ring: a fresh prefill's tokens and drafts");
       // From it again, a pass of 128 rows keeping the state at 192 inside it (prefill_snapshot), then 384 rows: the
       // ring gone round since either checkpoint.
+      // Where the device's GDN prefill is chunked (gdn_chunked_device) a pass keeps a state inside it; elsewhere
+      // (prefill_align 1) the checkpoint is the pass's end.
       const int align = ring_eng->prefill_align();
       const bool inside = align > 1 && 192 % align == 0 && api->prefill_snapshot;
-      check(inside, "  passes that keep a state inside them (prefill_align " + std::to_string(align) + ")");
+      check(inside == flyx::test::gdn_chunked_device(api),
+            "  passes that keep a state inside them where the device's GDN prefill is chunked (prefill_align " +
+                std::to_string(align) + ")");
       ok = ok && api->restore(src.seq(), 0, prompt[128]) == 128 &&
            (!inside || api->prefill_snapshot(src.seq(), 192) == 0) &&
            prefill_span(*ring_eng, src, prompt, 128, 256, 128);

@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -206,6 +207,106 @@ int main(int argc, char** argv) {
   {
     std::lock_guard<std::mutex> lock(mu);
     check(open_models == 0 && closes == opens, "every model the backend opened is closed with the host");
+  }
+  {
+    // ModelHost::run enforces Want::eo.allow_path before opening the model file.
+    ModelHost host(so);
+    ModelHost::Want blocked;
+    blocked.model = argv[1];
+    blocked.eo = eo;
+    blocked.eo.allow_path = [](std::string_view) { return false; };
+    std::string policy_err;
+    const int opens_now = opens;
+    check(!host.run(blocked, &policy_err) && policy_err.find("remote path policy") != std::string::npos &&
+              opens == opens_now,
+          "ModelHost::run rejects model path blocked by eo.allow_path before backend open: " + policy_err);
+
+    // Item 1: Scheduler::Scheduler's own tokenizer ModelFile::open must forward eo.allow_path when opening
+    // split GGUF sibling shards, failing with remote path policy before touching the denied shard or backend.
+    const fs::path split1 = config / "policy_split-00001-of-00002.gguf";
+    const fs::path split2 = config / "policy_split-00002-of-00002.gguf";
+    {
+      auto write_u16 = [](std::ofstream& f, uint16_t v) { f.write(reinterpret_cast<const char*>(&v), 2); };
+      auto write_u32 = [](std::ofstream& f, uint32_t v) { f.write(reinterpret_cast<const char*>(&v), 4); };
+      auto write_u64 = [](std::ofstream& f, uint64_t v) { f.write(reinterpret_cast<const char*>(&v), 8); };
+      auto write_str = [&](std::ofstream& f, const std::string& s) {
+        write_u64(f, s.size());
+        f.write(s.data(), std::streamsize(s.size()));
+      };
+      std::ofstream f(split1, std::ios::binary | std::ios::trunc);
+      f.write("GGUF", 4);
+      write_u32(f, 3);  // version
+      write_u64(f, 0);  // n_tensors
+      write_u64(f, 2);  // n_kv
+      write_str(f, "split.no");
+      write_u32(f, 2);  // GGUF_TYPE_UINT16
+      write_u16(f, 0);
+      write_str(f, "split.count");
+      write_u32(f, 2);  // GGUF_TYPE_UINT16
+      write_u16(f, 2);
+    }
+    bool saw_shard2_check = false;
+    ModelHost::Want split_want;
+    split_want.model = os::from_path(split1);
+    split_want.eo = eo;
+    split_want.eo.allow_path = [&](std::string_view p) {
+      if (p.find("00002-of-00002") != std::string_view::npos) {
+        saw_shard2_check = true;
+        return false;
+      }
+      return true;
+    };
+    policy_err.clear();
+    const int opens_before_split = opens;
+    check(!host.run(split_want, &policy_err) && saw_shard2_check &&
+              policy_err.find("remote path policy") != std::string::npos && opens == opens_before_split &&
+              !fs::exists(split2),
+          "ModelHost::run -> Scheduler::Scheduler rejects denied split GGUF sibling shard via eo.allow_path: " +
+              policy_err);
+  }
+  {
+    // Single-lock NetworkSettingsSnapshot coherence: save_network_settings commits on_remote_manage_committed and
+    // samples live_remote_manage under settings_mutex(), matching read_network_settings under concurrent toggles.
+    std::atomic<bool> live_rm{false};
+    auto commit_rm = [&](bool v) { live_rm.store(v, std::memory_order_relaxed); };
+    auto read_live = [&]() { return live_rm.load(std::memory_order_relaxed); };
+    ModelHost::NetworkSettingsSnapshot snap;
+    std::string net_err;
+    check(ModelHost::save_network_settings(true, true, commit_rm, &snap, &net_err, read_live) &&
+              snap.lan_access && snap.remote_manage && snap.live_remote_manage,
+          "save_network_settings samples committed live_remote_manage in the same critical section: " + net_err);
+    const auto read_snap = ModelHost::read_network_settings(read_live);
+    check(read_snap.lan_access && read_snap.remote_manage && read_snap.live_remote_manage,
+          "read_network_settings returns coherent lan_access, remote_manage, and live_remote_manage");
+
+    std::atomic<bool> stop{false};
+    std::atomic<bool> torn{false};
+    std::thread writer([&] {
+      bool v = false;
+      for (int i = 0; i < 40; ++i) {
+        v = !v;
+        ModelHost::NetworkSettingsSnapshot s;
+        std::string e;
+        if (!ModelHost::save_network_settings(v, v, commit_rm, &s, &e, read_live) ||
+            s.lan_access != v || s.remote_manage != v || s.live_remote_manage != v) {
+          torn.store(true, std::memory_order_relaxed);
+          break;
+        }
+      }
+      stop.store(true, std::memory_order_relaxed);
+    });
+    std::thread reader([&] {
+      while (!stop.load(std::memory_order_relaxed)) {
+        const auto s = ModelHost::read_network_settings(read_live);
+        if (s.lan_access != s.remote_manage || s.remote_manage != s.live_remote_manage) {
+          torn.store(true, std::memory_order_relaxed);
+          break;
+        }
+      }
+    });
+    writer.join();
+    reader.join();
+    check(!torn.load(), "concurrent save_network_settings / read_network_settings never tear disk vs live_remote_manage");
   }
   fs::remove_all(config, ec);
   return flyx::test::finish("model_host_test");

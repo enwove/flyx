@@ -1,10 +1,11 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // The dashboard: the frame, which page is shown, and the telemetry every page reads.
 // Every page stays mounted and is hidden when another is shown, so a chat or a filter survives a visit elsewhere.
-// The whole tree draws again on each telemetry answer (once a second) and on a change of language.
+// The whole tree draws again on each telemetry answer (once a second) and on a change of language or theme.
 import { html, render, useState, useEffect } from "./lib/html.js";
 import { apiKey, consumeAddressKey, saved, setKey } from "./lib/api.js";
 import { t, onLang } from "./lib/i18n.js";
+import { onTheme } from "./lib/theme.js";
 import { live, onLive, poll, busyLoad } from "./lib/telemetry.js";
 import { TopBar } from "./components/topbar.js";
 import { Sidebar, PAGES } from "./components/sidebar.js";
@@ -63,7 +64,7 @@ function App() {
 
   useEffect(() => {
     const again = () => redraw((x) => x + 1);
-    const offs = [onLive(again), onLang(again)];
+    const offs = [onLive(again), onLang(again), onTheme(again)];
     window.addEventListener("resize", again);
     return () => { offs.forEach((f) => f()); window.removeEventListener("resize", again); };
   }, []);
@@ -158,10 +159,10 @@ function App() {
           <${Notice} keyChanged=${keyChanged}/>
           <${Hint} tab=${tab} go=${go} explore=${exploreLibrary} showModel=${showModel} onOpenMem=${setMemKind}/>
           ${page("overview", html`<${Overview} active=${tab === "overview"} go=${go} explore=${exploreLibrary} showModel=${showModel} onOpenMem=${setMemKind}/>`)}
-          ${page("model", html`<${ModelPage} active=${tab === "model"} libraryAsked=${libraryAsked} currentAsked=${currentAsked}/>`)}
+          ${page("model", html`<${ModelPage} key=${apiKey()} active=${tab === "model"} libraryAsked=${libraryAsked} currentAsked=${currentAsked}/>`)}
           ${page("requests", html`<${Requests} key=${apiKey()} active=${tab === "requests"} openId=${openRequest} select=${selectRequest}/>`)}
           ${page("chat", html`<${Chat} active=${tab === "chat"} showModel=${showModel}/>`)}
-          ${page("logs", html`<${Logs} active=${tab === "logs"}/>`)}
+          ${page("logs", html`<${Logs} key=${apiKey()} active=${tab === "logs"}/>`)}
           ${page("integration", html`<${Integration} active=${tab === "integration"}/>`)}
           ${page("settings", tab === "settings" && html`<${NetworkSettings} key=${JSON.stringify([apiKey(), tm?.server?.started_at, live.offline])}/>`)}
         </div>
@@ -171,7 +172,6 @@ function App() {
     </div>`;
 }
 
-saved.set("theme", null);  // older pages kept a theme choice here
 for (const k of ["live", "live_pos", "live_closed"]) saved.set(k, null);  // what older pages kept for their floats
 render(html`<${App}/>`, document.getElementById("app"));
 poll();

@@ -60,6 +60,7 @@ std::string claude(const AgentTarget& t) {
       "    ANTHROPIC_MODEL = $modelName",
       "    ANTHROPIC_BASE_URL = " + ps_quote(t.origin),
       std::string("    ANTHROPIC_AUTH_TOKEN = ") + (t.keyed ? "$env:FLYX_KEY" : "'flyx'"),
+      "    API_TIMEOUT_MS = '600000'",
       "    CLAUDE_CODE_MAX_CONTEXT_TOKENS = '" + std::to_string(t.context) + "'",
       "    CLAUDE_CODE_MAX_OUTPUT_TOKENS = '" + std::to_string(claude_output(t.context)) + "'",
       "    CLAUDE_CODE_MODEL_CAPABILITIES = '-mid_conv_system'",

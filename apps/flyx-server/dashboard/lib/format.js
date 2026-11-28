@@ -41,11 +41,19 @@ export function contextLimit(model) {
 export const level = (f) => f > 0.95 ? "hot" : f > 0.85 ? "warn" : "";
 // "NVIDIA GeForce RTX 5070 Ti" -> "RTX 5070 Ti".
 export const shortDevice = (d) => d ? d.replace(/^NVIDIA (GeForce )?/, "") : "";
-export const baseName = (p) => String(p).split(/[\\/]/).pop();
+export const baseName = (p, winPaths = true) => String(p).split(winPaths === false ? "/" : /[\\/]/).pop();
 // A literal argument in a POSIX shell snippet.
 export const shQuote = (s) => "'" + s.replace(/'/g, "'\\''") + "'";
 // PowerShell treats curly apostrophes as quotes too.
 export const psQuote = (s) => "'" + s.replace(/['\u2018-\u201b]/g, (c) => "'" + c) + "'";
+// A shell argument kept unquoted when it has only safe literal characters (so copied commands work identically in
+// PowerShell, cmd.exe, and Bash/zsh). On Windows, prefer double quotes when quoting is needed unless a character
+// would expand or break inside double quotes in PowerShell or cmd.exe.
+const kBareSh = /^[A-Za-z0-9._/:+][A-Za-z0-9._/:+@-]*$/;
+const kBarePs = /^[A-Za-z0-9._/:+\\][A-Za-z0-9._/:+@\\-]*$/;
+const kPsDoubleUnsafe = /["\u201c-\u201e$`%!\r\n]|\\$/;
+export const shArg = (s) => (kBareSh.test(s) ? s : shQuote(s));
+export const psArg = (s) => (kBarePs.test(s) ? s : (!s || kPsDoubleUnsafe.test(s)) ? psQuote(s) : '"' + s + '"');
 // A figure under 100 with one decimal, else whole: the collapsed rail's.
 export const short = (v) => v === undefined || v === null || !isFinite(v) ? "-" : v >= 100 ? fmt(v) : fmt(v, 1);
 // A count as a list shows it: 1.2K, 56.8K, 3.4M.

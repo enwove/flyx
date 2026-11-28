@@ -1,6 +1,6 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
-// The system log and GET /v1/logs?after=SEQ&limit=N (default 500, at most 2000, oldest first): for
-// this machine, or with --api-key for the key's holder (may_manage), as the request log: it names files and requests.
+// The system log and GET /v1/logs?after=SEQ&limit=N (default 500, at most 2000, oldest first): gated by
+// Access::kManage, as the request log: it names files and requests.
 #include "apps/flyx-server/system_log.h"
 
 #include <algorithm>
@@ -48,7 +48,7 @@ ojson SystemLog::since(uint64_t after, size_t limit) const {
 
 void add_system_log_routes(httplib::Server& http, Server* s) {
   http.Get("/v1/logs", [s](const httplib::Request& q, httplib::Response& r) {
-    if (!require_manage(*s, q, r, "the system log")) return;
+    if (!require_access(*s, q, r, Access::kManage, "the system log")) return;
     const uint64_t after = query_u64(q, "after", 0);
     const size_t limit = size_t(query_int(q, "limit", 500, 0, int(SystemLog::kKept)));
     r.set_header("Cache-Control", "no-store");

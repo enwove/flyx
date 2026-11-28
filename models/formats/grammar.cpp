@@ -90,7 +90,11 @@ std::string reply_grammar(const TagSyntax& syntax, const std::vector<ojson>& too
   } else {
     return "";
   }
-  ojson format = syntax.thinking
+  // A thinking block where the request left thinking on, or where the prompt opened one (it is closed first).  Off,
+  // the prompt closed an empty one: a block allowed here, a model that thinks by default opens it again and may never
+  // come to the answer (Qwen3-8B with a json_schema answer thought until max_tokens ran out).
+  const bool think = syntax.thinking && (rules.thinking || in_reasoning);
+  ojson format = think
                      ? ojson{{"type", "sequence"}, {"elements", ojson::array({thinking(syntax, in_reasoning), answer})}}
                      : answer;
   return ojson{{"type", "structural_tag"}, {"format", format}}.dump(-1, ' ', false, ojson::error_handler_t::replace);

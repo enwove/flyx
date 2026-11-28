@@ -675,5 +675,114 @@ int main() {
               std::to_string(b.layout.copy_host) + ", dev=" + std::to_string(b.layout.device_positions));
   }
 
+  // Explicit --vram-reserve and --ram-reserve overrides: 0 lets a dedicated host use all available VRAM/RAM.
+  {
+    ResourceLedger ledger_auto, ledger_zero, ledger_big;
+    plan::Budget b_auto, b_zero, b_big;
+    std::string err;
+    int ctx_auto = 8192, ctx_zero = 8192, ctx_big = 8192;
+    plan::KvTiers t_auto = kGpuOnly;
+    plan::KvTiers t_zero = kGpuOnly;
+    t_zero.vram_reserve = 0;
+    plan::KvTiers t_big = kGpuOnly;
+    t_big.vram_reserve = int64_t(2 * kGiB);
+    check(plan::account(&api, nullptr, false, false, &ctx_auto, 4096, t_auto, &ledger_auto, &b_auto, &err),
+          "auto vram_reserve accounts: " + err);
+    check(plan::account(&api, nullptr, false, false, &ctx_zero, 4096, t_zero, &ledger_zero, &b_zero, &err),
+          "zero vram_reserve accounts: " + err);
+    check(plan::account(&api, nullptr, false, false, &ctx_big, 4096, t_big, &ledger_big, &b_big, &err),
+          "explicit 2 GiB vram_reserve accounts: " + err);
+    check(ledger_zero.budget() == 16 * kGiB && ledger_zero.budget() > ledger_auto.budget(),
+          "vram_reserve=0 unlocks full device VRAM (" + std::to_string(ledger_zero.budget()) + " > " +
+              std::to_string(ledger_auto.budget()) + ")");
+    check(ledger_big.budget() == 14 * kGiB && ledger_big.budget() < ledger_auto.budget(),
+          "explicit vram_reserve=2 GiB reserves exactly 2 GiB (" + std::to_string(ledger_big.budget()) + ")");
+  }
+  {
+    // Platform VRAM floor (min_vram_reserve, e.g. native Windows 256 MiB WDDM pieces floor) clamps lower overrides.
+    const uint64_t floor = 256 * kMiB;
+    check(plan::effective_device_reserve(16 * kGiB, false, 0, 0) == 0,
+          "effective_device_reserve honors 0 when min_floor=0 (Linux)");
+    check(plan::effective_device_reserve(16 * kGiB, false, 0, floor) == floor,
+          "effective_device_reserve clamps 0 to 256 MiB floor");
+    check(plan::effective_device_reserve(16 * kGiB, false, int64_t(100 * kMiB), floor) == floor,
+          "effective_device_reserve clamps 100 MiB to 256 MiB floor");
+    check(plan::effective_device_reserve(16 * kGiB, false, int64_t(512 * kMiB), floor) == 512 * kMiB,
+          "effective_device_reserve preserves 512 MiB above 256 MiB floor");
+    ResourceLedger l_zero, l_small, l_above;
+    plan::Budget b_zero, b_small, b_above;
+    std::string err;
+    int c0 = 8192, c1 = 8192, c2 = 8192;
+    plan::KvTiers t_zero = kGpuOnly;
+    t_zero.vram_reserve = 0;
+    t_zero.min_vram_reserve = floor;
+    plan::KvTiers t_small = kGpuOnly;
+    t_small.vram_reserve = int64_t(100 * kMiB);
+    t_small.min_vram_reserve = floor;
+    plan::KvTiers t_above = kGpuOnly;
+    t_above.vram_reserve = int64_t(512 * kMiB);
+    t_above.min_vram_reserve = floor;
+    check(plan::account(&api, nullptr, false, false, &c0, 4096, t_zero, &l_zero, &b_zero, &err) &&
+              l_zero.budget() == 16 * kGiB - floor && b_zero.device_reserve == floor,
+          "min_vram_reserve=256 MiB clamps vram_reserve=0 in account()");
+    check(plan::account(&api, nullptr, false, false, &c1, 4096, t_small, &l_small, &b_small, &err) &&
+              l_small.budget() == 16 * kGiB - floor && b_small.device_reserve == floor,
+          "min_vram_reserve=256 MiB clamps vram_reserve=100 MiB in account()");
+    check(plan::account(&api, nullptr, false, false, &c2, 4096, t_above, &l_above, &b_above, &err) &&
+              l_above.budget() == 16 * kGiB - 512 * kMiB && b_above.device_reserve == 512 * kMiB,
+          "min_vram_reserve=256 MiB preserves vram_reserve=512 MiB in account()");
+
+    // Backend-reported flyx_memory_info::reserve_floor enforces the floor even when KvTiers::min_vram_reserve is 0.
+    flyx_backend_api api_floor = fake();
+    api_floor.memory = [](flyx_bmodel* bm, flyx_memory_info* out) -> int {
+      const int rc = memory(bm, out);
+      out->reserve_floor = 256 * kMiB;
+      return rc;
+    };
+    ResourceLedger l_be;
+    plan::Budget b_be;
+    int c_be = 8192;
+    plan::KvTiers t_be = kGpuOnly;
+    t_be.vram_reserve = 0;
+    check(plan::account(&api_floor, nullptr, false, false, &c_be, 4096, t_be, &l_be, &b_be, &err) &&
+              l_be.budget() == 16 * kGiB - floor && b_be.device_reserve == floor,
+          "backend flyx_memory_info::reserve_floor clamps vram_reserve=0 and reports b.device_reserve");
+  }
+  {
+    // Auto host RAM budget (--kv-ram auto) honors --ram-reserve: 0 >= auto > large explicit reserve.
+    ResourceLedger l0, l1, l2;
+    plan::Budget b0, b1, b2;
+    std::string err;
+    int c0 = 65536, c1 = 65536, c2 = 65536;
+    plan::KvTiers t_zero{-1, -1};
+    t_zero.ram_reserve = 0;
+    plan::KvTiers t_auto{-1, -1};
+    plan::KvTiers t_large{-1, -1};
+    t_large.ram_reserve = int64_t(4 * kGiB);
+    check(plan::account(&api, nullptr, false, false, &c0, 0, t_zero, &l0, &b0, &err), "ram_reserve=0: " + err);
+    check(plan::account(&api, nullptr, false, false, &c1, 0, t_auto, &l1, &b1, &err), "ram_reserve=auto: " + err);
+    check(plan::account(&api, nullptr, false, false, &c2, 0, t_large, &l2, &b2, &err), "ram_reserve=4GiB: " + err);
+    if (b0.host_budget > 0) {
+      check(b0.host_budget > b1.host_budget,
+            "ram_reserve=0 grants more host KV budget than auto (" + std::to_string(b0.host_budget) + " > " +
+                std::to_string(b1.host_budget) + ")");
+      check(b0.host_budget >= b2.host_budget + 3 * kGiB || b2.host_budget == 0,
+            "explicit ram_reserve reduces host KV budget");
+    }
+  }
+  {
+    // Without per-process accounting (Linux), ~0.65 GiB of CUDA context is not misreported as closable other apps.
+    const flyx_memory_info linux_ctx{0, 0, 16 * kGiB - 650 * kMiB, 16 * kGiB, 0};
+    const flyx_memory_info linux_other{0, 0, 16 * kGiB - 1500 * kMiB, 16 * kGiB, 0};
+    const flyx_memory_info win_other{10 * kGiB, 0, 16 * kGiB - 10 * kGiB - 500 * kMiB - 512 * kMiB, 16 * kGiB,
+                                     10 * kGiB + 500 * kMiB};
+    check(!plan::closable(plan::held_of(linux_ctx)),
+          "0.65 GiB without process accounting is not blamed on other apps");
+    check(plan::closable(plan::held_of(linux_other)),
+          "1.5 GiB without process accounting is reported as other apps");
+    check(plan::closable(plan::held_of(win_other)),
+          "0.5 GiB with process accounting is reported as other apps");
+  }
+
   return flyx::test::finish("budget_test");
 }

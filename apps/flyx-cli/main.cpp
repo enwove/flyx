@@ -694,6 +694,14 @@ int cmd_bench_prompts(const Args& a) {
     tok += u.new_tokens - 1;
     ms += u.decode_ms;
     rounds += u.rounds;
+    // What the rounds cost by now at the context this reply ended at, learned from the rounds read (null: the load's
+    // costs throughout, FLYX_LEARN_COSTS=0, or nothing to choose among: one plan, no lookup).
+    nlohmann::json learned = nullptr;
+    if (const RoundCosts* costs = e->round_costs()) {
+      learned = nlohmann::json::array();
+      const int at = u.prompt_tokens + u.new_tokens;
+      for (size_t k = 0; k < e->widths().size(); ++k) learned.push_back(costs->cost(k, at));
+    }
     lines.push_back(nlohmann::json{{"i", i},
                                    {"prompt_tokens", u.prompt_tokens},
                                    {"prefill_ms", u.prefill_ms},
@@ -706,6 +714,7 @@ int cmd_bench_prompts(const Args& a) {
                                    {"round_choices", res.round_choices},
                                    {"round_accepted", res.round_accepted},
                                    {"lookup_rounds", res.lookup_rounds},
+                                   {"round_ms_learned", learned},
                                    {"finish", finish_reason},
                                    {"prompt_ids", gen.prompt},
                                    {"ids", ids},

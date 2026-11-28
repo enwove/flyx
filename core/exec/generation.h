@@ -163,6 +163,13 @@ class Generation {
     batched_ = on;
     s_->rounds().batched(on);
   }
+  // Whether this generation has the device to itself (the scheduler's only one running): only then does the clock
+  // between its reads tell what its rounds cost (Engine::round_costs).  A generation run alone is (generate()).  Either
+  // way past a change, the next round read is not timed: the other's work may still be on the device when it runs.
+  void set_alone(bool on) {
+    if (on != alone_) read_ms_ = 0;
+    alone_ = on;
+  }
   // In the round phase with its reply going on: it will want rounds (round_ready: one now).
   bool in_rounds() const { return phase_ == Phase::kRounds && launching_; }
   bool round_ready() const;
@@ -173,6 +180,10 @@ class Generation {
   bool round_candidates(std::vector<RoundCandidate>* out);
   void commit_round(const RoundChoice& choice, NextRound* out);
   void launched(const NextRound& r) {
+    launch_ms_[in_flight_] = kUntimed;  // batched: the time between reads is the batch's
+    launch_at_[in_flight_] = 0;
+    launch_idle_[in_flight_] = false;
+    launch_epoch_[in_flight_] = 0;
     launched_[in_flight_++] = r.round;
     result_.adaptive_rounds += r.g.stop_policy != nullptr;  // prepare_round gives one with the adaptive plan only
   }
@@ -186,6 +197,7 @@ class Generation {
   bool finish_prefill();
   bool checkpoint_prompt_end();
   bool round(bool wait, bool* busy);
+  long ran_as(const RoundChoice& was, const flyx_round_result& r) const;
   bool finish_up();
   // The next call that waits for the device would not wait.
   bool device_ready() const;
@@ -241,6 +253,16 @@ class Generation {
   bool batched_ = false;           // the scheduler launches its rounds (round_candidates, commit_round)
   int in_flight_ = 0;
   RoundChoice launched_[FLYX_MAX_IN_FLIGHT];  // the rounds in flight, oldest first
+  // ... when each was launched (os::now_ms; kUntimed: never timed, the device not this generation's alone), the
+  // context it was launched at and whether none was in flight then; when the last round was read (0: none since the
+  // rounds began or the device was last shared); alone: set_alone().
+  static constexpr double kUntimed = 1e300;
+  double launch_ms_[FLYX_MAX_IN_FLIGHT] = {};
+  int launch_at_[FLYX_MAX_IN_FLIGHT] = {};
+  bool launch_idle_[FLYX_MAX_IN_FLIGHT] = {};
+  uint64_t launch_epoch_[FLYX_MAX_IN_FLIGHT] = {};  // Engine::generation_epoch() at its launch
+  double read_ms_ = 0;
+  bool alone_ = true;
 };
 
 // Runs a request to its end on the calling thread (the C API, the command

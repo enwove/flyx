@@ -19,6 +19,7 @@
 #include "core/os/os.h"
 #include "core/render/chat.h"
 #include "core/speculation/controller.h"
+#include "core/speculation/round_costs.h"
 #include "core/tokenizer/tokenizer.h"
 #include "core/resources/ledger.h"
 #include "core/vision/image.h"
@@ -102,6 +103,10 @@ struct EngineOptions {
   // Host memory the process takes besides, which kv_ram's auto leaves aside.  (The server's store of parked
   // conversations, is not: it takes what the sessions' K/V leave, Scheduler.)
   uint64_t host_reserved = 0;
+  // Opt-in memory reserves in bytes (-1: automatic plan::device_reserve / plan::host_keep defaults; 0: let flyx use
+  // all free VRAM / available RAM on a dedicated machine or headless VM).
+  int64_t vram_reserve = -1;
+  int64_t ram_reserve = -1;
   // Drafts verified per round: -1 = chosen each round by the speculation
   // controller from the measured cost of each width and the acceptance seen
   // so far; >= 0 pins the width (tests, benchmarks; the drafter is still
@@ -136,10 +141,17 @@ struct EngineOptions {
   // Intra-round confidence optimal stopping on drafters that support adaptive plans; FLYX_ADAPTIVE=0 turns it off.
   bool adaptive = true;
   bool adaptive_given = false;
+  // The rounds' costs learned from the rounds read (RoundCosts), the load's timings their start; off: the load's
+  // timings throughout.  FLYX_LEARN_COSTS=0 turns it off.  The output is the same either way.
+  bool learn_costs = true;
+  bool learn_costs_given = false;
   // Automatically step down VRAM-heavy optional features on tight GPUs (vision gpu->disk, draft_weights->nvfp4,
   // drop DFlash2 keeping MTP, drop drafters keeping prompt lookup). Never changes target output tokens.
   // Benchmarks set this to false so measurements never silently alter configuration.
   bool elastic_load = true;
+  // Optional authorization predicate evaluated BEFORE opening or inspecting derived files (split GGUF shards,
+  // PEFT adapter files, drafter directory configs/safetensors). Empty: unrestricted.
+  PathAllowFn allow_path;
 };
 
 // Fills the options the caller left unset from the environment: FLYX_BACKEND,
@@ -204,6 +216,24 @@ class Engine {
   // What the trees without a trunk of this engine's sessions gave a round: the means every reply's estimate of them
   // starts from (a session's first reply's too); and the engine's credit for probing DV (SharedTokens, SpecController).
   SharedTokens* round_tokens() const { return &round_tokens_; }
+  // What the rounds and the lookup rounds cost at a context, learned from the rounds this engine's sessions read
+  // (RoundCosts: round_ms() and lookup_ms() their start); null where EngineOptions::learn_costs is off, or with one
+  // plan and no lookup rounds (no costs choose among them: round_ms() is no timing).
+  RoundCosts* round_costs() const { return opt_.learn_costs && costs_chosen_ ? &round_costs_ : nullptr; }
+  RoundCosts* lookup_costs() const { return opt_.learn_costs && costs_chosen_ ? &lookup_costs_ : nullptr; }
+  // The generations under way on this engine's sessions (Generation's lifetime, any thread: sessions may generate at
+  // once through the C API), and a count of their beginnings and ends: a round's cost is learned only where its
+  // generation was the only one from its launch to its read.
+  void generation_began() const {
+    generations_.fetch_add(1);
+    generation_epoch_.fetch_add(1);
+  }
+  void generation_ended() const {
+    generations_.fetch_sub(1);
+    generation_epoch_.fetch_add(1);
+  }
+  int generations() const { return generations_.load(); }
+  uint64_t generation_epoch() const { return generation_epoch_.load(); }
   std::string round_name(size_t i) const;
   flyx_plan* round_plan(size_t i) const { return plans_.rounds[i]; }
   // Rounds whose drafts the engine gives (EngineOptions::lookup): no drafter runs.
@@ -301,6 +331,10 @@ class Engine {
   std::vector<double> lookup_ms_;           // measured cost of each lookup plan (core/speculation)
   std::vector<double> round_ms_per_token_;  // ... more for every token of context past round_ms_at_
   mutable SharedTokens round_tokens_;
+  mutable RoundCosts round_costs_, lookup_costs_;  // round_costs(), lookup_costs()
+  bool costs_chosen_ = false;                       // ... learned (build_and_calibrate_plans)
+  mutable std::atomic<int> generations_{0};         // generations(), generation_epoch()
+  mutable std::atomic<uint64_t> generation_epoch_{0};
   int round_ms_at_ = 0, round_ms_again_at_ = 0;
   double lower_ms_ = 0, timed_ms_ = 0;      // the load's lowering and timing of the plans, over every pass
   uint64_t given_back_ = 0;                 // bytes the backend gave back at load (trim)

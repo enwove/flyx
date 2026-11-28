@@ -244,8 +244,9 @@ bool fetch_blob(const Repo& r, const RepoFile& f, const fs::path& blob, Meter* m
   std::error_code ec;
   if (!partial.can_resume()) fs::remove(partial.data, ec), fs::remove(partial.map, ec);  // unknown state: start over
 
-  BlobTransfer tx(f, endpoint() + "/" + r.id + "/resolve/" + r.commit + "/" + detail::url_path(f.path),
-                  detail::auth_headers(), partial.pieces, meter, stop);
+  const auto ep = resolve_endpoint();
+  BlobTransfer tx(f, ep.value + "/" + r.id + "/resolve/" + r.commit + "/" + detail::url_path(f.path),
+                  detail::auth_headers(ep), partial.pieces, meter, stop);
   if (!tx.out.open(from_path(partial.data), f.size, err) ||
       !tx.map.open(from_path(partial.map), partial.pieces, err) ||
       !tx.map.read_at(0, tx.done.data(), partial.pieces, err))
@@ -310,13 +311,102 @@ bool gated_field(const nlohmann::json& o) {
   return it != o.end() && (it->is_string() || (it->is_boolean() && it->get<bool>()));
 }
 
+bool is_digits(std::string_view s) {
+  if (s.empty()) return false;
+  for (char c : s)
+    if (c < '0' || c > '9') return false;
+  return true;
+}
+
+bool valid_hms(std::string_view s) {
+  if (s.size() != 8 || s[2] != ':' || s[5] != ':') return false;
+  if (!is_digits(s.substr(0, 2)) || !is_digits(s.substr(3, 2)) || !is_digits(s.substr(6, 2))) return false;
+  const int hh = (s[0] - '0') * 10 + (s[1] - '0');
+  const int mm = (s[3] - '0') * 10 + (s[4] - '0');
+  const int ss = (s[6] - '0') * 10 + (s[7] - '0');
+  return hh <= 23 && mm <= 59 && ss <= 60;
+}
+
+bool valid_day3(std::string_view s) {
+  return s == "Mon" || s == "Tue" || s == "Wed" || s == "Thu" || s == "Fri" || s == "Sat" || s == "Sun";
+}
+
+bool valid_day_long(std::string_view s) {
+  return s == "Monday" || s == "Tuesday" || s == "Wednesday" || s == "Thursday" || s == "Friday" ||
+         s == "Saturday" || s == "Sunday";
+}
+
+bool valid_month(std::string_view s) {
+  return s == "Jan" || s == "Feb" || s == "Mar" || s == "Apr" || s == "May" || s == "Jun" ||
+         s == "Jul" || s == "Aug" || s == "Sep" || s == "Oct" || s == "Nov" || s == "Dec";
+}
+
+bool valid_http_date(std::string_view s) {
+  // IMF-fixdate: "Sun, 06 Nov 1994 08:49:37 GMT" (29 chars)
+  if (s.size() == 29 && valid_day3(s.substr(0, 3)) && s.substr(3, 2) == ", " && is_digits(s.substr(5, 2)) &&
+      s[7] == ' ' && valid_month(s.substr(8, 3)) && s[11] == ' ' && is_digits(s.substr(12, 4)) && s[16] == ' ' &&
+      valid_hms(s.substr(17, 8)) && s.substr(25, 4) == " GMT") {
+    const int d = (s[5] - '0') * 10 + (s[6] - '0');
+    return d >= 1 && d <= 31;
+  }
+  // Obsolete asctime-date: "Sun Nov  6 08:49:37 1994" (24 chars)
+  if (s.size() == 24 && valid_day3(s.substr(0, 3)) && s[3] == ' ' && valid_month(s.substr(4, 3)) && s[7] == ' ' &&
+      (s[8] == ' ' || (s[8] >= '0' && s[8] <= '9')) && (s[9] >= '0' && s[9] <= '9') && s[10] == ' ' &&
+      valid_hms(s.substr(11, 8)) && s[19] == ' ' && is_digits(s.substr(20, 4))) {
+    const int d = (s[8] == ' ' ? 0 : (s[8] - '0') * 10) + (s[9] - '0');
+    return d >= 1 && d <= 31;
+  }
+  // Obsolete rfc850-date: "Sunday, 06-Nov-94 08:49:37 GMT"
+  const size_t comma = s.find(", ");
+  if (comma != std::string_view::npos && valid_day_long(s.substr(0, comma))) {
+    const std::string_view rest = s.substr(comma + 2);
+    if (rest.size() == 22 && is_digits(rest.substr(0, 2)) && rest[2] == '-' && valid_month(rest.substr(3, 3)) &&
+        rest[6] == '-' && is_digits(rest.substr(7, 2)) && rest[9] == ' ' && valid_hms(rest.substr(10, 8)) &&
+        rest.substr(18, 4) == " GMT") {
+      const int d = (rest[0] - '0') * 10 + (rest[1] - '0');
+      return d >= 1 && d <= 31;
+    }
+  }
+  return false;
+}
+
+bool set_outcome(HubOutcome* outcome, HubError err, std::string retry_after = {}) {
+  if (outcome) {
+    outcome->error = err;
+    outcome->retry_after = err == HubError::kRateLimited ? std::move(retry_after) : std::string();
+  }
+  return false;
+}
+
+HubError error_for_status(int status) {
+  if (status == 404) return HubError::kNotFound;
+  if (status == 401 || status == 403) return HubError::kUnauthorized;
+  if (status == 429) return HubError::kRateLimited;
+  return HubError::kUnreachable;
+}
+
 }  // namespace
+
+std::string sanitize_retry_after(std::string_view raw) {
+  size_t s = 0;
+  while (s < raw.size() && (raw[s] == ' ' || raw[s] == '\t')) ++s;
+  size_t e = raw.size();
+  while (e > s && (raw[e - 1] == ' ' || raw[e - 1] == '\t' || raw[e - 1] == '\r' || raw[e - 1] == '\n')) --e;
+  if (s >= e) return "";
+  const std::string_view v = raw.substr(s, e - s);
+  for (unsigned char c : v)
+    if (c < 0x20 || c >= 0x7f) return "";
+  if (is_digits(v) && v.size() <= 20) return std::string(v);
+  if (valid_http_date(v)) return std::string(v);
+  return "";
+}
 
 std::string base_relation(const std::string& repo) {
   if (offline()) return "";
+  const auto ep = resolve_endpoint();
   os::HttpGet g;
-  g.url = endpoint() + "/api/models/" + repo + "?expand[]=baseModels";
-  g.headers = detail::auth_headers();
+  g.url = ep.value + "/api/models/" + repo + "?expand[]=baseModels";
+  g.headers = detail::auth_headers(ep);
   std::string body, net;
   int status = 0;
   if (!os::http_get_text(g, &body, &status, &net) || status != 200) return "";
@@ -325,35 +415,53 @@ std::string base_relation(const std::string& repo) {
   return str_field(j["baseModels"], "relation");
 }
 
-bool describe(const std::string& repo, const std::string& revision, Repo* out, std::string* err) {
-  if (!detail::valid_repo(repo)) return *err = "not a Hub repository name: " + repo, false;
+bool describe(const std::string& repo, const std::string& revision, Repo* out, std::string* err, HubOutcome* outcome,
+              const PathAllowFn& allow_path) {
+  if (outcome) *outcome = {};
+  if (!detail::valid_repo(repo)) {
+    *err = "not a Hub repository name: " + repo;
+    return set_outcome(outcome, HubError::kInvalidName);
+  }
   Repo r;
   r.id = repo, r.revision = revision.empty() ? "main" : revision;
-  if (!detail::valid_word(r.revision)) return *err = "not a Hub revision name: " + r.revision, false;
-  std::string net;
+  if (!detail::valid_word(r.revision)) {
+    *err = "not a Hub revision name: " + r.revision;
+    return set_outcome(outcome, HubError::kInvalidName);
+  }
+  std::string net, retry_after;
+  int last_status = 0;
   if (!offline()) {
+    const auto ep = resolve_endpoint();
     os::HttpGet g;
-    g.url = endpoint() + "/api/models/" + repo + "/revision/" + detail::url_path(r.revision) + "?blobs=true";
-    g.headers = detail::auth_headers();
+    g.url = ep.value + "/api/models/" + repo + "/revision/" + detail::url_path(r.revision) + "?blobs=true";
+    g.headers = detail::auth_headers(ep);
     std::string body;
     int status = 0;
-    if (os::http_get_text(g, &body, &status, &net)) {
+    if (os::http_get_text(g, &body, &status, &net, 64u << 20, nullptr, &retry_after)) {
+      last_status = status;
       // A repository the Hub no longer shows this machine (gone, made private, a token expired) is still served
       // from the cache when it has the revision.
-      if ((status == 401 || status == 403 || status == 404) && detail::from_cache(repo, r.revision, &r)) {
+      if ((status == 401 || status == 403 || status == 404) && detail::from_cache(repo, r.revision, &r, allow_path)) {
         *out = std::move(r);
         return true;
       }
-      if (status == 401 || status == 403)  // the Hub answers a name it does not show anyone this way too
-        return *err = repo + ": not on the Hub, or gated or private: check the name; for a gated model accept its "
-                             "terms on huggingface.co, then set HF_TOKEN or run `hf auth login`", false;
-      if (status == 404)
-        return *err = repo + (r.revision == "main" ? "" : "@" + r.revision) +
-                      ": not on the Hub (a typo, or a private repository: set HF_TOKEN)", false;
+      if (status == 401 || status == 403) {  // the Hub answers a name it does not show anyone this way too
+        *err = repo + ": not on the Hub, or gated or private: check the name; for a gated model accept its "
+                      "terms on huggingface.co, then set HF_TOKEN or run `hf auth login`";
+        return set_outcome(outcome, HubError::kUnauthorized);
+      }
+      if (status == 404) {
+        *err = repo + (r.revision == "main" ? "" : "@" + r.revision) +
+               ": not on the Hub (a typo, or a private repository: set HF_TOKEN)";
+        return set_outcome(outcome, HubError::kNotFound);
+      }
       if (status == 200) {
         try {
           const auto j = nlohmann::json::parse(body);
-          if (!j.is_object()) return *err = repo + ": the Hub's answer is not a JSON object", false;
+          if (!j.is_object()) {
+            *err = repo + ": the Hub's answer is not a JSON object";
+            return set_outcome(outcome, HubError::kBadAnswer);
+          }
           r.commit = str_field(j, "sha");
           r.info.downloads = u64_field(j, "downloads"), r.info.likes = u64_field(j, "likes");
           r.info.updated = str_field(j, "lastModified"), r.info.pipeline = str_field(j, "pipeline_tag");
@@ -392,22 +500,27 @@ bool describe(const std::string& repo, const std::string& revision, Repo* out, s
             }
           }
         } catch (const std::exception& e) {
-          return *err = repo + ": the Hub's answer: " + e.what(), false;
+          *err = repo + ": the Hub's answer: " + e.what();
+          return set_outcome(outcome, HubError::kBadAnswer);
         }
-        if (!detail::is_commit(r.commit)) return *err = repo + ": the Hub named no commit", false;
+        if (!detail::is_commit(r.commit)) {
+          *err = repo + ": the Hub named no commit";
+          return set_outcome(outcome, HubError::kBadAnswer);
+        }
         *out = std::move(r);
         return true;
       }
       net = "the Hub answered " + std::to_string(status);
     }
   }
-  if (detail::from_cache(repo, r.revision, &r)) {
+  if (detail::from_cache(repo, r.revision, &r, allow_path)) {
     *out = std::move(r);
     return true;
   }
   *err = repo + ": " + (offline() ? std::string("not in the cache (") + cache_dir() + ") and HF_HUB_OFFLINE is set"
                                   : "cannot reach the Hub (" + net + ") and not in the cache (" + cache_dir() + ")");
-  return false;
+  if (last_status == 429) return set_outcome(outcome, HubError::kRateLimited, sanitize_retry_after(retry_after));
+  return set_outcome(outcome, HubError::kUnreachable);
 }
 
 // Pulls the `cursor` parameter from a Link header entry with rel="next" (RFC 8288), or empty when absent.
@@ -452,30 +565,43 @@ bool found_of(const nlohmann::json& m, Found* f) {
 }  // namespace
 
 bool search(const std::string& query, const std::string& sort, int limit, std::vector<Found>* out, std::string* err,
-            const std::string& cursor, std::string* next_cursor, bool gguf_only) {
+            const std::string& cursor, std::string* next_cursor, bool gguf_only, HubOutcome* outcome) {
   out->clear();
   if (next_cursor) next_cursor->clear();
-  if (offline()) return *err = "HF_HUB_OFFLINE is set: the Hub is not asked", false;
+  if (outcome) *outcome = {};
+  if (offline()) {
+    *err = "HF_HUB_OFFLINE is set: the Hub is not asked";
+    return set_outcome(outcome, HubError::kUnreachable);
+  }
   const char* by = sort == "downloads" ? "downloads" : sort == "likes" ? "likes" : sort == "updated" ? "lastModified"
                  : sort == "created" ? "createdAt" : "trendingScore";
+  const auto ep = resolve_endpoint();
   os::HttpGet g;
   // expand[]: returns GGUF architecture, timestamps, counts and gated status without full sibling file lists.
-  g.url = endpoint() + "/api/models?" + (gguf_only ? "filter=gguf&" : "") + "direction=-1&sort=" + by + "&limit=" +
+  g.url = ep.value + "/api/models?" + (gguf_only ? "filter=gguf&" : "") + "direction=-1&sort=" + by + "&limit=" +
           std::to_string(std::clamp(limit, 1, 100)) +
           "&expand[]=gguf&expand[]=downloads&expand[]=likes&expand[]=lastModified&expand[]=createdAt"
           "&expand[]=pipeline_tag&expand[]=gated" +
           (gguf_only ? "" : "&expand[]=config") +
           (query.empty() ? "" : "&search=" + detail::url_query(query)) +
           (cursor.empty() ? "" : "&cursor=" + detail::url_query(cursor));
-  g.headers = detail::auth_headers();
+  g.headers = detail::auth_headers(ep);
   g.connect_timeout_s = 10, g.stall_timeout_s = 20;
-  std::string body, link, net;
+  std::string body, link, net, retry_after;
   int status = 0;
-  if (!os::http_get_text(g, &body, &status, &net, 64u << 20, next_cursor ? &link : nullptr))
-    return *err = "cannot reach the Hub (" + net + ")", false;
-  if (status != 200) return *err = "the Hub answered " + std::to_string(status), false;
+  if (!os::http_get_text(g, &body, &status, &net, 64u << 20, next_cursor ? &link : nullptr, &retry_after)) {
+    *err = "cannot reach the Hub (" + net + ")";
+    return set_outcome(outcome, HubError::kUnreachable);
+  }
+  if (status != 200) {
+    *err = "the Hub answered " + std::to_string(status);
+    return set_outcome(outcome, error_for_status(status), sanitize_retry_after(retry_after));
+  }
   const auto j = nlohmann::json::parse(body, nullptr, false);
-  if (!j.is_array()) return *err = "the Hub's answer is not a list of repositories", false;
+  if (!j.is_array()) {
+    *err = "the Hub's answer is not a list of repositories";
+    return set_outcome(outcome, HubError::kBadAnswer);
+  }
   for (const auto& m : j) {
     Found f;
     if (!found_of(m, &f)) continue;
@@ -500,19 +626,23 @@ namespace {
 bool file_of(const Repo& r, const RepoFile& f, fs::path* local, os::HttpGet* g, std::string* err) {
   if (!detail::valid_repo(r.id) || !detail::is_commit(r.commit) || !detail::safe_path(f.path))
     return *err = "not a file of a Hub repository: " + r.id + "/" + f.path, false;
+  const auto ep = resolve_endpoint();
   *local = to_path(snapshot_dir(r)) / to_path(f.path);
-  g->url = endpoint() + "/" + r.id + "/resolve/" + r.commit + "/" + detail::url_path(f.path);
-  g->headers = detail::auth_headers();
+  g->url = ep.value + "/" + r.id + "/resolve/" + r.commit + "/" + detail::url_path(f.path);
+  g->headers = detail::auth_headers(ep);
   g->connect_timeout_s = 10, g->stall_timeout_s = 20;
   return true;
 }
 }  // namespace
 
-bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text, std::string* err) {
+bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text, std::string* err,
+               const PathAllowFn& allow_path) {
   fs::path local;
   os::HttpGet g;
   if (!file_of(r, f, &local, &g, err)) return false;
   if (f.size > max) return *err = f.path + ": " + std::to_string(f.size) + " bytes, more than " + std::to_string(max), false;
+  if (allow_path && !allow_path(from_path(local)))
+    return *err = from_path(local) + ": path is not allowed by remote path policy", false;
   if (detail::has_size(local, f.size)) {
     std::ifstream in(local, std::ios::binary);
     text->assign(size_t(f.size), '\0');
@@ -527,10 +657,13 @@ bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text
   return true;
 }
 
-bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, std::string* err) {
+bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, std::string* err,
+                        const PathAllowFn& allow_path) {
   fs::path local;
   os::HttpGet file;
   if (!file_of(r, f, &local, &file, err)) return false;
+  if (allow_path && !allow_path(from_path(local)))
+    return *err = from_path(local) + ": path is not allowed by remote path policy", false;
   constexpr uint64_t kMax = modelfile::kSafetensorsHeaderMaxBytes;  // what a load of the file reads
   if (detail::has_size(local, f.size)) {
     std::ifstream in(local, std::ios::binary);
@@ -562,25 +695,41 @@ bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, s
 }
 
 bool adapters_of(const std::string& base, int limit, std::vector<Found>* out, std::string* err,
-                 const std::string& cursor, std::string* next_cursor) {
+                 const std::string& cursor, std::string* next_cursor, HubOutcome* outcome) {
   out->clear();
   if (next_cursor) next_cursor->clear();
-  if (!detail::valid_repo(base)) return *err = "not a Hub repository name: " + base, false;
-  if (offline()) return *err = "HF_HUB_OFFLINE is set: the Hub is not asked", false;
+  if (outcome) *outcome = {};
+  if (!detail::valid_repo(base)) {
+    *err = "not a Hub repository name: " + base;
+    return set_outcome(outcome, HubError::kInvalidName);
+  }
+  if (offline()) {
+    *err = "HF_HUB_OFFLINE is set: the Hub is not asked";
+    return set_outcome(outcome, HubError::kUnreachable);
+  }
+  const auto ep = resolve_endpoint();
   os::HttpGet g;
-  g.url = endpoint() + "/api/models?filter=" + detail::url_query("base_model:adapter:" + base) +
+  g.url = ep.value + "/api/models?filter=" + detail::url_query("base_model:adapter:" + base) +
           "&sort=downloads&direction=-1&limit=" + std::to_string(std::clamp(limit, 1, 100)) +
           "&expand[]=downloads&expand[]=likes&expand[]=lastModified&expand[]=createdAt&expand[]=gated" +
           (cursor.empty() ? "" : "&cursor=" + detail::url_query(cursor));
-  g.headers = detail::auth_headers();
+  g.headers = detail::auth_headers(ep);
   g.connect_timeout_s = 10, g.stall_timeout_s = 20;
-  std::string body, link, net;
+  std::string body, link, net, retry_after;
   int status = 0;
-  if (!os::http_get_text(g, &body, &status, &net, 16u << 20, next_cursor ? &link : nullptr))
-    return *err = "cannot reach the Hub (" + net + ")", false;
-  if (status != 200) return *err = "the Hub answered " + std::to_string(status), false;
+  if (!os::http_get_text(g, &body, &status, &net, 16u << 20, next_cursor ? &link : nullptr, &retry_after)) {
+    *err = "cannot reach the Hub (" + net + ")";
+    return set_outcome(outcome, HubError::kUnreachable);
+  }
+  if (status != 200) {
+    *err = "the Hub answered " + std::to_string(status);
+    return set_outcome(outcome, error_for_status(status), sanitize_retry_after(retry_after));
+  }
   const auto j = nlohmann::json::parse(body, nullptr, false);
-  if (!j.is_array()) return *err = "the Hub's answer is not a list of repositories", false;
+  if (!j.is_array()) {
+    *err = "the Hub's answer is not a list of repositories";
+    return set_outcome(outcome, HubError::kBadAnswer);
+  }
   for (const auto& m : j) {
     Found f;
     if (found_of(m, &f)) out->push_back(std::move(f));
@@ -590,20 +739,35 @@ bool adapters_of(const std::string& base, int limit, std::vector<Found>* out, st
 }
 
 bool fetch(const Repo& r, const std::vector<RepoFile>& files, std::vector<std::string>* paths, const ProgressFn& progress,
-           const std::atomic<bool>* stop, std::string* err) {
+           const std::atomic<bool>* stop, std::string* err, const PathAllowFn& allow_path) {
   paths->clear();
   if (!detail::valid_repo(r.id)) return *err = "not a Hub repository name: " + r.id, false;
   if (!detail::is_commit(r.commit)) return *err = r.id + ": invalid Hub commit: " + r.commit, false;
   if (!r.revision.empty() && !detail::valid_word(r.revision))
     return *err = "not a Hub revision name: " + r.revision, false;
   if (stop && stop->load()) return *err = "stopped", false;
-  const fs::path snap = to_path(snapshot_dir(r)), blobs = detail::repo_dir(r.id) / "blobs";
+  auto check_allow = [&](const fs::path& p) -> bool {
+    if (!allow_path || allow_path(from_path(p))) return true;
+    paths->clear();
+    *err = from_path(p) + ": path is not allowed by remote path policy";
+    return false;
+  };
+  const fs::path repo_root = detail::repo_dir(r.id), snap = to_path(snapshot_dir(r)), blobs = repo_root / "blobs";
+  if (!check_allow(to_path(cache_dir())) || !check_allow(repo_root) || !check_allow(repo_root / "snapshots") ||
+      !check_allow(snap) || !check_allow(blobs))
+    return false;
+  if (!r.revision.empty() && r.revision != r.commit) {
+    const fs::path refs = repo_root / "refs";
+    if (!check_allow(refs) || !check_allow(refs / to_path(r.revision))) return false;
+  }
   Meter meter;
   meter.fn = progress;
   std::vector<Missing> missing;
   for (const RepoFile& f : files) {
-    if (!detail::safe_path(f.path)) return *err = r.id + ": unsafe file path: " + f.path, false;
+    if (!detail::safe_path(f.path)) return paths->clear(), *err = r.id + ": unsafe file path: " + f.path, false;
     const fs::path dst = snap / to_path(f.path);
+    for (fs::path p = dst; !p.empty() && p != snap; p = p.parent_path())
+      if (!check_allow(p)) return false;
     paths->push_back(from_path(dst));
     meter.total += f.size;
     if (detail::has_size(dst, f.size)) {
@@ -611,16 +775,21 @@ bool fetch(const Repo& r, const std::vector<RepoFile>& files, std::vector<std::s
       meter.file = f.path;
       continue;
     }
-    if (r.from_cache) return *err = r.id + ": " + f.path + " is not in the cache, and the Hub is not reached", false;
+    if (r.from_cache)
+      return paths->clear(), *err = r.id + ": " + f.path + " is not in the cache, and the Hub is not reached", false;
     const std::string id = f.sha256.empty() ? f.blob_id : detail::lower(f.sha256);
-    if (!detail::hex_id(id)) return *err = r.id + ": " + f.path + " has no id on the Hub", false;
+    if (!detail::hex_id(id)) return paths->clear(), *err = r.id + ": " + f.path + " has no id on the Hub", false;
     const fs::path blob = blobs / id;
+    const PartialBlob partial(blob, f.size);
+    if (!check_allow(blob) || !check_allow(to_path(from_path(blob) + ".flyx-lock")) ||
+        !check_allow(partial.data) || !check_allow(partial.map))
+      return false;
     missing.push_back({&f, blob});
   }
   if (!missing.empty()) {
     std::error_code ec;
     fs::create_directories(blobs, ec);
-    if (ec) return *err = from_path(blobs) + ": " + ec.message(), false;
+    if (ec) return paths->clear(), *err = from_path(blobs) + ": " + ec.message(), false;
   }
   bool checked_space = false;
   for (const auto& [f, blob] : missing) {

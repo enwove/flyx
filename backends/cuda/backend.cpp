@@ -12,6 +12,7 @@
 //   both folds of a saved state, never a recompute of the prompt.
 #include "backends/cuda/backend.h"
 #include "backends/cuda/regions/layers.h"
+#include "core/interfaces/memory_policy.h"
 
 #include <charconv>
 #include <climits>
@@ -623,6 +624,13 @@ int probe(flyx_device_info* out) {
                 (need == 13000 ? " (driver 580 or newer)" : " or newer"));
   int n = 0;
   cudaError_t e = cudaGetDeviceCount(&n);
+  // A CUDA forward-compatibility driver (a container's libcuda newer than the kernel driver: the version above is its)
+  // runs on data-center GPUs only: an RTX 4080 SUPER with kernel driver 570 under a CUDA 13 image said only "forward
+  // compatibility was attempted on non supported HW".
+  if (e == cudaErrorCompatNotSupportedOnDevice)
+    return fail("the NVIDIA kernel driver is older than CUDA " + std::to_string(need / 1000) + " needs" +
+                (need == 13000 ? " (580 or newer)" : "") +
+                ", and the CUDA forward-compatibility driver in use runs on data-center GPUs only: update the driver");
   if (e != cudaSuccess || n == 0) return fail(std::string("no CUDA device: ") + cudaGetErrorString(e));
   cudaDeviceProp prop{};
   if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) return fail("cannot query device 0");
@@ -640,6 +648,7 @@ int probe(flyx_device_info* out) {
   cudaMemGetInfo(&fr, &tot);
   out->mem_free = fr;
   out->mem_total = tot;
+  out->reserve_floor = device_reserve_floor();
   return 0;
 }
 
@@ -793,9 +802,11 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     size_t free = 0, total = 0;
     const bool mem_ok = gpu_memory(&free, &total) && total > 0;
     const size_t process = gpu_process_memory();
-    const size_t own = process >= m->bytes ? process : m->bytes;
+    const bool runtime_known = process > 0 && process >= m->bytes;
+    const size_t own = runtime_known ? process : m->bytes;
     const size_t others = mem_ok && total > free && total - free > own ? total - free - own : 0;
-    const bool has_others = others >= (256ull << 20);
+    const bool has_others =
+        others >= (runtime_known ? interfaces::kClosableOthersKnownBytes : interfaces::kClosableOthersUnknownBytes);
     // From the description: a drafter's layers may come before its block, and run out of memory before it is bound.
     bool drafter = false;
     for (int i = 0; i < desc->n_blocks; ++i)
@@ -809,12 +820,13 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
                     others / 1e9, total / 1e9);
     else if (mem_ok)
       std::snprintf(head, sizeof(head), "Not enough VRAM while loading weights (%.2f GB GPU).", total / 1e9);
-    const std::string fix =
-        has_others ? std::string(" Close other apps") + (drafter ? ", disable speculative decoding" : "") +
-                         ", or use a smaller quantization."
-                   : (drafter ? " Disable speculative decoding or use a smaller quantization."
-                              : " Use a smaller quantization.");
-    return fail_oom(std::string(head) + fix);
+    const std::string advice =
+        has_others
+            ? std::string("Close other apps") + (drafter ? ", disable speculative decoding" : "") +
+                  ", or use a smaller quantization."
+            : (drafter ? "Disable speculative decoding or use a smaller quantization."
+                       : "Use a smaller quantization.");
+    return fail_oom(std::string(head) + " " + advice);
   } catch (const std::exception& e) {
     return fail(std::string("uploading weights: ") + e.what());
   }

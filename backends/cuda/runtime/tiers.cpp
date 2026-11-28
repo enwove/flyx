@@ -19,6 +19,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -89,6 +90,31 @@ const Vmm& vmm() {
       return;
     }
     v.gran = std::max(gd, gh);
+    // Probe one granularity of VMM end-to-end (reserve -> create -> map -> set_access -> release) so drivers
+    // that advertise VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED yet return CUDA_ERROR_NOT_SUPPORTED on VMM calls
+    // report the fallback reserve floor before planning accepts a tighter memory budget.
+    CUdeviceptr probe_va = 0;
+    CUmemGenericAllocationHandle probe_h = 0;
+    bool probe_mapped = false;
+    CUresult pr = v.reserve(&probe_va, v.gran, v.gran, 0, 0);
+    if (pr == CUDA_SUCCESS) pr = v.create(&probe_h, v.gran, &dev, 0);
+    if (pr == CUDA_SUCCESS) {
+      pr = v.map(probe_va, v.gran, 0, probe_h, 0);
+      probe_mapped = (pr == CUDA_SUCCESS);
+    }
+    if (pr == CUDA_SUCCESS) {
+      CUmemAccessDesc access{};
+      access.location = {CU_MEM_LOCATION_TYPE_DEVICE, v.device};
+      access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+      pr = v.set_access(probe_va, v.gran, &access, 1);
+    }
+    if (probe_mapped) v.unmap(probe_va, v.gran);
+    if (probe_va) v.address_free(probe_va, v.gran);
+    if (probe_h) v.release(probe_h);
+    if (pr == CUDA_ERROR_NOT_SUPPORTED) {
+      v.missing = "the driver does not support virtual memory management operations";
+      return;
+    }
   });
   return v;
 }
@@ -181,11 +207,25 @@ void DevicePieces::release() {
   alias = false;
 }
 
-bool vmm_supported() { return vmm().missing.empty(); }
+namespace {
+
+std::atomic<bool> g_vmm_fallback{false};
+
+}  // namespace
+
+bool vmm_supported() { return vmm().missing.empty() && !g_vmm_fallback.load(std::memory_order_relaxed); }
 
 size_t pieces_floor() {
   const Vmm& v = vmm();
-  return v.missing.empty() ? floor_of(v) : kPagedFloor;
+  return v.missing.empty() && !g_vmm_fallback.load(std::memory_order_relaxed) ? floor_of(v) : kPagedFloor;
+}
+
+uint64_t device_reserve_floor() {
+#if defined(_WIN32)
+  return pieces_floor();
+#else
+  return 0;
+#endif
 }
 
 namespace {
@@ -197,7 +237,7 @@ template <class Map>
 void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
   const Vmm& v = vmm();
   out->release();
-  if (!v.missing.empty() || bytes == 0) return nullptr;
+  if (!v.missing.empty() || g_vmm_fallback.load(std::memory_order_relaxed) || bytes == 0) return nullptr;
   const size_t total = round_up(bytes, v.gran);
   try {
     CUdeviceptr va = 0;
@@ -210,6 +250,7 @@ void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
     access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     piece_check(v.set_access(va, total, &access, 1), "granting the device access", total);
   } catch (const VmmUnsupported&) {
+    g_vmm_fallback.store(true, std::memory_order_relaxed);
     out->release();
     return nullptr;
   } catch (...) {
@@ -223,7 +264,7 @@ void* map_range(size_t bytes, DevicePieces* out, Map&& map) {
 
 void* device_pieces(size_t bytes, DevicePieces* out) {
   const Vmm& v = vmm();
-  if (!v.missing.empty() || bytes == 0) return nullptr;
+  if (!vmm_supported() || bytes == 0) return nullptr;
   device_room(round_up(bytes, v.gran), floor_of(v));
   return map_range(bytes, out, [&](const Vmm& v, CUdeviceptr va, size_t total) {
     create_pieces(v, total, &out->handles, "allocating device memory in pieces");
@@ -239,7 +280,7 @@ void* device_pieces(size_t bytes, DevicePieces* out) {
 
 void* device_alias(size_t bytes, DevicePieces* out) {
   const Vmm& v = vmm();
-  if (!v.missing.empty() || bytes == 0) return nullptr;
+  if (!vmm_supported() || bytes == 0) return nullptr;
   device_room(v.gran, floor_of(v));
   return map_range(bytes, out, [&](const Vmm& v, CUdeviceptr va, size_t total) {
     out->alias = true;

@@ -143,6 +143,8 @@ void apply_environment(EngineOptions* o) {
     }
   if (!o->adaptive_given)
     if (const auto v = os::env_bool(env::kAdaptive)) o->adaptive = *v;
+  if (!o->learn_costs_given)
+    if (const auto v = os::env_bool(env::kLearnCosts)) o->learn_costs = *v;
 }
 
 namespace {
@@ -169,27 +171,34 @@ flyx_backend_entry_fn find_builtin_backend(const std::string& name) {
 bool open_backend(const EngineOptions& opt, std::unique_ptr<os::DynLib>* out_lib, const flyx_backend_api** out_api,
                   flyx_device_info* out_info, std::string* err) {
   std::string dir = opt.backend_dir.empty() ? os::executable_dir() : opt.backend_dir;
+  // The backend asked for; else the build's own: cuda where it ships one, cpu_ref (the float64 reference) where it
+  // has none.  A cuda backend that is there but cannot run on this machine (no GPU, a GPU before sm_80, a driver too
+  // old) is an error, not the reference in its place: a real model on cpu_ref takes minutes a token.
   std::vector<std::string> names;
   std::string want = opt.backend;
   if (!want.empty()) names = {want};
   else names = {"cuda", "cpu_ref"};
   std::string tried;
+  auto unusable = [&](const std::string& n) {
+    *err = "the " + n + " backend is not usable here:" + tried +
+           "\n(--backend cpu_ref runs the float64 reference instead: for checking, far too slow for a real model)";
+    return false;
+  };
   for (const auto& n : names) {
     if (opt.backend_dir.empty()) {
       if (auto entry = find_builtin_backend(n)) {
         const flyx_backend_api* api = entry();
         if (!api || api->abi_version != FLYX_BACKEND_ABI_VERSION || api->struct_size < sizeof(flyx_backend_api)) {
           tried += "\n  built-in " + n + ": incompatible backend ABI";
+          if (want.empty() && n == names.front()) return unusable(n);
           continue;
         }
         flyx_device_info info{};
         if (api->probe(&info) != 0) {
           tried += "\n  built-in " + n + ": " + api->last_error();
+          if (want.empty() && n == names.front()) return unusable(n);
           continue;
         }
-        if (n != names.front())
-          log::warn("flyx: the %s backend is not usable here, so %s runs:%s", names.front().c_str(), n.c_str(),
-                    tried.c_str());
         *out_lib = nullptr;
         *out_api = api;
         *out_info = info;
@@ -222,17 +231,15 @@ bool open_backend(const EngineOptions& opt, std::unique_ptr<os::DynLib>* out_lib
         failures += "\n  " + path + ": " + api->last_error();
         continue;
       }
-      // A backend passed over is said without -v: on Windows, Smart App Control once refused an unsigned
-      // libflyx-cuda.dll and a real model ran on the float64 reference, a minute a 6000-token prefill, unexplained.
-      if (n != names.front())
-        log::warn("flyx: the %s backend is not usable here, so %s runs:%s", names.front().c_str(), n.c_str(),
-                  tried.c_str());
       *out_lib = std::move(lib);
       *out_api = api;
       *out_info = info;
       return true;
     }
     tried += failures.empty() ? "\n  " + file + " not found in backend paths relative to " + dir : failures;
+    // The build's cuda backend is there and does not run here (on Windows, Smart App Control once refused an
+    // unsigned libflyx-cuda.dll, and a real model then ran on the reference, a minute a 6000-token prefill).
+    if (want.empty() && n == names.front() && !failures.empty()) return unusable(n);
   }
   *err = "no usable backend" + tried;
   return false;
@@ -400,6 +407,22 @@ bool Engine::build_and_calibrate_plans(double* t_plans, double* t_rounds, std::s
   } else {
     spec::warm_rounds(api_, bm_, plans_.prefill, plans_.rounds, prompt);
   }
+  // The costs the controller chooses by from here: these timings, then what the rounds read teach (RoundCosts),
+  // where they choose (one plan and no lookup: nothing timed, nothing to learn).  A drafter's wider chain costs no
+  // less than its next narrower one; so does a lookup round of more drafts (given_widths ascend).
+  costs_chosen_ = plans_.widths.size() > 1 || !plans_.given.empty();
+  std::vector<int> narrower(plans_.widths.size(), -1), lookup_narrower(lookup_ms_.size(), -1);
+  for (size_t i = 0; i < plans_.widths.size(); ++i) {
+    const int d = plans_.drafters[i];
+    if (d < 0 || plans_.drafter_trees[i]) continue;
+    for (size_t j = 0; j < plans_.widths.size(); ++j)
+      if (plans_.drafters[j] == d && !plans_.drafter_trees[j] && plans_.widths[j] < plans_.widths[i] &&
+          (narrower[i] < 0 || plans_.widths[j] > plans_.widths[size_t(narrower[i])]))
+        narrower[i] = int(j);
+  }
+  for (size_t k = 1; k < lookup_narrower.size(); ++k) lookup_narrower[k] = int(k - 1);
+  round_costs_.reset(round_ms_, &round_ms_per_token_, round_ms_at_, &narrower);
+  lookup_costs_.reset(lookup_ms_, nullptr, round_ms_at_, &lookup_narrower);
   *t_rounds = os::now_ms();
   return true;
 }
@@ -416,9 +439,10 @@ bool Engine::lower_and_time(std::string* err) {
     lower_ms_ += os::now_ms() - t0;
     if (!plans_.oom) return false;
     if (!give_back()) {  // out of GPU memory with nothing left to give back: what would make room (as the budget's)
-      *err += std::string(". Close other apps") +
-              (model_->drafters() > 0 ? ", disable speculative decoding" : "") +
-              ", or use a smaller quantization.";
+      flyx_memory_info mi{};
+      const bool has_others =
+          api_->memory && api_->memory(bm_, &mi) == 0 && mi.total > 0 && plan::closable(plan::held_of(mi));
+      *err += ". " + plan::oom_fix_advice(has_others, model_->drafters() > 0);
       return false;
     }
   }
@@ -471,33 +495,71 @@ bool Engine::plan_memory(plan::KvTiers* tiers, int session_limit, int* asked_ctx
   // The model file's pages the load read are cached, not used: on Windows they count as available only once the
   // process lets go of them, and the host memory K/V may take is measured next.
   os::release_working_set();
+  auto current_floor = [&]() -> uint64_t {
+    uint64_t f = device_.reserve_floor;
+    if (api_ && api_->memory && bm_) {
+      flyx_memory_info mi{};
+      if (api_->memory(bm_, &mi) == 0) f = std::max(f, mi.reserve_floor);
+    }
+    return f;
+  };
+  device_.reserve_floor = current_floor();
   tiers->gpu = opt_.kv_gpu;
   tiers->ram = opt_.kv_ram;
   tiers->copy_gpu = opt_.kv_copy_gpu;
   tiers->reserved = opt_.host_reserved;
+  tiers->vram_reserve = opt_.vram_reserve;
+  tiers->min_vram_reserve = device_.reserve_floor;
+  tiers->ram_reserve = opt_.ram_reserve;
   tiers->gpu_paged = os::gpu_memory_paged();
   // --ctx max: the longest the GPU and host memory hold, or with no host memory for K/V the longest the GPU holds.
   const int min_ctx = opt_.ctx_max ? 1024 : opt_.ctx_given ? 0 : kMinFittedCtx;
   // Not even one session fits (in any layout account() takes, its K/V in host memory or its context shrunk
   // included): one step of what the backend keeps for speed, and the budget again.  Only when nothing is left to give
-  // is it an error.
-  while (!plan::account(api_, bm_, model_->drafters() > 0, 2 * bf16 > all, &opt_.max_ctx, min_ctx, *tiers, &ledger_,
-                        &budget_, err, opt_.ctx_max)) {
-    const std::string why = *err;
-    if (!give_back()) {
-      *err = why;
-      if (given_back_) *err += " (" + gb(given_back_) + " the backend kept for speed already given back)";
-      return false;
+  // is it an error.  The K/V of the context asked for comes before the copies only the target's rounds read to run
+  // faster (flyx_memory_info::speed) too: where a session of it fits on the GPU without them, they go, a step at a
+  // time, rather than its positions past what fits beside them to host memory, read over the bus every step.  With
+  // the copies first, a tenth of a GB other programs held or let go of at load decided where the K/V went: Qwen3.5-4B
+  // NVFP4 at 40960 tokens on an RTX 5060 Ti, with 0.1 GB more free, kept its certified head (0.64 GB) and 6144
+  // positions on the GPU and decoded a 35K-token prompt at 41 tok/s, against 82 with the head given back and every
+  // position there (the head alone: 127 against 106 tok/s on short prompts).  An explicit --kv-gpu keeps the copies.
+  const int asked = opt_.max_ctx;
+  auto speed_in_the_way = [&] {
+    flyx_memory_info mi{};
+    return tiers->gpu < 0 && ledger_.budget() > 0 && budget_.whole_bytes > budget_.sessions_room && api_->memory &&
+           api_->memory(bm_, &mi) == 0 && mi.speed > 0 && budget_.whole_bytes - budget_.sessions_room <= mi.speed;
+  };
+  for (;;) {
+    for (;;) {
+      const bool placed = plan::account(api_, bm_, model_->drafters() > 0, 2 * bf16 > all, &opt_.max_ctx, min_ctx,
+                                        *tiers, &ledger_, &budget_, err, opt_.ctx_max);
+      if (placed && !speed_in_the_way()) break;
+      const std::string why = *err;
+      if (!give_back()) {
+        if (placed) break;
+        *err = why;
+        if (given_back_) *err += " (" + gb(given_back_) + " the backend kept for speed already given back)";
+        return false;
+      }
+      opt_.max_ctx = asked;  // account() may have fitted a shorter one
+      if (!lower_and_time(err)) {
+        budget_.oom = plans_.oom;
+        return false;
+      }
+      const uint64_t f = current_floor();
+      if (f > tiers->min_vram_reserve) device_.reserve_floor = tiers->min_vram_reserve = f;
     }
-    if (!lower_and_time(err)) {
-      budget_.oom = plans_.oom;
-      return false;
-    }
+    if (session_limit > 1) plan::fit_second_session(api_, bm_, *tiers, ledger_, &budget_);
+    const uint64_t f = current_floor();
+    if (f <= tiers->min_vram_reserve) break;
+    // Backend's reserve floor grew lazily (e.g., CUDA VMM fell back to paged allocation); replan with the new floor,
+    // for the context asked for.
+    device_.reserve_floor = tiers->min_vram_reserve = f;
+    opt_.max_ctx = asked;
   }
   if (given_back_)
     log::info("flyx: %s of GPU memory the backend kept only for speed given back so that a session fits (the same "
               "output, a little slower; -v says what)", gb(given_back_).c_str());
-  if (session_limit > 1) plan::fit_second_session(api_, bm_, *tiers, ledger_, &budget_);
   return true;
 }
 
@@ -568,19 +630,19 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   if (!set_kv_method(opt_, &tiers, err)) return false;
   // The load's steps, for its report (verbose): file, tokenizer and chat, backend, model, open, plans, rounds, memory.
   double t[7] = {os::now_ms()};
-  if (!file_.open(path, err)) return false;
+  if (!file_.open(path, err, opt_.allow_path)) return false;
   for (const std::string& f : opt_.drafter_files)
-    if (!file_.add(f, err)) return false;
+    if (!file_.add(f, err, opt_.allow_path)) return false;
   if (!opt_.lora_file.empty()) {
     const int before = file_.companions();
-    if (!file_.add(opt_.lora_file, err)) return false;
+    if (!file_.add(opt_.lora_file, err, opt_.allow_path)) return false;
     if (file_.header()["companions"][size_t(before)].value("kind", "") != "lora")
       return *err = opt_.lora_file + ": not a LoRA adapter (a directory of adapter_config.json and "
                                      "adapter_model.safetensors)",
              false;
   }
   if (opt_.vision && !opt_.mmproj_file.empty())
-    if (!file_.add(opt_.mmproj_file, err)) return false;
+    if (!file_.add(opt_.mmproj_file, err, opt_.allow_path)) return false;
   ReadAhead ahead(file_);  // until the load returns
   t[1] = os::now_ms();
   if (!tok_.load(file_, err)) return false;
@@ -650,6 +712,14 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   const bool orig_has_vision = model_->vision() != nullptr;
   const std::string orig_drafters_str = model_drafters_str(*model_);
   const bool gpu_paged = os::gpu_memory_paged();
+  const uint64_t vram_floor = device_.reserve_floor;
+  if (opt_.vram_reserve >= 0 && uint64_t(opt_.vram_reserve) < vram_floor) {
+    log::info("flyx: --vram-reserve %s clamped to backend floor %s",
+              gb(uint64_t(opt_.vram_reserve)).c_str(), gb(vram_floor).c_str());
+  }
+  auto device_reserve = [&](uint64_t total_vram) {
+    return plan::effective_device_reserve(total_vram, gpu_paged, opt_.vram_reserve, vram_floor);
+  };
 
   auto upsert_adj = [&](const std::string& kind, const std::string& from, const std::string& to,
                         const std::string& detail) {
@@ -724,8 +794,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
         if (api_->estimate_load(&target.desc(), &oo, device_.mem_free, device_.mem_total, &base) == 0 &&
             base.target_kv_bytes_per_position) {
           uint64_t room = device_.mem_free;
-          for (uint64_t held : {base.weights_bytes, base.min_runtime_bytes,
-                                plan::device_reserve(device_.mem_total, gpu_paged)})
+          for (uint64_t held : {base.weights_bytes, base.min_runtime_bytes, device_reserve(device_.mem_total)})
             room -= std::min(room, held);
           auto_from = int(std::min<uint64_t>(INT32_MAX, room / base.target_kv_bytes_per_position));
         }
@@ -871,7 +940,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     uint64_t free_vram = 0, total_vram = 0;
     query_vram(&free_vram, &total_vram);
     if (total_vram > 0 && free_vram > 0) {
-      const uint64_t reserve = plan::device_reserve(total_vram, gpu_paged);
+      const uint64_t reserve = device_reserve(total_vram);
       for (;;) {
         flyx_load_estimate est{};
         if (!query_estimate(free_vram, total_vram, &est)) break;

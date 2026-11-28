@@ -4,6 +4,7 @@
 // name@commit offline, files deleted with their blobs only where no other snapshot reads them); and fetching from a
 // fake Hub on this machine (HF_ENDPOINT): the files in huggingface_hub's cache layout, found again without a request and offline, a fetch cut short going on with the pieces it lacks, a
 // corrupted piece refused by the hash, a storage address that stops working.  Skipped (77) where libcurl is missing.
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -22,6 +23,7 @@
 #endif
 
 #include "core/hub/hub.h"
+#include "core/hub/hub_internal.h"
 #include "core/hub/sha256.h"
 #include "core/os/env.h"
 #include "core/os/os.h"
@@ -218,6 +220,25 @@ void hub_settings() {
   check_cache("cache/xdg/huggingface/hub", "XDG_CACHE_HOME");
   set_env("XDG_CACHE_HOME", "");
   check_cache(flyx::os::home_dir() + "/.cache/huggingface/hub", "default");
+
+  // HF_TOKEN is only sent over HTTPS to the default Hub or an explicit HF_ENDPOINT override, never to http:// or a runtime mirror.
+  set_env("HF_TOKEN", "hf_secret_unit_token");
+  const auto has_bearer = [](const std::vector<std::string>& hdrs) {
+    for (const auto& h : hdrs)
+      if (h == "Authorization: Bearer hf_secret_unit_token") return true;
+    return false;
+  };
+  check(has_bearer(detail::auth_headers({kDefaultEndpoint, "default"})),
+        "auth_headers attaches Bearer token for default HTTPS Hub");
+  check(has_bearer(detail::auth_headers({"https://env.mirror.test", "HF_ENDPOINT"})),
+        "auth_headers attaches Bearer token for HTTPS HF_ENDPOINT");
+  check(detail::auth_headers({"http://127.0.0.1:8080", "HF_ENDPOINT"}).empty(),
+        "auth_headers omits Bearer token for plaintext http:// HF_ENDPOINT");
+  check(detail::auth_headers({"https://evil.mirror.test", "setting"}).empty(),
+        "auth_headers omits Bearer token for runtime setting mirror");
+  check(has_bearer(detail::auth_headers({kDefaultEndpoint, "setting"})),
+        "auth_headers attaches Bearer token if runtime setting equals default HTTPS Hub");
+  set_env("HF_TOKEN", "");
 }
 
 flyx::hub::RepoFile file(const std::string& path, uint64_t size, const std::string& sha256 = "ab") {
@@ -531,6 +552,442 @@ void cached_drafter_kinds(const fs::path& tmp) {
         "a DFlashDraftModel: DFlash");
 }
 
+void cached_allow_path_guard() {
+  auto norm = [](const fs::path& p) {
+    std::string s = from_path(p);
+    std::replace(s.begin(), s.end(), '\\', '/');
+    return s;
+  };
+  std::vector<std::string> touched_blocked;
+  auto record_if_blocked = [&](const fs::path& p, const char* op) {
+    const std::string s = norm(p);
+    if (s.find("blocked") != std::string::npos || s.find("evil") != std::string::npos)
+      touched_blocked.push_back(std::string(op) + ":" + s);
+  };
+  const std::string root = "/hf_cache";
+  const std::string commit_ok = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const std::string commit_blocked = "blocked000000000000000000000000000000000";
+  const std::string repo_ok = root + "/models--acme--good";
+  const std::string snaps_ok = repo_ok + "/snapshots";
+  const std::string snap_ok = snaps_ok + "/" + commit_ok;
+
+  flyx::hub::CacheFs fake_fs;
+  fake_fs.root_override = root;
+  fake_fs.is_directory = [&](const fs::path& p, std::error_code&) {
+    record_if_blocked(p, "is_directory");
+    const std::string s = norm(p);
+    return s == root || s == repo_ok || s == snaps_ok || s == snap_ok || s == snap_ok + "/sub";
+  };
+  fake_fs.is_regular_file = [&](const fs::path& p, std::error_code&) {
+    record_if_blocked(p, "is_regular_file");
+    const std::string s = norm(p);
+    return s == snap_ok + "/good-Q4_K_M.gguf" || s == snap_ok + "/sub/extra.gguf";
+  };
+  fake_fs.file_size = [&](const fs::path& p, std::error_code&) -> uint64_t {
+    record_if_blocked(p, "file_size");
+    return 4096;
+  };
+  fake_fs.last_write_time = [&](const fs::path& p, std::error_code&) {
+    record_if_blocked(p, "last_write_time");
+    return fs::file_time_type::clock::now();
+  };
+  fake_fs.for_each_dir_entry = [&](const fs::path& p, const std::function<bool(const fs::path&)>& visit,
+                                   std::error_code&) {
+    record_if_blocked(p, "for_each_dir_entry");
+    const std::string s = norm(p);
+    std::vector<fs::path> entries;
+    if (s == root) {
+      entries = {p / "models--acme--blocked", p / "models--acme--good"};
+    } else if (s == snaps_ok) {
+      entries = {p / commit_blocked, p / commit_ok};
+    } else if (s == snap_ok) {
+      entries = {p / "evil_link.gguf", p / "evil_dir", p / "good-Q4_K_M.gguf", p / "sub"};
+    } else if (s == snap_ok + "/sub") {
+      entries = {p / "extra.gguf"};
+    }
+    for (const auto& e : entries)
+      if (!visit(e)) break;
+  };
+  fake_fs.read_text = [&](const fs::path& p) -> std::string {
+    record_if_blocked(p, "read_text");
+    const std::string s = norm(p);
+    if (s == repo_ok + "/refs/main") return commit_ok;
+    if (s == snap_ok + "/config.json") return R"({"architectures":["DFlash2DraftModel"]})";
+    return {};
+  };
+
+  auto allow = [](std::string_view p) {
+    return p.find("blocked") == std::string_view::npos && p.find("evil") == std::string_view::npos;
+  };
+  const auto snaps = flyx::hub::cached(allow, &fake_fs);
+  check(touched_blocked.empty(),
+        "hub::cached never invokes target-following fs ops on blocked repos/commits/entries (touched=" +
+            std::to_string(touched_blocked.size()) + ")");
+  check(snaps.size() == 1 && snaps[0].repo == "acme/good" && snaps[0].commit == commit_ok && snaps[0].current &&
+            snaps[0].files.size() == 2 && snaps[0].architectures == std::vector<std::string>{"DFlash2DraftModel"},
+        "hub::cached still enumerates allowed snapshot files and config.json when blocked entries are skipped");
+  // Also verify blocked refs/main and config.json are never read.
+  touched_blocked.clear();
+  std::vector<std::string> reads;
+  fake_fs.read_text = [&](const fs::path& p) -> std::string {
+    reads.push_back(norm(p));
+    return {};
+  };
+  auto deny_meta = [&](std::string_view p) {
+    std::string s(p);
+    std::replace(s.begin(), s.end(), '\\', '/');
+    return allow(p) && s.find("refs/main") == std::string::npos && s.find("config.json") == std::string::npos;
+  };
+  const auto snaps2 = flyx::hub::cached(deny_meta, &fake_fs);
+  check(reads.empty() && snaps2.size() == 1 && !snaps2[0].current && snaps2[0].architectures.empty(),
+        "hub::cached skips reading refs/main and config.json when blocked by allow_path");
+
+  // Item 3 (deterministic CacheFs): directory symlinks are never descended into, while file symlinks to blobs still work.
+  std::vector<std::string> descended_links;
+  flyx::hub::CacheFs sym_fs = fake_fs;
+  sym_fs.is_symlink = [&](const fs::path& p, std::error_code&) {
+    const std::string s = norm(p);
+    return s == snap_ok + "/dir_link" || s == snap_ok + "/good-Q4_K_M.gguf";
+  };
+  sym_fs.is_directory = [&](const fs::path& p, std::error_code&) {
+    const std::string s = norm(p);
+    return s == root || s == repo_ok || s == snaps_ok || s == snap_ok || s == snap_ok + "/dir_link";
+  };
+  sym_fs.is_regular_file = [&](const fs::path& p, std::error_code&) {
+    const std::string s = norm(p);
+    return s == snap_ok + "/good-Q4_K_M.gguf";
+  };
+  sym_fs.for_each_dir_entry = [&](const fs::path& p, const std::function<bool(const fs::path&)>& visit,
+                                  std::error_code&) {
+    const std::string s = norm(p);
+    if (s == snap_ok + "/dir_link") {
+      descended_links.push_back(s);
+      visit(p / "leaked.gguf");
+      return;
+    }
+    std::vector<fs::path> entries;
+    if (s == root) entries = {p / "models--acme--good"};
+    else if (s == snaps_ok) entries = {p / commit_ok};
+    else if (s == snap_ok) entries = {p / "dir_link", p / "good-Q4_K_M.gguf"};
+    for (const auto& e : entries)
+      if (!visit(e)) break;
+  };
+  const auto sym_snaps = flyx::hub::cached({}, &sym_fs);
+  check(descended_links.empty() && sym_snaps.size() == 1 && sym_snaps[0].files.size() == 1 &&
+            sym_snaps[0].files[0].path == "good-Q4_K_M.gguf",
+        "hub::cached never descends into directory symlinks while preserving file symlinks to blobs");
+
+  // Linked repo, snapshots, and commit roots are rejected in both hub::cached and detail::from_cache.
+  for (const auto& [label, linked_root] : std::vector<std::pair<std::string, std::string>>{
+           {"repo", repo_ok}, {"snapshots", snaps_ok}, {"commit", snap_ok}}) {
+    std::vector<std::string> enumerated_under;
+    flyx::hub::CacheFs root_link_fs = sym_fs;
+    root_link_fs.is_symlink = [&](const fs::path& p, std::error_code&) {
+      const std::string s = norm(p);
+      return s == linked_root || s == snap_ok + "/good-Q4_K_M.gguf";
+    };
+    root_link_fs.for_each_dir_entry = [&](const fs::path& p, const std::function<bool(const fs::path&)>& visit,
+                                          std::error_code&) {
+      const std::string s = norm(p);
+      if (s == linked_root || s == snap_ok) enumerated_under.push_back(s);
+      std::vector<fs::path> entries;
+      if (s == root) entries = {p / "models--acme--good"};
+      else if (s == snaps_ok) entries = {p / commit_ok};
+      else if (s == snap_ok) entries = {p / "good-Q4_K_M.gguf"};
+      for (const auto& e : entries)
+        if (!visit(e)) break;
+    };
+    const auto listed = flyx::hub::cached({}, &root_link_fs);
+    flyx::hub::Repo resolved;
+    const bool got_main = flyx::hub::detail::from_cache("acme/good", "main", &resolved, {}, &root_link_fs);
+    const bool got_commit = flyx::hub::detail::from_cache("acme/good", commit_ok, &resolved, {}, &root_link_fs);
+    check(listed.empty() && !got_main && !got_commit && enumerated_under.empty(),
+          "linked " + label + " root directory is rejected before enumerating snapshot entries");
+  }
+}
+
+void secondary_cache_policy_and_traversal(const fs::path& tmp) {
+  auto norm = [](std::string_view p) {
+    std::string s(p);
+    std::replace(s.begin(), s.end(), '\\', '/');
+    return s;
+  };
+  const std::string commit_a = "1111111111111111111111111111111111111111";
+  const std::string commit_b = "2222222222222222222222222222222222222222";
+  // Item 2a: hub::describe offline fallback and hub::in_cache enforce allow_path.
+  {
+    const fs::path cache = tmp / "offline_policy";
+    const fs::path repo = cache / "models--acme--policy-GGUF";
+    put(repo, commit_a, "ok-Q4_K_M.gguf", "aaaa");
+    put(repo, commit_a, "evil-Q8_0.gguf", "bbbb");
+    fs::create_directories(repo / "refs");
+    std::ofstream(repo / "refs" / "main", std::ios::binary) << commit_a;
+    set_env("HF_HUB_CACHE", from_path(cache));
+    set_env("HF_HUB_OFFLINE", "1");
+    auto deny_evil = [&](std::string_view p) { return norm(p).find("evil") == std::string::npos; };
+    auto deny_all = [](std::string_view) { return false; };
+    flyx::hub::Repo r;
+    std::string err;
+    check(flyx::hub::describe("acme/policy-GGUF", "main", &r, &err, nullptr, deny_evil) && r.from_cache &&
+              r.files.size() == 1 && r.files[0].path == "ok-Q4_K_M.gguf",
+          "describe offline fallback filters denied snapshot entries via allow_path: " + err);
+    r = {};
+    check(!flyx::hub::describe("acme/policy-GGUF", "main", &r, &err, nullptr, deny_all),
+          "describe offline fallback fails when allow_path denies cached repo");
+    check(!flyx::hub::in_cache("acme/policy-GGUF", "main", &r, deny_all),
+          "in_cache fails when allow_path denies cached repo");
+    set_env("HF_HUB_OFFLINE", "");
+  }
+  // Item 2b: hub::fetch rejects derived cache paths before creating dirs or placing files.
+  {
+    const fs::path denied_cache = tmp / "denied_fetch_cache";
+    set_env("HF_HUB_CACHE", from_path(denied_cache));
+    flyx::hub::Repo r;
+    r.id = "acme/fetch-denied";
+    r.commit = commit_a;
+    r.revision = "main";
+    const auto f = file("m-Q4_K_M.gguf", 16, std::string(64, 'a'));
+    std::vector<std::string> paths;
+    std::string err;
+    auto deny_file = [&](std::string_view p) { return norm(p).find("m-Q4_K_M.gguf") == std::string::npos; };
+    check(!flyx::hub::fetch(r, {f}, &paths, nullptr, nullptr, &err, deny_file) &&
+              err.find("remote path policy") != std::string::npos && paths.empty() && !fs::exists(denied_cache),
+          "hub::fetch rejects denied destination path before creating cache dirs: " + err);
+    err.clear();
+    auto deny_blob = [&](std::string_view p) { return norm(p).find("/blobs/") == std::string::npos; };
+    check(!flyx::hub::fetch(r, {f}, &paths, nullptr, nullptr, &err, deny_blob) &&
+              err.find("remote path policy") != std::string::npos && paths.empty() && !fs::exists(denied_cache),
+          "hub::fetch rejects denied blob path before creating cache dirs: " + err);
+    // Item 1 (PR #74 follow-up): deny ONLY the PartialBlob progress .map path and verify no filesystem I/O occurs.
+    err.clear();
+    bool saw_part_data = false, saw_part_map = false;
+    auto deny_only_map = [&](std::string_view p) {
+      const std::string s = norm(p);
+      if (s.ends_with(".flyx-part")) saw_part_data = true;
+      if (s.ends_with(".flyx-part.map")) {
+        saw_part_map = true;
+        return false;
+      }
+      return true;
+    };
+    check(!flyx::hub::fetch(r, {f}, &paths, nullptr, nullptr, &err, deny_only_map) && saw_part_data && saw_part_map &&
+              err.find("remote path policy") != std::string::npos && paths.empty() && !fs::exists(denied_cache),
+          "hub::fetch rejects denied PartialBlob .map path before any filesystem I/O: " + err);
+  }
+  // Item 2c: hub::remove_cached retains a shared/unverified blob when allow_path denies another snapshot entry,
+  // and refuses to delete a denied target entry.
+  {
+    const fs::path cache = tmp / "remove_policy";
+    const fs::path repo = cache / "models--acme--shared-GGUF";
+    const std::string payload = "shared-model-bytes";
+    const std::string blob_id = sha(payload, true);
+    const fs::path blob = repo / "blobs" / blob_id;
+    const fs::path snap_a = repo / "snapshots" / commit_a;
+    const fs::path snap_b = repo / "snapshots" / commit_b;
+    fs::create_directories(blob.parent_path());
+    fs::create_directories(snap_a);
+    fs::create_directories(snap_b);
+    std::ofstream(blob, std::ios::binary) << payload;
+    fs::create_hard_link(blob, snap_a / "model.gguf");
+    fs::create_hard_link(blob, snap_b / "model.gguf");
+    set_env("HF_HUB_CACHE", from_path(cache));
+    uint64_t freed = 0;
+    std::string err;
+    auto deny_b = [&](std::string_view p) { return norm(p).find(commit_b) == std::string::npos; };
+    check(!flyx::hub::remove_cached("acme/shared-GGUF", commit_b, {"model.gguf"}, &freed, &err, deny_b) &&
+              err.find("remote path policy") != std::string::npos && fs::exists(snap_b / "model.gguf"),
+          "remove_cached refuses to remove entry denied by allow_path: " + err);
+    err.clear();
+    check(flyx::hub::remove_cached("acme/shared-GGUF", commit_a, {"model.gguf"}, &freed, &err, deny_b) &&
+              !fs::exists(snap_a / "model.gguf") && fs::exists(blob) && fs::exists(snap_b / "model.gguf"),
+          "remove_cached safely retains blob when allow_path denies another snapshot during reference scan: " + err);
+  }
+  // Item 2 (PR #74 follow-up): remove_cached independently rejects linked repo/snapshots/commit/blobs roots (CacheFs).
+  {
+    const fs::path cache = tmp / "rm_linked_root";
+    const fs::path repo = cache / "models--acme--rmroot";
+    const fs::path snaps = repo / "snapshots";
+    const fs::path snap = snaps / commit_a;
+    const fs::path blobs = repo / "blobs";
+    const std::string payload = "do-not-delete-external";
+    const fs::path blob = blobs / sha(payload, true);
+    fs::create_directories(snap);
+    fs::create_directories(blobs);
+    std::ofstream(blob, std::ios::binary) << payload;
+    fs::create_hard_link(blob, snap / "victim.gguf");
+    for (const auto& [label, target] : std::vector<std::pair<std::string, fs::path>>{
+             {"repo", repo}, {"snapshots", snaps}, {"commit", snap}, {"blobs", blobs}}) {
+      flyx::hub::CacheFs linked_fs;
+      linked_fs.root_override = from_path(cache);
+      const std::string linked_norm = norm(from_path(target));
+      linked_fs.is_symlink = [&](const fs::path& p, std::error_code&) { return norm(from_path(p)) == linked_norm; };
+      uint64_t freed = 0;
+      std::string err;
+      check(!flyx::hub::remove_cached("acme/rmroot", commit_a, {"victim.gguf"}, &freed, &err, {}, &linked_fs) &&
+                fs::exists(snap / "victim.gguf") && fs::exists(blob),
+            "remove_cached rejects linked " + label + " root without deleting files: " + err);
+    }
+  }
+  // Item 3 (PR #74 follow-up): remove_cached fails closed (retains blob) on symlink canonicalization or equivalent errors.
+  {
+    const fs::path cache = tmp / "remove_id_err";
+    const std::string payload = "shared-identity-error-bytes";
+    const std::string blob_id = sha(payload, true);
+    // 3a: symlink canonicalization error in another snapshot.
+    {
+      const fs::path repo = cache / "models--acme--iderr-sym";
+      const fs::path blob = repo / "blobs" / blob_id;
+      const fs::path snap_a = repo / "snapshots" / commit_a;
+      const fs::path snap_b = repo / "snapshots" / commit_b;
+      fs::create_directories(blob.parent_path());
+      fs::create_directories(snap_a);
+      fs::create_directories(snap_b);
+      std::ofstream(blob, std::ios::binary) << payload;
+      fs::create_hard_link(blob, snap_a / "model.gguf");
+      std::error_code sym_ec;
+      fs::create_symlink(fs::path("../../blobs") / blob_id, snap_b / "model.gguf", sym_ec);
+      if (sym_ec) fs::create_hard_link(blob, snap_b / "model.gguf");
+      bool canon_err_hit = false;
+      const std::string other_entry = norm(from_path(snap_b / "model.gguf"));
+      flyx::hub::CacheFs canon_err_fs;
+      canon_err_fs.root_override = from_path(cache);
+      canon_err_fs.is_symlink = [&](const fs::path& p, std::error_code& ec) {
+        if (norm(from_path(p)) == other_entry) return true;
+        const auto st = fs::symlink_status(p, ec);
+        if (st.type() == fs::file_type::not_found) {
+          ec.clear();
+          return false;
+        }
+        return !ec && fs::is_symlink(st);
+      };
+      canon_err_fs.weakly_canonical = [&](const fs::path& p, std::error_code& ec) {
+        if (norm(from_path(p)) == other_entry) {
+          canon_err_hit = true;
+          ec = std::make_error_code(std::errc::permission_denied);
+          return fs::path{};
+        }
+        return fs::weakly_canonical(p, ec);
+      };
+      uint64_t freed = 0;
+      std::string err;
+      check(flyx::hub::remove_cached("acme/iderr-sym", commit_a, {"model.gguf"}, &freed, &err, {}, &canon_err_fs) &&
+                canon_err_hit && !fs::exists(snap_a / "model.gguf") && fs::exists(blob) &&
+                read_all(snap_b / "model.gguf") == payload,
+            "remove_cached retains blob when canonicalizing another snapshot symlink errors: " + err);
+    }
+    // 3b: regular-file identity (equivalent) error in another snapshot.
+    {
+      const fs::path repo = cache / "models--acme--iderr-eq";
+      const fs::path blob = repo / "blobs" / blob_id;
+      const fs::path snap_a = repo / "snapshots" / commit_a;
+      const fs::path snap_b = repo / "snapshots" / commit_b;
+      fs::create_directories(blob.parent_path());
+      fs::create_directories(snap_a);
+      fs::create_directories(snap_b);
+      std::ofstream(blob, std::ios::binary) << payload;
+      fs::create_hard_link(blob, snap_a / "model.gguf");
+      fs::create_hard_link(blob, snap_b / "model.gguf");
+      bool eq_err_hit = false;
+      const std::string other_entry = norm(from_path(snap_b / "model.gguf"));
+      flyx::hub::CacheFs eq_err_fs;
+      eq_err_fs.root_override = from_path(cache);
+      eq_err_fs.equivalent = [&](const fs::path& a, const fs::path& b, std::error_code& ec) {
+        if (norm(from_path(a)) == other_entry || norm(from_path(b)) == other_entry) {
+          eq_err_hit = true;
+          ec = std::make_error_code(std::errc::io_error);
+          return false;
+        }
+        return fs::equivalent(a, b, ec);
+      };
+      uint64_t freed = 0;
+      std::string err;
+      check(flyx::hub::remove_cached("acme/iderr-eq", commit_a, {"model.gguf"}, &freed, &err, {}, &eq_err_fs) &&
+                eq_err_hit && !fs::exists(snap_a / "model.gguf") && fs::exists(blob) &&
+                read_all(snap_b / "model.gguf") == payload,
+            "remove_cached retains blob when fs::equivalent errors on another snapshot entry: " + err);
+    }
+  }
+  // Item 3 (real filesystem, when OS permits directory symlinks): external directory symlinks, ancestor cycles,
+  // and linked repo/snapshots/commit roots are rejected in cached/in_cache/remove_cached.
+  {
+    const fs::path cache = tmp / "real_symlink";
+    const fs::path outside = tmp / "outside_dir";
+    const fs::path repo = cache / "models--acme--sym-GGUF";
+    const fs::path snap = repo / "snapshots" / commit_a;
+    fs::create_directories(outside);
+    std::ofstream(outside / "secret.gguf", std::ios::binary) << "secret";
+    put(repo, commit_a, "real-Q4_K_M.gguf", "ok");
+    fs::create_directories(repo / "refs");
+    std::ofstream(repo / "refs" / "main", std::ios::binary) << commit_a;
+    std::error_code sec1, sec2;
+    fs::create_directory_symlink(outside, snap / "ext_link", sec1);
+    fs::create_directory_symlink(snap, snap / "cycle_link", sec2);
+    if (!sec1 && !sec2) {
+      const fs::path ext_repo = tmp / "ext_repo_target";
+      put(ext_repo, commit_a, "leaked-repo.gguf", "x");
+      fs::create_directories(ext_repo / "refs");
+      std::ofstream(ext_repo / "refs" / "main", std::ios::binary) << commit_a;
+      std::error_code lsec;
+      fs::create_directory_symlink(ext_repo, cache / "models--acme--linked-repo", lsec);
+      const fs::path linked_snaps_repo = cache / "models--acme--linked-snaps";
+      fs::create_directories(linked_snaps_repo / "refs");
+      std::ofstream(linked_snaps_repo / "refs" / "main", std::ios::binary) << commit_a;
+      fs::create_directory_symlink(ext_repo / "snapshots", linked_snaps_repo / "snapshots", lsec);
+      const fs::path linked_commit_repo = cache / "models--acme--linked-commit";
+      fs::create_directories(linked_commit_repo / "snapshots");
+      fs::create_directories(linked_commit_repo / "refs");
+      std::ofstream(linked_commit_repo / "refs" / "main", std::ios::binary) << commit_a;
+      fs::create_directory_symlink(outside, linked_commit_repo / "snapshots" / commit_a, lsec);
+
+      set_env("HF_HUB_CACHE", from_path(cache));
+      const auto listed = flyx::hub::cached();
+      check(listed.size() == 1 && listed[0].repo == "acme/sym-GGUF" && listed[0].files.size() == 1 &&
+                listed[0].files[0].path == "real-Q4_K_M.gguf",
+            "hub::cached skips real directory symlinks, ancestor cycles, and linked repo/snapshots/commit roots");
+      flyx::hub::Repo r;
+      check(flyx::hub::in_cache("acme/sym-GGUF", "main", &r) && r.files.size() == 1 &&
+                r.files[0].path == "real-Q4_K_M.gguf",
+            "hub::in_cache skips real directory symlinks and ancestor cycles on disk");
+      check(!flyx::hub::in_cache("acme/linked-repo", "main", &r) &&
+                !flyx::hub::in_cache("acme/linked-snaps", "main", &r) &&
+                !flyx::hub::in_cache("acme/linked-commit", "main", &r) &&
+                !flyx::hub::in_cache("acme/linked-commit", commit_a, &r),
+            "hub::in_cache rejects real linked repo, snapshots, and commit root directories");
+      uint64_t freed = 0;
+      std::string err;
+      check(!flyx::hub::remove_cached("acme/linked-commit", commit_a, {"secret.gguf"}, &freed, &err) &&
+                fs::exists(outside / "secret.gguf"),
+            "hub::remove_cached refuses to delete external file through a real linked commit root: " + err);
+    }
+  }
+  // Item 4: authoritative offline hub::in_cache and hub::describe return complete inventory > 16 dirs deep.
+  {
+    const fs::path cache = tmp / "d";
+    const fs::path repo = cache / "models--a--b";
+    std::string deep_rel;
+    for (int i = 0; i < 18; ++i) deep_rel += "a/";
+    deep_rel += "n-Q8_0.gguf";
+    put(repo, commit_a, "root-Q4_K_M.gguf", "root");
+    put(repo, commit_a, deep_rel, "deep");
+    fs::create_directories(repo / "refs");
+    std::ofstream(repo / "refs" / "main", std::ios::binary) << commit_a;
+    set_env("HF_HUB_CACHE", from_path(cache));
+    set_env("HF_HUB_OFFLINE", "1");
+    flyx::hub::Repo r;
+    std::string err;
+    check(flyx::hub::describe("a/b", "main", &r, &err) && r.from_cache && r.files.size() == 2 &&
+              r.files[0].path == deep_rel && r.files[1].path == "root-Q4_K_M.gguf",
+          "offline hub::describe returns complete inventory nested > 16 directories deep: " + err);
+    flyx::hub::Repo r2;
+    check(flyx::hub::in_cache("a/b", "main", &r2) && r2.files.size() == 2,
+          "hub::in_cache returns complete inventory nested > 16 directories deep");
+    const auto bounded = flyx::hub::cached();
+    check(bounded.size() == 1 && bounded[0].files.size() == 1 && bounded[0].files[0].path == "root-Q4_K_M.gguf",
+          "interactive hub::cached keeps depth bound while offline describe/in_cache stays authoritative");
+    set_env("HF_HUB_OFFLINE", "");
+  }
+}
+
 // ---- a fake Hub ------------------------------------------------------------------------------------------------
 struct FakeHub {
   const std::string commit = "0123456789abcdef0123456789abcdef01234567";
@@ -543,6 +1000,7 @@ struct FakeHub {
   std::atomic<bool> corrupt{false};    // one byte of the second piece flipped
   std::atomic<int> sig{0};             // the signature the last redirect carried
   std::atomic<bool> expire_first{false};  // signature 1 stops working after the first request
+  std::atomic<bool> saw_auth{false};      // whether any request carried an Authorization header
 
   FakeHub() {
     std::mt19937 rng(11);
@@ -551,7 +1009,8 @@ struct FakeHub {
     files["tiny-Q4_K_M.gguf"] = big;
     files["MTP/mtp-tiny-Q4_0.gguf"] = std::string(1000, 'm');
     files["config.json"] = "{}";
-    http.Get("/api/models/acme/tiny-GGUF/revision/main", [this](const httplib::Request&, httplib::Response& res) {
+    http.Get("/api/models/acme/tiny-GGUF/revision/main", [this](const httplib::Request& q, httplib::Response& res) {
+      if (q.has_header("Authorization")) saw_auth = true;
       nlohmann::json sib = nlohmann::json::array();
       for (const auto& [path, content] : files) {
         nlohmann::json f = {{"rfilename", path}, {"size", content.size()}, {"blobId", "00112233445566778899aabbccddeeff00112233"}};
@@ -576,7 +1035,13 @@ struct FakeHub {
                       "application/json");
     });
     http.Get(R"(/api/models/acme/none/revision/main)", [](const httplib::Request&, httplib::Response& res) { res.status = 404; });
+    http.Get(R"(/api/models/acme/gated/revision/main)", [](const httplib::Request&, httplib::Response& res) { res.status = 403; });
+    http.Get(R"(/api/models/acme/throttled/revision/main)", [](const httplib::Request&, httplib::Response& res) {
+      res.status = 429;
+      res.set_header("Retry-After", "42");
+    });
     http.Get("/api/models", [this](const httplib::Request& q, httplib::Response& res) {
+      if (q.has_header("Authorization")) saw_auth = true;
       const std::string cursor = q.get_param_value("cursor");
       if (cursor.empty()) {
         res.set_header("Link", "<http://127.0.0.1:" + std::to_string(port) +
@@ -795,6 +1260,57 @@ void fetching(const fs::path& tmp) {
               err.find("free") != std::string::npos && hub.storage == before,
           "has_room saturates uint64_t sum instead of wrapping around: " + err);
   }
+  {
+    // Live fetch/search with HF_TOKEN set must never leak Authorization to plaintext http:// or runtime setting mirror.
+    hub.saw_auth = false;
+    set_env("HF_TOKEN", "hf_must_not_leak");
+    std::vector<flyx::hub::Found> found;
+    std::string next;
+    check(flyx::hub::search("", "trending", 10, &found, &err, "", &next) && !hub.saw_auth,
+          "search does not leak HF_TOKEN to plaintext http:// HF_ENDPOINT");
+    std::string ep_err;
+    check(flyx::hub::set_endpoint("http://127.0.0.1:" + std::to_string(hub.port), &ep_err),
+          "set_endpoint to local FakeHub");
+    flyx::hub::Repo described;
+    check(flyx::hub::describe("acme/tiny-GGUF", "main", &described, &err) && !hub.saw_auth,
+          "describe does not leak HF_TOKEN to runtime setting mirror");
+    flyx::hub::set_endpoint("", &ep_err);
+    set_env("HF_TOKEN", "");
+  }
+  {
+    // Typed HubOutcome error classification (400/403/404/429 + Retry-After) without brittle string parsing.
+    flyx::hub::Repo out_repo;
+    flyx::hub::HubOutcome out;
+    check(!flyx::hub::describe("acme/none", "main", &out_repo, &err, &out) && out.error == flyx::hub::HubError::kNotFound,
+          "describe classifies 404 as kNotFound");
+    out = {};
+    check(!flyx::hub::describe("acme/gated", "main", &out_repo, &err, &out) &&
+              out.error == flyx::hub::HubError::kUnauthorized,
+          "describe classifies 403 as kUnauthorized");
+    out = {};
+    check(!flyx::hub::describe("acme/throttled", "main", &out_repo, &err, &out) &&
+              out.error == flyx::hub::HubError::kRateLimited && out.retry_after == "42",
+          "describe classifies 429 as kRateLimited and preserves Retry-After: " + out.retry_after);
+    out = {};
+    check(!flyx::hub::describe("acme/tiny-GGUF", "../../bad", &out_repo, &err, &out) &&
+              out.error == flyx::hub::HubError::kInvalidName,
+          "describe classifies invalid revision as kInvalidName");
+    // RFC 9110 Retry-After sanitizer: delay-seconds (0, >86400) and HTTP-date preserved; injection/garbage dropped.
+    check(flyx::hub::sanitize_retry_after("0") == "0", "sanitize_retry_after preserves 0");
+    check(flyx::hub::sanitize_retry_after("  172800 ") == "172800",
+          "sanitize_retry_after preserves delay-seconds > 86400 without truncation");
+    check(flyx::hub::sanitize_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") == "Wed, 21 Oct 2015 07:28:00 GMT",
+          "sanitize_retry_after preserves IMF-fixdate");
+    check(flyx::hub::sanitize_retry_after("Sunday, 06-Nov-94 08:49:37 GMT") == "Sunday, 06-Nov-94 08:49:37 GMT",
+          "sanitize_retry_after preserves obsolete rfc850-date");
+    check(flyx::hub::sanitize_retry_after("Sun Nov  6 08:49:37 1994") == "Sun Nov  6 08:49:37 1994",
+          "sanitize_retry_after preserves asctime-date");
+    check(flyx::hub::sanitize_retry_after("-5").empty() &&
+              flyx::hub::sanitize_retry_after("42\r\nX-Evil: 1").empty() &&
+              flyx::hub::sanitize_retry_after("not-a-date").empty() &&
+              flyx::hub::sanitize_retry_after("999999999999999999999").empty(),
+          "sanitize_retry_after drops negative, CRLF-injected, malformed, and oversized values");
+  }
 }
 
 }  // namespace
@@ -835,6 +1351,8 @@ int main(int argc, char** argv) {
   const TestDirectory tmp;
   cache_snapshots(tmp.path / "snapshots");
   cached_drafter_kinds(tmp.path / "kinds");
+  cached_allow_path_guard();
+  secondary_cache_policy_and_traversal(tmp.path / "p");
 #if !defined(_WIN32)
   void* curl = dlopen("libcurl.so.4", RTLD_NOW);
   if (!curl) curl = dlopen("libcurl.4.dylib", RTLD_NOW);

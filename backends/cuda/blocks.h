@@ -527,6 +527,7 @@ struct KvBuf {
     if (ks_host) r.ks_far = ks_host, r.vs_far = vs_host, r.scale_split = device_positions;
     r.hot_scale = hot_scale;
     if (pageable) r.page_ctx = page_ctx, r.ring_safe = page_safe, r.ring_pad = page_ring_base - device_positions;
+    r.host_writes = vk != nullptr || (kq_host != nullptr && kq == kq_host);
     return r;
   }
   // What an attention reads: the caches, or after stage() their views.

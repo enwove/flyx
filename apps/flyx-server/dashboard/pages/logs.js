@@ -47,7 +47,8 @@ export function Logs({ active }) {
     busy.current = true;
     try {
       const r = await fetch("/v1/logs?after=" + next.current + "&limit=2000", { headers: headers(), cache: "no-store" });
-      if (r.status === 403) return setNote("The log is for this machine, or with the server's API key.");
+      if (r.status === 401 || r.status === 403)
+        return setNote("The log is for this machine, with --api-key, or with --no-auth on a trusted LAN.");
       if (r.status === 404) return setNote("This server keeps no system log.");
       if (!r.ok) return;
       const j = await r.json();

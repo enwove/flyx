@@ -9,8 +9,10 @@
 
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace flyx::hub {
@@ -51,11 +53,34 @@ struct Repo {
   bool from_cache = false;               // the Hub was not asked (offline) or not reached
 };
 
+// Structured failure category from a Hub API query so callers map HTTP statuses without matching prose.
+enum class HubError {
+  kNone,
+  kInvalidName,
+  kNotFound,
+  kUnauthorized,
+  kRateLimited,
+  kUnreachable,
+  kBadAnswer,
+};
+
+struct HubOutcome {
+  HubError error = HubError::kNone;
+  std::string retry_after;  // validated RFC 9110 Retry-After value (delay-seconds or HTTP-date; empty if absent/invalid)
+};
+
+// Validates an RFC 9110 Retry-After header value (non-negative delay-seconds or HTTP-date); returns "" if invalid.
+std::string sanitize_retry_after(std::string_view raw);
+
+// Authorization predicate evaluated BEFORE any target-following stat, open, or descent (true if allowed).
+using PathAllowFn = std::function<bool(std::string_view)>;
+
 // A repository's files at a revision, from the Hub; from the cache when offline, or when the Hub cannot be reached
 // or no longer shows the repository and the cache has the revision.
-bool describe(const std::string& repo, const std::string& revision, Repo* out, std::string* err);
+bool describe(const std::string& repo, const std::string& revision, Repo* out, std::string* err,
+              HubOutcome* outcome = nullptr, const PathAllowFn& allow_path = {});
 // The cache's snapshot of a revision (a branch its refs/ names, or a commit), without the Hub.
-bool in_cache(const std::string& repo, const std::string& revision, Repo* out);
+bool in_cache(const std::string& repo, const std::string& revision, Repo* out, const PathAllowFn& allow_path = {});
 
 // A repository as the Hub lists it in a search.
 struct Found {
@@ -72,7 +97,8 @@ struct Found {
 // `cursor` resumes from a previous call's *next_cursor (from the Hub's Link rel="next" header).  Only the Hub knows:
 // false, with *err saying why, offline or when it cannot be reached.
 bool search(const std::string& query, const std::string& sort, int limit, std::vector<Found>* out, std::string* err,
-            const std::string& cursor = "", std::string* next_cursor = nullptr, bool gguf_only = true);
+            const std::string& cursor = "", std::string* next_cursor = nullptr, bool gguf_only = true,
+            HubOutcome* outcome = nullptr);
 
 // A LoRA adapter as Hugging Face PEFT saves it, in a repository: a folder with an adapter_config.json ("" the top,
 // else its path, "a/b"), that file, and its adapter_model.safetensors (null: none beside it; `pickle`: an
@@ -93,7 +119,8 @@ bool parse_adapter_name(const std::string& s, Name* out);
 // filter=base_model:adapter:BASE), the most downloaded first, at most `limit`; `cursor` as search's.  false, with *err,
 // offline or when the Hub cannot be reached.
 bool adapters_of(const std::string& base, int limit, std::vector<Found>* out, std::string* err,
-                 const std::string& cursor = "", std::string* next_cursor = nullptr);
+                 const std::string& cursor = "", std::string* next_cursor = nullptr,
+                 HubOutcome* outcome = nullptr);
 
 // The GGUF files of a repository a model can be read from, each with the quantization its name carries ("UD-IQ3_XXS"
 // for Qwen3.8-27B-UD-IQ3_XXS.gguf).  Left out: projectors, importance matrices, files under MTP/; split models are
@@ -168,13 +195,16 @@ using ProgressFn = std::function<void(const Progress&)>;
 // The files on disk, in the cache's snapshot of r.commit, fetched when missing (all of them: `paths` in the same
 // order).  `stop`, when set, ends a fetch early; what came stays for the next try.  progress: about four times a second.
 bool fetch(const Repo& r, const std::vector<RepoFile>& files, std::vector<std::string>* paths,
-           const ProgressFn& progress, const std::atomic<bool>* stop, std::string* err);
+           const ProgressFn& progress, const std::atomic<bool>* stop, std::string* err,
+           const PathAllowFn& allow_path = {});
 // A safetensors file's header (its JSON) at r.commit without the file: two ranged requests (its length, then the
 // header, at most 16 MiB); from the cache when the file is there.  false, with *err, when neither has it.
-bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, std::string* err);
+bool safetensors_header(const Repo& r, const RepoFile& f, std::string* header, std::string* err,
+                        const PathAllowFn& allow_path = {});
 // A small file's text at r.commit, from the cache when it is there, else from the Hub into memory alone (the cache is
 // left as it was).  false, with *err, for a file of more than `max` bytes or one neither has.
-bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text, std::string* err);
+bool read_text(const Repo& r, const RepoFile& f, uint64_t max, std::string* text, std::string* err,
+               const PathAllowFn& allow_path = {});
 // Where r.commit's files are (or will be): <cache>/models--org--name/snapshots/<commit>.
 std::string snapshot_dir(const Repo& r);
 
@@ -187,13 +217,29 @@ struct Cached {
   std::vector<RepoFile> files;  // sizes only
   std::vector<std::string> architectures;  // its config.json's, when it has one
 };
-std::vector<Cached> cached();
+// Injectable filesystem operations for deterministic tests verifying cache policy, link handling, and identity errors.
+struct CacheFs {
+  std::function<bool(const std::filesystem::path&, std::error_code&)> is_symlink;
+  std::function<bool(const std::filesystem::path&, std::error_code&)> is_directory;
+  std::function<bool(const std::filesystem::path&, std::error_code&)> is_regular_file;
+  std::function<uint64_t(const std::filesystem::path&, std::error_code&)> file_size;
+  std::function<std::filesystem::file_time_type(const std::filesystem::path&, std::error_code&)> last_write_time;
+  std::function<void(const std::filesystem::path&, const std::function<bool(const std::filesystem::path&)>&,
+                     std::error_code&)>
+      for_each_dir_entry;
+  std::function<std::string(const std::filesystem::path&)> read_text;
+  std::function<std::filesystem::path(const std::filesystem::path&, std::error_code&)> weakly_canonical;
+  std::function<bool(const std::filesystem::path&, const std::filesystem::path&, std::error_code&)> equivalent;
+  std::string root_override;  // optional cache directory override for deterministic tests
+};
+std::vector<Cached> cached(const PathAllowFn& allow_path = {}, const CacheFs* fs_ops = nullptr);
 
 // Deletes files of a snapshot (paths in the repository): the snapshot's entries, and the blobs behind them that no
 // other entry of the repository's snapshots still refers to, by a link, a hard link or as the blob a copy was made
 // of.  Nothing outside the repository's directory in the cache is touched.  *freed: the bytes given back.
 bool remove_cached(const std::string& repo, const std::string& commit, const std::vector<std::string>& paths,
-                   uint64_t* freed, std::string* err);
+                   uint64_t* freed, std::string* err, const PathAllowFn& allow_path = {},
+                   const CacheFs* fs_ops = nullptr);
 
 struct ResolvedSetting {
   std::string value, source;

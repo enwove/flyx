@@ -314,19 +314,24 @@ constexpr size_t kGraphParamBytes = 1024, kGraphParamCost = 3;
 constexpr size_t kGraphSetBytes = 1 << 10, kGraphOtherBytes = 16 << 10;
 constexpr size_t kGraphBytes = 128 << 10, kGraphForkBytes = 128 << 10, kGraphForkMoreBytes = 6 << 10;
 // A kernel node's and a device-to-device copy node's are the driver's for the GPU's architecture, three times apart
-// between the two measured (`cuda_bench graphs`, KiB a node in chains of 100, 400 and 1000 kernels; of 100 copies):
+// between sm_8x and every architecture from sm_90 (`cuda_bench graphs`, KiB a node in chains of 100, 400 and 1000
+// kernels; of 100 copies):
 //   sm_120  RTX 5060 Ti and RTX 5070 Ti, driver 610.88, Windows:  3.5, 3.3, 2.7;  5.8 a copy
+//   sm_120  RTX PRO 6000 Server, driver 620.70, Linux:            3.5, 3.3, 2.7;  5.8 a copy
+//   sm_100  B200; sm_103 B300, driver 620.70, Linux:              3.5, 3.3, 2.7;  5.8 a copy
+//   sm_90   H100 SXM and H200, driver 620.70, Linux:              3.2, 3.3, 2.7;  5.8 a copy
+//   sm_89   L4 and L40S; sm_86 A10; sm_80 A100, driver 620.70:    9.0, 10.7, 8.5;  21.8 a copy
 //   sm_86   RTX 3090, driver 615.71, Linux:                       9.0, 10.7, 8.5 (11.0 in chains of 200, and the
 //           same with 4 KB of parameters);  21.8 a copy
-// The other kinds and the graph's own are the same on both.  Priced at sm_120's, an RTX 3090's and an RTX 4090's
+// The other kinds and the graph's own are the same on all.  Priced at sm_120's, an RTX 3090's and an RTX 4090's
 // (sm_89) sessions took more of the device than the rooms they leased (the memory tests: 340 MiB in rooms of 225);
-// an RTX 5080's and an RTX 5090's on Linux did not.  So sm_120 has its prices and every other architecture, measured
-// or not, the larger ones: a room too large costs sessions, one too small is memory the plan does not know of.
+// priced at sm_8x's, an H100's, H200's, B200's and B300's rooms were four times what their graphs took (the memory
+// tests: 451 MiB counted, 104 taken).  So sm_90 and newer have the smaller prices and sm_8x the larger ones.
 struct GraphPrices {
   size_t kernel = 0, copy = 0;
 };
 constexpr GraphPrices graph_prices(int cc) {  // cc: the device's compute capability, major * 10 + minor
-  return cc / 10 == 12 ? GraphPrices{3584, 7 << 10} : GraphPrices{11776, 22 << 10};
+  return cc >= 90 ? GraphPrices{3584, 7 << 10} : GraphPrices{11776, 22 << 10};
 }
 // A graph's nodes by kind (a conditional node's bodies' among them), its largest kernel parameters, and what it takes
 // at most (graph_size).
@@ -479,6 +484,8 @@ void* device_alias(size_t bytes, DevicePieces* out);
 // granularity is larger or there is no VMM (one allocation instead).
 bool vmm_supported();
 size_t pieces_floor();
+// Minimum VRAM reserve floor the backend requires for its device allocations (Windows WDDM: pieces_floor(); 0 elsewhere).
+uint64_t device_reserve_floor();
 
 }  // namespace flyx::cuda
 
@@ -1239,6 +1246,7 @@ void make_draft_weights(flyx_bmodel* m);
 void make_head_fp8(flyx_bmodel* m);
 void make_head_w12(flyx_bmodel* m);
 uint64_t trim(flyx_bmodel* m, uint64_t bytes);  // the ABI's trim: speed-only copies of the head
+uint64_t head_speed_bytes(const flyx_bmodel* m);  // flyx_memory_info::speed: what trim() gives back first
 
 // regions/linear.cpp (gemm and gemm_presplit above)
 void draft_logits(const HeadBlock& h, const float* x, int ldx, float* y, int rows, const Launch& L);

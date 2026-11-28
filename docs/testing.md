@@ -114,10 +114,11 @@ before the GPU tests start: tests beside another program's memory fail for its r
 enough VRAM ... used by other apps"; a `cuda_device_memory*` test reading the other program's allocations as its own).
 `FLYX_TEST_GPU_MAX_USED_MIB` in the environment changes the limit (`FLYX_TEST_GPU_MAX_USED_MIB=4096 ctest --preset
 gpu`; in PowerShell `$env:FLYX_TEST_GPU_MAX_USED_MIB = 4096` first). The GPU checked is the first of
-`CUDA_VISIBLE_DEVICES`, else `nvidia-smi`'s GPU 0. Without `nvidia-smi` on `PATH` (or a GPU it can read) it is skipped
-and the GPU tests run. When it fails, the CPU tests still run, every GPU test is Not Run, and the output says who holds
-the GPU (`nvidia-smi`'s processes; on Windows, where `nvidia-smi` gives no process's memory, Windows' GPU Process Memory
-counter):
+`CUDA_VISIBLE_DEVICES`, else `nvidia-smi`'s GPU 0. It fails too on a GPU of compute capability below 8.0 (a T4, a V100),
+which no kernel of the CUDA backend runs on, naming it once instead of every GPU test aborting. Without `nvidia-smi` on
+`PATH` (or a GPU it can read) it is skipped and the GPU tests run. When it fails, the CPU tests still run, every GPU
+test is Not Run, and the output says who holds the GPU (`nvidia-smi`'s processes; on Windows, where `nvidia-smi` gives
+no process's memory, Windows' GPU Process Memory counter):
 
 ```text
  4/93 Test  #93: gpu_preflight ....................***Failed    1.34 sec
@@ -159,12 +160,13 @@ The following tests FAILED:
 | `model_source` | Target/companion classification and discovery, including the Markov header and adjacent DSpark files. |
 | `draft_ring`, `window_ring`, `gguf_cuda_unfused`, `gguf_cuda_pdl` | Window wrap, refused restores after overwrites and DFlash2 execution with packed GGUF weights; the rings checkpoints copy (sliding-window layers', the MTP layer's): their slots and rewind floor, and the MTP ring's checkpoints restored and saved after it went round with a fresh prefill's drafts. |
 | `elastic_load`, `elastic_load_cuda`, `cuda_loader` | VRAM-constrained load policy, protected target arithmetic and CUDA loader estimates, storage and precision. |
+| `speed_copies` | The K/V of the context asked for before the copies the backend keeps only for speed: given back a step at a time where the context then fits on the GPU, kept where it would not or `--kv-gpu` limits the GPU's part. |
 | `dflash2_models` | The shared DFlash2 drafter (`models/drafters/`), and DeepSpec's DSpark (taken beside the tiny Qwen3.5, refused with DFlash2's convolutions or a block past 15): config validation before tensor binding, drafter GGUFs beside the tiny Qwen3 and Llama (block, taps, context nodes), a soft-capped selector and a tap after the output norm, drafter files refused for what they say or for the model they were made for, a DFlash2 file from before `draft_from` and `sel_gate` read as DFlash2's block, a DSpark file refused beside a model whose programs do not tap for it; a DSpine drafter file taken beside its model, refused beside another, beside a block drafter already there and for a config its block does not run. |
 
 | `tokenizer`, `bpe_merges`, `gguf_qwen2_*` | BPE merge exactness, pre-tokenizer splits, streaming UTF-8 decode. |
 | `flyx_reader`, `flag_numbers`, `known_drafters`, `drafter_speeds`, `cli_usage`, `hub`, `hub_concurrent`, `drafter_dir` | Malformed `.flyx` refusal, strict CLI numeric parsing, the verified drafters list (made for the model, then inferred; the kinds the build runs; a list not version 1 throughout refused whole) and this machine's speeds with them (a malformed file replaced), the command line where it is asked something or cannot be followed (`--version`, `--help`, an unknown option), Hub SHA-256 & multi-process lock/resume, drafter kinds of cached repos, direct DFlash2, DFlash and DSpine directory loading. |
 | `chat`, `chat_qwen35`, `chat_replies`, `reply_grammars`, `xgrammar_local_changes` | Template rendering vs `transformers`, native Qwen3.5 renderer vs Jinja on 3000 generated conversations, XML/JSON reply parsing, XGrammar structural tags, and the vendored XGrammar's differences from upstream (`third_party/xgrammar/README.flyx.md`) on vocabularies made by hand: mask and acceptance for every token at every step. |
-| `request`, `reply_text`, `round_chooser`, `memory_budget`, `snapshot_store`, `strata_snapshot`, `parked_edit`, `telemetry`, `response_store`, `request_log` | Core request pipeline, stop-string boundary handling, speculation width/drafter chooser, VRAM/RAM tier planner, host/disk snapshot stores, telemetry snapshot. |
+| `request`, `reply_text`, `round_chooser`, `round_costs_learned`, `memory_budget`, `snapshot_store`, `strata_snapshot`, `parked_edit`, `telemetry`, `response_store`, `request_log` | Core request pipeline, stop-string boundary handling, speculation width/drafter chooser and the round costs it learns at the context from the rounds read, VRAM/RAM tier planner, host/disk snapshot stores, telemetry snapshot. |
 | `scheduler_*`, `session_host_budget`, `model_host`, `capi`, `python_binding`, `convert_*` | Multi-session scheduling, concurrent generation, prewarm/superseding semantics, refused-session guards, a model switch that loads only once the old model is closed, C API & Python `ctypes` binding, converter UTF-8/CLI checks. |
 | `server_hardening` | What a hostile or broken client sends a live `flyx serve`, and what a browser brings: none of it ends the process, fills its memory, holds its workers or reads what it should not (`tests/apps/flyx-server/hardening.py` lists the checks). |
 | `api_compat`, `streaming_tool_calls`, `queued_request_*`, `client_conversations`, `codex_threads`, `remembered_model`, `kv_method_flags`, `cli_utf8_paths` | Live `flyx serve` and CLI integration tests (OpenAI Chat/Responses, Anthropic Messages, cancellation, session isolation, remembered `serve.json`). |
@@ -210,6 +212,10 @@ python tests/apps/flyx-server/check_dashboard_chat.py
 # Model page: load settings and what a reload posts, the command line through this system's shells,
 # the library (Hugging Face, this machine's folders), a server with nothing loaded
 python tests/apps/flyx-server/check_dashboard_model.py
+
+# Light and dark themes: light as it was, dark before the first paint and across a reload, the system's setting
+# followed while nothing is chosen, a browser without storage, the menu in all 7 languages
+python tests/apps/flyx-server/check_dashboard_theme.py
 ```
 
 ### Coding Agent Integration Tests

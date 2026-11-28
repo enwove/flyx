@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 53u
+#define FLYX_BACKEND_ABI_VERSION 55u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -314,7 +314,7 @@ typedef enum {
   FLYX_BLOCK_DSPARK_LAYER = 18, /* ABI 45: one layer of DSpark */
   FLYX_BLOCK_DSPINE = 19,       /* ABI 51: DSpine, a block drafter whose rows pass a code bridge's message on */
   FLYX_BLOCK_DSPINE_LAYER = 20, /* ABI 51: a DSpine layer: a Qwen3 layer, then its bridge's read and write */
-  FLYX_BLOCK_EAGLE4 = 21        /* ABI 53: EAGLE-4, a one-layer drafter run a step a draft from target taps */
+  FLYX_BLOCK_EAGLE4 = 21        /* ABI 55: EAGLE-4, a one-layer drafter run a step a draft from target taps */
 } flyx_block_kind;
 
 /* Token rows -> residual rows: x = table[token], optionally followed by RMSNorm (has_norm != 0, ABI 45). */
@@ -495,7 +495,7 @@ typedef struct {
   int32_t pad0;
 } flyx_dspine_layer_block;
 
-/* EAGLE-4 drafter (ABI 53; python/reference/flyx_ref/eagle4.py): one decoder layer run a step per draft, as MTP's,
+/* EAGLE-4 drafter (ABI 55; python/reference/flyx_ref/eagle4.py): one decoder layer run a step per draft, as MTP's,
  * from the target's residual rows at n_taps taps instead of its final-normed hidden.  All norms plain (w, eps).
  *   context features at position j (the residual rows tapped there): h_j = fc([fc_norm_i(tap_i)]_i)
  *   a step from (h, the next token t) at position j:
@@ -780,7 +780,7 @@ typedef struct {
     flyx_dspark_layer_block dspark_layer; /* ABI 45 */
     flyx_dspine_block dspine;             /* ABI 51 */
     flyx_dspine_layer_block dspine_layer; /* ABI 51 */
-    flyx_eagle4_block eagle4;             /* ABI 53 */
+    flyx_eagle4_block eagle4;             /* ABI 55 */
   };
 } flyx_block;
 
@@ -939,6 +939,9 @@ typedef struct {
    * whose file says NVFP4 inputs with bf16 ones where it does not. */
   int32_t fp4_inputs;
   uint64_t mem_total, mem_free;
+  /* Minimum free device bytes the backend's allocator enforces (ABI 53; e.g. Windows WDDM pieces/paged floor, 0 when
+   * unconstrained).  The planner clamps any smaller --vram-reserve to this floor. */
+  uint64_t reserve_floor;
 } flyx_device_info;
 
 /* Why the clocks are below their maximum (flyx_device_stats.clock_limits). */
@@ -1033,6 +1036,12 @@ typedef struct {
   /* What this process holds of the device as the system counts it, all of it: its models, their sequences and the
    * runtime's own (ABI 37).  0 where the system does not tell a process's share. */
   uint64_t process;
+  /* Minimum free device bytes the backend's allocator keeps free (ABI 53; 0 when unconstrained). */
+  uint64_t reserve_floor;
+  /* Of `weights`, what trim() gives back before anything drafts read: copies only the target's own rounds read, to
+   * run faster (ABI 54).  The engine gives them back rather than put K/V of the context it was asked for in host
+   * memory, where without them that context's K/V fits on the device.  0: none. */
+  uint64_t speed;
 } flyx_memory_info;
 
 typedef struct flyx_bmodel flyx_bmodel;

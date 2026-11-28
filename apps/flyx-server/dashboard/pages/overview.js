@@ -8,7 +8,7 @@ import { Meter, MemBar, StatusBadge, Icon } from "../lib/ui.js";
 import { Chart } from "../lib/charts.js";
 import { pendingConnect } from "../components/hints.js";
 import { openRequest } from "../lib/actions.js";
-import { live, phaseOf, phaseNames, phaseTone, ttftSeconds, prefillRate, cacheHit, acceptance, memoryOf } from "../lib/telemetry.js";
+import { live, phaseOf, phaseNames, phaseTone, ttftSeconds, speeds, cacheHit, acceptance, memoryOf } from "../lib/telemetry.js";
 
 // What runs now: a sentence of parts (bold where it names a figure), what sits on the right, how far along it is.
 function now(tm, phase) {
@@ -59,14 +59,11 @@ function now(tm, phase) {
 }
 
 // The two speeds over the throughput chart, decoding's and prefill's: of now, of the running request, or of the last.
-function speeds(tm, phase, recent) {
-  const state = tm.state || {}, last = recent[0] || {}, running = phase === "decode" || phase === "prefill";
+function speedFigures(tm, phase, recent) {
+  const sp = speeds(tm, phase, recent);
   return [
-    { v: phase === "decode" ? tm.rates.decode_tok_s : last.decode_tok_s, d: 1,
-      what: phase === "decode" ? "decode tok/s, now" : recent.length ? "decode tok/s, last request" : "decode tok/s" },
-    { v: running ? state.prefill_tok_s : prefillRate(last), d: 0,
-      what: phase === "prefill" ? "prefill tok/s, now" : running ? "prefill tok/s, this request" :
-            recent.length ? "prefill tok/s, last request" : "prefill tok/s" },
+    { v: sp.decode, d: 1, what: sp.decodeWhen ? "decode tok/s, " + sp.decodeWhen : "decode tok/s" },
+    { v: sp.prefill, d: 0, what: sp.prefillWhen ? "prefill tok/s, " + sp.prefillWhen : "prefill tok/s" },
   ];
 }
 
@@ -127,7 +124,7 @@ export function Overview({ active, go, explore, showModel, onOpenMem }) {
         <div class="pane-h"><h2>${t("Throughput")}</h2><span class="legend"><span style="--c: var(--chart)">${t("decode, left axis")}</span>
           <span style="--c: var(--chart-2)">${t("prefill, right axis")}</span></span>
           <span class="aside">${t("last 2 minutes")}</span></div>
-        <div class="fig">${speeds(tm, phase, recent).map((f) => html`<b>${fmt(f.v, f.d)}</b><span>${t(f.what)}</span>`)}</div>
+        <div class="fig">${speedFigures(tm, phase, recent).map((f) => html`<b>${fmt(f.v, f.d)}</b><span>${t(f.what)}</span>`)}</div>
         ${active ? html`<${Chart} samples=${perSecond}
                          series=${[{ key: "out", color: "--chart", fill: true }, { key: "pre", color: "--chart-2", axis: "right" }]}
                          opts=${{ span: 120, minTop: 10, right: { minTop: 100 } }}
