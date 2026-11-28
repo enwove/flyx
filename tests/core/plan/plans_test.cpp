@@ -30,10 +30,18 @@ std::vector<int> g_refuses;   // ... but not of these widths
 std::string g_why = "no rounds of this drafter here";
 int g_fail_rc = -1;
 std::string g_error;
+enum class OptionalPlan { none, given_tree, draft_tree, wide_given, adaptive };
+OptionalPlan g_oom_plan = OptionalPlan::none;
 
 int lower(flyx_bmodel*, const flyx_program* p, flyx_plan** out) {
   int block = -1, tree = 0;
+  if (g_oom_plan == OptionalPlan::adaptive && p->n_checkpoints) return g_error = "optional plan OOM", FLYX_ERR_OOM;
   for (int i = 0; i < p->n_nodes; ++i) {
+    const auto& node = p->nodes[i];
+    if ((g_oom_plan == OptionalPlan::given_tree && node.kind == FLYX_NODE_GIVEN && node.arg1 == FLYX_GIVEN_TREE) ||
+        (g_oom_plan == OptionalPlan::draft_tree && node.kind == FLYX_NODE_DRAFT && node.arg1 == FLYX_DRAFT_TREE) ||
+        (g_oom_plan == OptionalPlan::wide_given && node.kind == FLYX_NODE_GIVEN && p->width >= FLYX_MAX_ROWS))
+      return g_error = "optional plan OOM", FLYX_ERR_OOM;
     if (p->nodes[i].kind == FLYX_NODE_DRAFT) {
       block = p->nodes[i].block;
       tree = p->nodes[i].arg1;
@@ -78,6 +86,7 @@ class FakeModel final : public interfaces::Model {
   std::vector<int> draft_widths(int) const override {
     return sole_ ? widths_ : std::vector<int>{3, 7, 15};
   }
+  std::vector<int> adaptive_checkpoints(int) const override { return sole_ ? std::vector<int>{} : std::vector<int>{3, 7}; }
   int trained_ctx() const override { return 0; }
   int block_drafts(int) const override { return sole_ ? 0 : 15; }  // one pass: its widest chain; trees only: none
   bool drafts_trees(int) const override { return sole_; }
@@ -133,6 +142,14 @@ int main() {
   flyx::test::print_passes = true;
   const flyx_backend_api api = fake_backend();
   const FakeModel dv(true), chain(false);
+  for (auto plan : {OptionalPlan::given_tree, OptionalPlan::draft_tree, OptionalPlan::wide_given, OptionalPlan::adaptive}) {
+    g_oom_plan = plan;
+    Built b = build(chain, -1, true, true, true);
+    check(!b.ok && b.plans.oom && b.err.find("optional plan OOM") != std::string::npos,
+          "OOM while lowering an optional plan reaches the load retry");
+    b.plans.free(&api);
+  }
+  g_oom_plan = OptionalPlan::none;
   const std::vector<int> kWarm = {0, 15, 0}, kWho = {-1, 0, 0};
   {
     Built b = build(dv, -1, true, true, true);
