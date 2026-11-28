@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 55u
+#define FLYX_BACKEND_ABI_VERSION 56u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -150,6 +150,10 @@ typedef struct {
   int64_t shape[4];
   const void* data;
   uint64_t nbytes;
+  /* Optional borrowed shard handle, valid as long as data. read_at returns zero only after reading all bytes. */
+  const void* file;
+  uint64_t file_offset;
+  int (*read_at)(const void* file, uint64_t offset, void* dst, size_t bytes);
 } flyx_tensor_view;
 
 /* ---- The model: weights, state, blocks ----------------------
@@ -251,7 +255,9 @@ typedef enum {
   FLYX_STATE_CANVAS = 4,
   /* Causal short-convolution recurrent history (ABI 45): `conv - 1` rows of `channels` float32 values per logical
    * layer; folded to accepted rows at commit, rewound inside FLYX_ROUND_SLOTS, and saved in checkpoints/snapshots. */
-  FLYX_STATE_SHORTCONV = 5
+  FLYX_STATE_SHORTCONV = 5,
+  FLYX_STATE_INDEXER = 6, /* one raw index key of width head_dim per logical position */
+  FLYX_STATE_PLE = 7      /* conv-1 rows of channels activations and width preceding token IDs */
 } flyx_state_kind;
 
 /* Per-sequence state.  Positional state (KV, RING) is rewritten after a
@@ -315,7 +321,9 @@ typedef enum {
   FLYX_BLOCK_DSPARK_LAYER = 18, /* ABI 45: one layer of DSpark */
   FLYX_BLOCK_DSPINE = 19,       /* ABI 51: DSpine, a block drafter whose rows pass a code bridge's message on */
   FLYX_BLOCK_DSPINE_LAYER = 20, /* ABI 51: a DSpine layer: a Qwen3 layer, then its bridge's read and write */
-  FLYX_BLOCK_EAGLE4 = 21        /* ABI 55: EAGLE-4, a one-layer drafter run a step a draft from target taps */
+  FLYX_BLOCK_EAGLE4 = 21,       /* ABI 55: EAGLE-4, a one-layer drafter run a step a draft from target taps */
+  FLYX_BLOCK_HC = 22,
+  FLYX_BLOCK_PLE = 23
 } flyx_block_kind;
 
 /* Token rows -> residual rows: x = table[token], optionally followed by RMSNorm (has_norm != 0, ABI 45). */
@@ -325,6 +333,26 @@ typedef struct {
   int32_t has_norm;                    /* ABI 45: 1 = apply norm after lookup; 0 = none */
   flyx_norm norm;
 } flyx_embed_block;
+
+typedef enum {
+  FLYX_HC_EXPAND, FLYX_HC_MIX, FLYX_HC_SCATTER, FLYX_HC_COLLAPSE
+} flyx_hc_phase;
+
+/* EXPAND broadcasts token rows to the wide residual. MIX saves one injection coefficient per stream.
+ * SCATTER adds the projected body output to each stream. COLLAPSE only mixes. */
+typedef struct {
+  int32_t phase, hidden, streams, rank, down, up, inject;
+  flyx_norm norm;
+} flyx_hc_block;
+
+typedef struct {
+  int32_t hidden, streams, ngram, heads_per_order, row_width, eos, table;
+  int32_t key, value, conv_w, taps, dilation, state;
+  flyx_norm norm_key, norm_query, norm_conv;
+  const uint64_t* multipliers; /* ngram entries, newest token first; model-owned until close */
+  const uint64_t* offsets;     /* (ngram - 1) * heads_per_order entries, order-major */
+  const uint64_t* moduli;
+} flyx_ple_block;
 
 /* x += o(attention(rope(q_norm(q)), rope(k_norm(k)), v) [* sigmoid(gate)]) with
  * q, k, v projections of norm(x); per head, causal over the sequence, keys
@@ -353,6 +381,10 @@ typedef struct {
   int32_t mrope_section[3];
   int32_t mrope_interleaved;
   int32_t lora_gate;                   /* ABI 50: flyx_gate_layout of lora[FLYX_LIN_Q]'s b rows (gate only) */
+  int32_t body_only;                   /* input is already mixed; return projection without a residual add */
+  int32_t has_indexer, index_q, index_k, index_heads, index_kv_heads, index_dim;
+  int32_t group_size, token_budget, index_state;
+  flyx_norm index_q_norm, index_k_norm;
 } flyx_attn_block;
 
 /* Gated delta net, as ops/ops.h: from h = norm(x), mixed = qkv(h) through
@@ -375,6 +407,7 @@ typedef struct {
    * FLYX_GDN_HEADS_GROUPED): the backend reads them as it reads the weights. */
   flyx_lora lora[FLYX_GDN_LINS];
   int32_t lora_head_order;             /* flyx_gdn_head_order */
+  int32_t body_only, out_gate_act;     /* output gate: 0 SiLU, 1 sigmoid. The convolution always uses SiLU. */
 } flyx_gdn_block;
 
 /* x += down(silu(gate(h)) * up(h)), h = norm(x). */
@@ -728,6 +761,8 @@ typedef struct {
   int32_t loop_rank;                   /* 0 on pass 0 */
   int32_t loop_ctrl_down, loop_ctrl_gain, loop_ctrl_forget;
   int32_t sconv, sconv_offset;         /* FLYX_STATE_SHORTCONV index and channel offset */
+  int32_t body_only, separate_gate_up, gate, up;
+  int32_t has_shared, shared_inter, shared_gate, shared_up, shared_down, shared_router;
 } flyx_moe_block;
 
 /* One layer of a DSpark parallel block drafter (ABI 45): per-layer context tap mix + K/V projection,
@@ -782,6 +817,8 @@ typedef struct {
     flyx_dspine_block dspine;             /* ABI 51 */
     flyx_dspine_layer_block dspine_layer; /* ABI 51 */
     flyx_eagle4_block eagle4;             /* ABI 55 */
+    flyx_hc_block hc;
+    flyx_ple_block ple;
   };
 } flyx_block;
 
@@ -999,6 +1036,10 @@ typedef enum {
   FLYX_DRAFT_WEIGHTS_EXACT = 3  /* keep drafter weights in file format (and uncompacted draft head) */
 } flyx_draft_weights;
 
+typedef enum {
+  FLYX_PLE_AUTO = 0, FLYX_PLE_GPU, FLYX_PLE_HOST, FLYX_PLE_DISK, FLYX_PLE_HYBRID
+} flyx_ple_placement;
+
 typedef struct {
   int32_t max_ctx;              /* tokens per sequence */
   int32_t verbose;
@@ -1015,6 +1056,8 @@ typedef struct {
   /* ABI 48: use this target-only position as AUTO's default switch on every layout. An explicit backend
    * switch still wins. A zero-initialized direct caller retains layout-dependent AUTO. */
   int32_t lock_auto_from, auto_from;
+  int32_t ple_placement;
+  uint64_t ple_hot_bytes, ple_host_room;
 } flyx_open_options;
 
 /* Pre-flight device memory estimate before open() allocates (ABI 48).

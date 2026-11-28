@@ -4,6 +4,41 @@
 
 namespace flyx::optest {
 
+void test_hc() {
+  constexpr int R = 3, C = 4, H = 32;
+  seed("hyper connection",R,C,H);
+  Vec x = randv(R*H), u = randv(R*C*H), a = randv(R*C*H), j = randv(R*C), router = randv(H);
+  auto* dx = up(x);
+  auto* dw = dev<float>(u.size());
+  auto* du = up(u);
+  auto* da = up(a);
+  auto* dj = up(j);
+  Vec wide(u.size()), mixed(x.size(),0);
+  for (int r = 0; r < R; ++r) for (int c = 0; c < C; ++c) for (int i = 0; i < H; ++i) {
+    const size_t k = (r*C+c)*H+i;
+    wide[k] = x[r*H+i];
+    mixed[r*H+i] += u[k]*ops::sigmoid(a[k])/C;
+  }
+  hc_rows(FLYX_HC_EXPAND,dx,dw,nullptr,nullptr,nullptr,R,C,H,0);
+  expect("expand",down(dw,wide.size()),wide,1e-7);
+  hc_rows(FLYX_HC_MIX,dx,dw,du,dj,da,R,C,H,0);
+  expect("mix",down(dx,x.size()),mixed,1e-6);
+  hc_rows(FLYX_HC_SCATTER,dx,dw,nullptr,dj,nullptr,R,C,H,0);
+  for (int r = 0; r < R; ++r) for (int c = 0; c < C; ++c) for (int i = 0; i < H; ++i)
+    wide[(r*C+c)*H+i] += 2*ops::sigmoid(j[r*C+c]/C)*mixed[r*H+i];
+  expect("scatter",down(dw,wide.size()),wide,1e-6);
+  hc_down_silu(du,u.size(),C,0);
+  for (auto& v : u) v = ops::silu(v/C);
+  expect("scaled SiLU",down(du,u.size()),u,1e-6);
+  shared_expert_add(dx,up(x),up(router),da,R,H,0);
+  for (int r = 0; r < R; ++r) {
+    double v = 0;
+    for (int i=0;i<H;++i) v += x[r*H+i]*router[i];
+    for (int i=0;i<H;++i) mixed[r*H+i] += ops::sigmoid(v)*a[r*H+i];
+  }
+  expect("shared expert gate", down(dx,mixed.size()),mixed,1e-6);
+}
+
 void test_gdn(const GdnDims d, const int rows, const double tol) {
   std::printf("gated delta net (dk %d, dv %d, %d rows)\n", d.dk, d.dv, rows);
   seed("gated delta net", d.nk, d.nv, d.dk, d.dv, rows);
@@ -34,7 +69,10 @@ void test_gdn(const GdnDims d, const int rows, const double tol) {
       ops::gdn_row(&S[size_t(h) * d.dv * d.dk], &conv[kh * d.dk], &conv[kd + kh * d.dk], &conv[2 * kd + h * d.dv], beta, g,
                    d.dk, d.dv, o.data());
       ops::rmsnorm(o.data(), gw.data(), d.dv, 1e-6, 0.0, on.data());
-      for (int j = 0; j < d.dv; ++j) y[size_t(r) * vd + h * d.dv + j] = on[j] * ops::silu(proj[size_t(r) * ld + C + h * d.dv + j]);
+      for (int j = 0; j < d.dv; ++j) {
+        const double z = proj[size_t(r) * ld + C + h * d.dv + j];
+        y[size_t(r) * vd + h * d.dv + j] = on[j] * (d.sigmoid_output ? ops::sigmoid(z) : ops::silu(z));
+      }
     }
   }
   // device: slot 1 holds the start state; rounds read it (round = 1).

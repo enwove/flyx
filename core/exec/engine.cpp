@@ -78,7 +78,9 @@ bool set_kv_method(const EngineOptions& opt, plan::KvTiers* tiers, std::string* 
 // in the memory available, so that reading ahead does not push out what the upload has yet to read.
 class ReadAhead {
  public:
-  explicit ReadAhead(const ModelFile& file) : available_(os::system_memory().available) {
+  ReadAhead(const ModelFile& file, const flyx_model_desc& desc) : available_(os::system_memory().available) {
+    // Cold rows can occupy an entire shard. Paging them in here defeats bounded placement.
+    for (int i = 0; i < desc.n_blocks; ++i) if (desc.blocks[i].kind == FLYX_BLOCK_PLE) return;
     if (available_ && file.bytes() < available_) thread_ = std::thread([this, &file] { file.read_ahead(stop_); });
   }
   ~ReadAhead() {
@@ -643,7 +645,6 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     return false;
   if (opt_.vision && !opt_.mmproj_file.empty())
     if (!file_.add(opt_.mmproj_file, err, opt_.allow_path, ModelFile::CompanionRole::Projector)) return false;
-  ReadAhead ahead(file_);  // until the load returns
   t[1] = os::now_ms();
   if (!tok_.load(file_, err)) return false;
   // Chat: a file without a usable template still runs raw prompts; a template
@@ -691,6 +692,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   mo.fp4_inputs = device_.fp4_inputs != 0;
   model_ = interfaces::open_model(file_, mo, err);
   if (!model_) return false;
+  ReadAhead ahead(file_, model_->desc());  // until the load returns
   const bool requested_trees = opt_.draft_trees;
   if (opt_.vision && !opt_.mmproj_file.empty() && !model_->vision())
     return *err = "--mmproj " + opt_.mmproj_file + ": file is not a supported vision projector (mmproj)", false;
@@ -751,6 +753,11 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     flyx_open_options oo{};
     oo.max_ctx = opt_.max_ctx;
     oo.verbose = opt_.verbose;
+    oo.ple_placement = opt_.ple_placement;
+    oo.ple_hot_bytes = opt_.ple_hot_bytes;
+    const auto mem = os::system_memory();
+    const auto keep = opt_.ram_reserve < 0 ? plan::host_keep(mem.total) : uint64_t(opt_.ram_reserve);
+    oo.ple_host_room = mem.available > keep ? mem.available - keep : 0;
     oo.lock_auto_from = tiers.method == FLYX_KV_AUTO;
     oo.auto_from = auto_from;
     oo.kv_fp8 = opt_.kv == FLYX_KV_FP8 ? 1 : 0;

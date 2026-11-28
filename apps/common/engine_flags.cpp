@@ -78,6 +78,16 @@ bool engine_flag(const std::string& a, const std::function<std::string()>& value
     if (!interfaces::parse_kv_method(v, &spec, &err))
       std::fprintf(stderr, "error: %s\n", err.c_str()), std::exit(2);
     eo->kv_method = v;
+  } else if (a == "--ple") {
+    const auto v = value();
+    if (v == "auto") eo->ple_placement = FLYX_PLE_AUTO;
+    else if (v == "gpu") eo->ple_placement = FLYX_PLE_GPU;
+    else if (v == "host") eo->ple_placement = FLYX_PLE_HOST;
+    else if (v == "disk") eo->ple_placement = FLYX_PLE_DISK;
+    else if (v == "hybrid") eo->ple_placement = FLYX_PLE_HYBRID;
+    else std::fprintf(stderr, "error: --ple expects auto, gpu, host, disk or hybrid\n"), std::exit(2);
+  } else if (a == "--ple-hot-mb") {
+    eo->ple_hot_bytes = uint64_t(whole_flag("--ple-hot-mb", value(), 0, INT_MAX)) << 20;
   } else if (a == "--backend-opt") {
     eo->backend_options += (eo->backend_options.empty() ? "" : ",") + value();
   } else if (a == "--backend") {
@@ -181,6 +191,8 @@ std::string engine_flags_help(int ctx) {
          "  --backend B          cuda | cpu_ref (default: the build's cuda, cpu_ref in a build without it; a CUDA\n"
          "                       backend that cannot run here is an error, never cpu_ref in its place); cuda runs on\n"
          "                       the first GPU CUDA lists: CUDA_VISIBLE_DEVICES=N in the environment makes that GPU N\n"
+         "  --ple PLACE          n-gram table placement: auto, gpu, host, disk or hybrid\n"
+         "  --ple-hot-mb N       maximum RAM for cached n-gram rows, in MiB (default 64)\n"
          "  --backend-opt K=V    a backend option (repeatable; also FLYX_BACKEND_OPTIONS=K=V,...)\n"
          "  --no-spec            plain decoding, ignore the drafter\n"
          "  --no-lookup          no rounds drafted from the text itself where it repeats\n"

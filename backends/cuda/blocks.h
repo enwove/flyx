@@ -80,6 +80,12 @@ struct StateTable {
 
 // ---- blocks ---------------------------------------------------------------------------------
 // Token rows -> residual stream rows of width `hidden`.
+struct HcBlock {
+  int phase = 0, hidden = 0, streams = 0, rank = 0;
+  Norm norm;
+  Lin down, up, inject;
+};
+
 struct EmbedBlock {
   int hidden = 0, vocab = 0;
   bf16* table = nullptr;  // [vocab, hidden]; null when packed
@@ -96,6 +102,7 @@ struct AttnBlock {
   double theta = 0;
   int mrope_section[3] = {0, 0, 0};
   int mrope_interleaved = 0;
+  bool body_only = false;
   bool gate = false;           // the q projection is [q (nh*hd) | gate (nh*hd)]
   Norm norm, q_norm, k_norm;   // q_norm and k_norm share offset and eps; w null: none (Llama's heads as projected)
   Lin w_in, w_out;             // w_in: the projections stacked as above
@@ -111,6 +118,7 @@ struct AttnBlock {
 // norm -> [mixed (q|k|v) | z | b | a] -> causal conv, gated delta rule over
 // its state -> gated norm (w, eps; offset 0) -> output projection, added to the residual.
 struct GdnBlock {
+  bool body_only = false;
   int hidden = 0;
   GdnDims gd{};
   Norm norm, gated;
@@ -401,6 +409,11 @@ struct RelAttnBlock {
 
 // Inkling-2 sparse MoE block with AttnRes, optional cross-pass loop control, SiTU activation, and post ShortConv.
 struct MoeBlock {
+  bool body_only = false, separate_gate_up = false;
+  int shared_inter = 0;
+  ExpertMat up;
+  Lin shared_gu, shared_down;
+  float* shared_router = nullptr;
   int hidden = 0, inter = 0, n_experts = 0, top_k = 0, conv = 0;
   bool gating_sigmoid = true, norm_weights = true;
   float route_scale = 1.f, norm_eps = 1e-20f, situ_beta = 0.f, situ_linear_beta = 0.f;
@@ -449,7 +462,7 @@ struct DSparkBlock {
 
 using Block = std::variant<EmbedBlock, AttnBlock, GdnBlock, MlpBlock, HeadBlock, MtpBlock, DFlashBlock, DFlashLayer,
                            DvBlock, DvLayer, VisionStemBlock, VitAttnBlock, VitMlpBlock, VisionMergeBlock,
-                           RelAttnBlock, MoeBlock, DSparkBlock, DSparkLayer, Eagle4Block>;
+                           RelAttnBlock, MoeBlock, DSparkBlock, DSparkLayer, Eagle4Block, HcBlock>;
 
 // ---- a sequence's state, as the table declares it -------------------------------------------
 struct KvBuf {

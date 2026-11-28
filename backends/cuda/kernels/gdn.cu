@@ -651,7 +651,7 @@ __global__ void k_gdn_compact(GdnBufs bufs, const GdnLayer* layers, const DevPar
 // grid (nv, ceil(rows / r_step)); block = dv threads.
 template <class TZ = float>
 __global__ void k_gdn_gated_norm(const float* o, const TZ* z, int ld_z, const float* w, float eps, Out y, int nv,
-                                 int dv, int rows, int r_step) {
+                                 int dv, int rows, int r_step, bool sigmoid_output) {
   pdl_trigger();
   const int h = blockIdx.x, r0 = int(blockIdx.y) * r_step, r1 = min(rows, r0 + r_step);
   const int j = threadIdx.x;  // blockDim: dv rounded up to 32
@@ -667,7 +667,7 @@ __global__ void k_gdn_gated_norm(const float* o, const TZ* z, int ld_z, const fl
     for (int r = r0; r < r1; ++r) {
       const int b = (r - r0) & 1;
       const float ws = warp_sum(__fmul_rn(v, v));
-      const float sz = j < dv ? silu(zv) : 0.f;
+      const float sz = j < dv ? (sigmoid_output ? 1.f / (1.f + expf(-zv)) : silu(zv)) : 0.f;
       // Prefetch next row's o and z before the barrier so their DRAM latency hides behind reduction + output store.
       float v_nxt = 0.f, z_nxt = 0.f;
       if (r + 1 < r1 && j < dv) {
@@ -692,7 +692,8 @@ __global__ void k_gdn_gated_norm(const float* o, const TZ* z, int ld_z, const fl
   for (int r = r0; r < r1; ++r) {
     const size_t at = size_t(r) * o_stride + size_t(h) * dv + j;
     const float v = j < dv ? o[at] : 0.f;
-    const float sz = j < dv ? silu(in_value(z + size_t(r) * ld_z + size_t(h) * dv + j)) : 0.f;
+    const float zv = j < dv ? in_value(z + size_t(r) * ld_z + size_t(h) * dv + j) : 0.f;
+    const float sz = j < dv ? (sigmoid_output ? 1.f / (1.f + expf(-zv)) : silu(zv)) : 0.f;
     const float inv = rsqrtf(block_sum(__fmul_rn(v, v)) / dv + eps);
     if (y.q8) {
       put_q8<false, true>(y, r, (h * dv + j) >> 5, v * inv * wj * sz);
@@ -891,7 +892,7 @@ void gdn_conv(const float* mixed, int ld_mixed, const float* conv_w, float* win,
 namespace {
 bool gdn_round_supported(const KernelOptions& opt, const GdnDims& d, int rows, const float* S, size_t s_stride) {
   const bool aligned = reinterpret_cast<uintptr_t>(S) % 16 == 0 && s_stride % 4 == 0;
-  return opt.gdn_round && sm90_or_newer() && aligned && rows >= 1 && rows <= kGdnRoundRows && d.nk > 0 && d.nv % d.nk == 0 &&
+  return !d.sigmoid_output && opt.gdn_round && sm90_or_newer() && aligned && rows >= 1 && rows <= kGdnRoundRows && d.nk > 0 && d.nv % d.nk == 0 &&
          (d.dk == 16 || d.dk == 32 || d.dk == 64 || d.dk == 128) && d.dv <= 8 * kGdnJB && d.ck >= 1 && d.ck <= 8;
 }
 }  // namespace
@@ -1114,21 +1115,21 @@ void gdn_gated_norm(const float* o, const float* z, int ld_z, const float* w, fl
                     GdnDims d, cudaStream_t st) {
   const int r_step = rows >= 64 ? 4 : 1;
   k_gdn_gated_norm<<<dim3(d.nv, ceil_div(rows, r_step)), (d.dv + 31) / 32 * 32, 0, st>>>(
-      o, z, ld_z, w, eps, Out{y, nullptr, nullptr}, d.nv, d.dv, rows, r_step);
+      o, z, ld_z, w, eps, Out{y, nullptr, nullptr}, d.nv, d.dv, rows, r_step, d.sigmoid_output);
 }
 
 void gdn_gated_norm_split(const float* o, const float* z, int ld_z, const float* w, float eps, int rows, GdnDims d,
                           const Launch& L, bool q8) {
   const int r_step = rows >= 64 ? 4 : 1;
   k_gdn_gated_norm<<<dim3(d.nv, ceil_div(rows, r_step)), (d.dv + 31) / 32 * 32, 0, L.st>>>(
-      o, z, ld_z, w, eps, split_out(L, rows, d.nv * d.dv, q8), d.nv, d.dv, rows, r_step);
+      o, z, ld_z, w, eps, split_out(L, rows, d.nv * d.dv, q8), d.nv, d.dv, rows, r_step, d.sigmoid_output);
 }
 
 void gdn_gated_norm_split(const float* o, const bf16* z, int ld_z, const float* w, float eps, int rows, GdnDims d,
                           const Launch& L, bool q8) {
   const int r_step = rows >= 64 ? 4 : 1;
   k_gdn_gated_norm<bf16><<<dim3(d.nv, ceil_div(rows, r_step)), (d.dv + 31) / 32 * 32, 0, L.st>>>(
-      o, z, ld_z, w, eps, split_out(L, rows, d.nv * d.dv, q8), d.nv, d.dv, rows, r_step);
+      o, z, ld_z, w, eps, split_out(L, rows, d.nv * d.dv, q8), d.nv, d.dv, rows, r_step, d.sigmoid_output);
 }
 
 }  // namespace flyx::cuda

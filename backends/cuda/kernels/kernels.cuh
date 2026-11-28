@@ -1157,10 +1157,16 @@ void swiglu(const float* gu, int ld, int I, float* out, int ld_out, int rows, cu
 void round_rows_bf16(float* x, int ld, int n, int rows, cudaStream_t st);
 void add_rows_bf16(float* x, int ld, const float* y, int ldy, int n, int rows, cudaStream_t st);
 
+void hc_rows(int phase, float* x, float* wide, const float* norm, const float* inject, const float* gain,
+             int rows, int streams, int hidden, cudaStream_t st);
+void hc_down_silu(float* x, int64_t elements, int streams, cudaStream_t st);
+void shared_expert_add(float* x, const float* input, const float* router, const float* expert, int rows, int hidden, cudaStream_t st);
+
 // ---- gated delta net ------------------------------------------------------------
 struct GdnDims {
   int nk, nv, dk, dv, ck;   // heads, head dims, conv kernel
   int tiled = 0;            // how value heads map to key heads (flyx_gdn_head_order)
+  bool sigmoid_output = false;
   __host__ __device__ int C() const { return 2 * nk * dk + nv * dv; }
   __host__ __device__ int rep() const { return nv / nk; }  // value heads to a key head
   // The key head value head h reads; value head i (0 .. rep() - 1) of key head kh; whether h is a key head's first.

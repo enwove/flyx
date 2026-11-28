@@ -571,7 +571,7 @@ ShardHeader parse_shard_header(const uint8_t* data, size_t size, bool allow_zero
 }
 
 void append_shard_tensors(const uint8_t* data, size_t size, const ShardHeader& h, ModelFile::Contents* result,
-                          bool* quantized) {
+                          bool* quantized, const os::MappedFile* file = nullptr) {
   Cursor r(data + h.tensor_pos, size - h.tensor_pos);
   struct Entry {
     uint64_t offset;
@@ -628,6 +628,13 @@ void append_shard_tensors(const uint8_t* data, size_t size, const ShardHeader& h
     if (e.offset > size - base || v.nbytes > size - base - e.offset)
       invalid("GGUF tensor outside the file: " + result->names[e.tensor]);
     v.data = data + base + size_t(e.offset);
+    if (file) {
+      v.file = file;
+      v.file_offset = base + e.offset;
+      v.read_at = [](const void* f, uint64_t at, void* dst, size_t bytes) {
+        return static_cast<const os::MappedFile*>(f)->read_at(at, dst, bytes) ? 0 : -1;
+      };
+    }
     ranges.push_back({e.offset, e.offset + v.nbytes});
   }
   std::sort(ranges.begin(), ranges.end());
@@ -704,7 +711,7 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
       file_type(initial.meta, need_tokenizer);
       ModelFile::Contents result;
       bool quantized = false;
-      append_shard_tensors((*maps)[0]->data(), (*maps)[0]->size(), initial, &result, &quantized);
+      append_shard_tensors((*maps)[0]->data(), (*maps)[0]->size(), initial, &result, &quantized, (*maps)[0].get());
       finalize_contents(std::move(initial.meta), initial.tok, initial.version, 1, quantized, need_tokenizer, &result);
       *out = std::move(result);
       return true;
@@ -751,7 +758,7 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
 
     ModelFile::Contents result;
     bool quantized = false;
-    append_shard_tensors(shards[0]->data(), shards[0]->size(), h0, &result, &quantized);
+    append_shard_tensors(shards[0]->data(), shards[0]->size(), h0, &result, &quantized, shards[0].get());
     for (int i = 1; i < split_count; ++i) {
       ShardHeader hi =
           i == initial_no ? std::move(initial)
@@ -765,7 +772,7 @@ bool read_gguf(std::vector<std::unique_ptr<os::MappedFile>>* maps, const std::st
       if (!hi.meta.contains("split.no") ||
           int(integer(hi.meta.at("split.no"), "split.no", 0, split_count - 1)) != i)
         invalid("shard " + std::to_string(i + 1) + " split.no does not match its index");
-      append_shard_tensors(shards[size_t(i)]->data(), shards[size_t(i)]->size(), hi, &result, &quantized);
+      append_shard_tensors(shards[size_t(i)]->data(), shards[size_t(i)]->size(), hi, &result, &quantized, shards[size_t(i)].get());
     }
     if (expected_tensors >= 0 && int64_t(result.tensors.size()) != expected_tensors)
       invalid("split GGUF tensor count mismatch: header says " + std::to_string(expected_tensors) + ", shards hold " +

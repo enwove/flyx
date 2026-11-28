@@ -24,7 +24,13 @@ RowNeeds row_needs(const flyx_bmodel* m) {
                               lora_down_part_floats(rank, last_in, 1)});
   };
   for (const Block& blk : m->blocks) {
-    if (const auto* a = std::get_if<AttnBlock>(&blk)) {
+    if (const auto* hc = std::get_if<HcBlock>(&blk)) {
+      n.hc_streams = std::max(n.hc_streams, hc->streams);
+      n.proj = std::max(n.proj, hc->streams * hc->hidden);
+      n.act = std::max(n.act, hc->rank);
+      ks({hc->streams * hc->hidden, hc->rank});
+      n.q8 |= hc->down.q8_inputs() || hc->up.q8_inputs() || hc->inject.q8_inputs();
+    } else if (const auto* a = std::get_if<AttnBlock>(&blk)) {
       n.proj = std::max(n.proj, a->n_in());
       n.act = std::max(n.act, a->nh * a->hd);
       n.q = std::max(n.q, a->nh * a->hd);
@@ -67,7 +73,12 @@ RowNeeds row_needs(const flyx_bmodel* m) {
       if (r->res_push && r->loop_rank == 0) ++pass0_pushes;
       ks({r->hidden, q_dim, 2 * r->hidden, r->loop_rank});
     } else if (const auto* e = std::get_if<MoeBlock>(&blk)) {
-      n.proj = std::max(n.proj, e->n_experts);
+      n.proj = std::max({n.proj, e->n_experts, 2*e->shared_inter});
+      n.act = std::max(n.act,e->shared_inter);
+      if (e->shared_inter) {
+        ks({e->shared_inter});
+        n.q8 |= e->shared_gu.q8_inputs() || e->shared_down.q8_inputs();
+      }
       n.moe_experts = std::max(n.moe_experts, e->n_experts);
       n.moe_topk = std::max(n.moe_topk, e->top_k);
       n.moe_inter = std::max(n.moe_inter, e->inter);
@@ -151,6 +162,11 @@ void alloc_rows(const flyx_bmodel* m, int R, bool prefill, RowBufs* b, Alloc&& a
     b->mval = f(size_t(R) * ops::kMtpCands);
   }
   b->x = f(size_t(R) * H);
+  if (n.hc_streams) {
+    b->hc_wide = f(size_t(R) * n.hc_streams * H);
+    b->hc_norm = f(size_t(R) * n.hc_streams * H);
+    b->hc_inject = f(size_t(R) * n.hc_streams);
+  }
   if (n.lora) b->lora = f(size_t(R) * n.lora);  // live beside every buffer below: a layer's linears read it
   if (n.lora_part) b->lora_part = f(size_t(std::min(R, kLoraEarlyRows)) * n.lora_part);
   // Prefill attention runs on tensor cores (no partials) above FLYX_MAX_ROWS rows, every head dim the backend

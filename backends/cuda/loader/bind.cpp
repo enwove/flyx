@@ -287,7 +287,8 @@ AttnBlock attention(WeightLoader& L, const flyx_attn_block& b, const StateMap& s
   a.mrope_interleaved = b.mrope_interleaved;
   rope_register(a.theta, a.rot);  // attn_prep's rotary factors, once
   a.gate = b.gate != FLYX_GATE_NONE;
-  a.norm = norm(L, b.norm);
+  a.body_only = b.body_only != 0;
+  a.norm = a.body_only ? Norm{} : norm(L, b.norm);
   // The kernels read every head's q, then every head's gate: a file that keeps
   // a head's gate rows after its q rows is uploaded in that order (and so is an adapter's q, in its own layout).
   auto gate_rows = [&](int layout) {
@@ -341,7 +342,9 @@ GdnBlock gdn(WeightLoader& L, const flyx_gdn_block& b, const StateMap& sm, Adapt
   GdnBlock g;
   g.hidden = b.hidden;
   g.gd = {b.nk, b.nv, b.dk, b.dv, b.conv, b.head_order == FLYX_GDN_HEADS_TILED};
-  g.norm = norm(L, b.norm);
+  g.gd.sigmoid_output = b.out_gate_act != 0;
+  g.body_only = b.body_only != 0;
+  g.norm = g.body_only ? Norm{} : norm(L, b.norm);
   int rows = 0;
   g.w_in = L.lin_stack({b.qkv, b.z, b.b, b.a}, &rows);
   expect(rows == g.n_in(), "GDN qkv|z|b|a rows do not match its dimensions");
@@ -764,10 +767,24 @@ MoeBlock moe(WeightLoader& L, const flyx_moe_block& b, const StateMap& sm) {
   f.norm_eps = b.norm_eps;
   f.situ_beta = b.situ_beta;
   f.situ_linear_beta = b.situ_linear_beta;
-  f.norm = norm(L, b.norm);
+  f.body_only = b.body_only != 0;
+  f.norm = f.body_only ? Norm{} : norm(L, b.norm);
   f.router = L.lin_f32(b.router);
   if (b.router_bias >= 0) f.router_bias = L.vec(b.router_bias);
-  f.gate_up = L.expert_mat(b.gate_up);
+  f.separate_gate_up = b.separate_gate_up != 0;
+  if (f.separate_gate_up) {
+    expect(f.inter % 2 == 0, "separate gate and up matrices require an even intermediate dimension");
+    f.gate_up = L.expert_mat(b.gate);
+    f.up = L.expert_mat(b.up);
+  } else {
+    f.gate_up = L.expert_mat(b.gate_up);
+  }
+  if (b.has_shared) {
+    f.shared_inter = b.shared_inter;
+    f.shared_gu = L.lin_stack({b.shared_gate,b.shared_up});
+    f.shared_down = L.lin(b.shared_down);
+    f.shared_router = L.vec(b.shared_router);
+  }
   f.down = L.expert_mat(b.down);
   if (b.post_conv >= 0) f.post_conv = L.vec(b.post_conv);
   if (b.res_query >= 0) f.res_query = L.vec(b.res_query);
@@ -1213,12 +1230,24 @@ void bind(flyx_bmodel* m, const flyx_model_desc& d, LoadTimes* times) {
         put_block(m, i, std::move(e));
         break;
       }
+      case FLYX_BLOCK_HC: {
+        HcBlock hc{};
+        hc.phase = b.hc.phase; hc.hidden = b.hc.hidden; hc.streams = b.hc.streams; hc.rank = b.hc.rank;
+        if (hc.phase == FLYX_HC_MIX || hc.phase == FLYX_HC_COLLAPSE) {
+          hc.norm = norm(L, b.hc.norm);
+          hc.down = L.lin(b.hc.down);
+          hc.up = L.lin(b.hc.up);
+          if (hc.phase == FLYX_HC_MIX) hc.inject = L.lin(b.hc.inject);
+        }
+        put_block(m, i, std::move(hc));
+        break;
+      }
       case FLYX_BLOCK_HEAD: {
         HeadBlock h;
         h.hidden = b.head.hidden;
         h.vocab = b.head.vocab_out > 0 ? b.head.vocab_out : b.head.vocab;
         h.softcap = b.head.softcap;
-        h.norm = norm(L, b.head.norm);
+        h.norm = head_norm(L, b.head.norm);
         if (L.packable(b.head.w)) {
           h.wb = L.pack(b.head.w);  // a tied head: the embedding's blocks
           h.wb.rows = h.vocab;      // truncate padded output rows to vocab_out
@@ -1561,7 +1590,10 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
         for (int w : {b.mlp.gate, b.mlp.up, b.mlp.down}) mark_linear(w, q.mtp);
       }
     } else if (b.kind == FLYX_BLOCK_MOE) {
-      mark(is_expert, b.moe.gate_up);
+      if (b.moe.separate_gate_up) {
+        mark(is_expert, b.moe.gate);
+        mark(is_expert, b.moe.up);
+      } else mark(is_expert, b.moe.gate_up);
       mark(is_expert, b.moe.down);
     } else if (b.kind == FLYX_BLOCK_DSPARK) {
       // Its block's norms, vectors, Markov head and joint projection stay as stored (dspark(): not quantized).

@@ -75,6 +75,8 @@ struct EngineOptions {
   // locked host RAM, 3-stage streamed via OS page cache), "host" (pinned host RAM, 0 VRAM), "gpu" (GPU resident),
   // or "auto" (GPU if >= 8 GB free after weights, else disk).
   std::string vision_device = "disk";
+  int ple_placement = FLYX_PLE_AUTO;
+  uint64_t ple_hot_bytes = uint64_t(64) << 20;
   // On-the-fly quantization of floating-point vision linear weights: "q8" (default: Q8_0, ~46% smaller),
   // "exact" (keep file BF16/F16/F32), or "nvfp4" (NVFP4, ~70% smaller). Pre-quantized mmproj stays packed.
   std::string vision_quant = "q8";

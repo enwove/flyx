@@ -9,6 +9,7 @@
 #include "models/inkling2/inkling2.h"
 #include "models/llama/llama.h"
 #include "models/qwen35/qwen35.h"
+#include "models/qwen4exp/qwen4exp.h"
 
 namespace flyx::models {
 
@@ -490,6 +491,7 @@ struct ArchEntry {
 
 constexpr ArchEntry kArchitectures[] = {
     {"qwen35", qwen35::open, true, true, nullptr},
+    {"qwen4exp", qwen4exp::open, true, false, nullptr},
     {"qwen3", llama::open, true, false, "lora"},  // Llama's layer with q/k norms; their own adapters (a V-LoRA)
     {"llama", llama::open, false, false, "lora"},
     {"inkling2_loop", inkling2::open, true, false, nullptr},

@@ -25,11 +25,16 @@ class MappedFile {
   // Asks the system to read bytes offset .. offset + len - 1 from disk now, in large reads, rather than a page at a
   // time when they are first touched.  It may return before they are read (Linux) or after (Windows).
   void read_ahead(size_t offset, size_t len) const;
+  bool read_at(uint64_t offset, void* dst, size_t bytes) const;
 
  private:
   const uint8_t* data_ = nullptr;
   size_t size_ = 0;
+#ifdef _WIN32
+  intptr_t handle_ = -1;
+#else
   int fd_ = -1;
+#endif
 };
 
 // A file read and written at offsets by several threads at once (core/hub: each connection of a download writes the

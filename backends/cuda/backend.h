@@ -243,6 +243,7 @@ struct RowBufs {
   float* lora = nullptr;  // the target's adapters' first products (RowNeeds::lora a row; none without adapters)
   float* lora_part = nullptr;  // their slices' sums (lora_down_rows; RowNeeds::lora_part a row, kLoraEarlyRows rows)
   // Inkling-2 pass-local scratch (null for models without RelAttnBlock / MoeBlock).
+  float *hc_wide = nullptr, *hc_norm = nullptr, *hc_inject = nullptr;
   float *res_bank = nullptr, *prelude_cur = nullptr, *prelude_blocks = nullptr;
   float *loop_bank = nullptr, *loop_bank_out = nullptr, *loop_msg = nullptr;
   float *inp_saved = nullptr, *attn_in = nullptr;
@@ -275,6 +276,7 @@ struct RowNeeds {
   bool glu = false;                         // non-packed MLP weights (prefill gemm_glu_staged)
   int k_max = 0;                            // largest GEMM K: the scratch staging GEMM inputs is sized by it
   bool q8 = false;  // weights with inputs in 8 bits: a prefill scratch holds their GEMMs' runs of K side by side
+  int hc_streams = 0;
   int max_bank = 0, max_loop_rank = 0;      // Inkling-2 AttnRes bank depth & loop gate rank
   int rel_q = 0, max_rel_nh = 0, max_rel_extent = 0, sink = 0, kv_dim = 0, kv_dyn = 0;
   int moe_experts = 0, moe_topk = 0, moe_inter = 0;
