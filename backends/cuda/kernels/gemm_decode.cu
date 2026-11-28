@@ -163,8 +163,9 @@ __global__ void __launch_bounds__(128) k_gemm_rows(const float* __restrict__ x, 
 // chunks added in order, whatever the number of warps; chunk c is every
 // kSkinnyChunks-th pair of 32-value spans from pair c (interleaved: a block's
 // warps stream neighbouring spans of its rows, which DRAM serves faster than 16
-// streams a row apart; 1.2 -> 1.4 TB/s at K = 17408 on an RTX PRO 6000; by pairs,
-// as W12's lanes load a pair's bytes at once and keep them): every configuration
+// streams a row apart, 1.4 TB/s at K = 17408 on an RTX PRO 6000 against 1.2 for
+// contiguous chunks; by pairs, as W12's lanes load a pair's bytes at once and keep
+// them): every configuration
 // (tile, warps, unroll) gives bit-identical results, so a tuning table can
 // pick one per shape and row count freely.
 constexpr int kSkinnyChunks = 16;
