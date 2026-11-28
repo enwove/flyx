@@ -1034,6 +1034,7 @@ hub::ProgressFn make_progress_logger(const char* prefix, double interval_ms, hub
   auto last = std::make_shared<double>(0.0);
   return [prefix, interval_ms, hook = std::move(hook), last](const hub::Progress& p) {
     if (hook) hook(p);
+    if (!p.fetched) return;  // all of it in the cache: nothing fetched, nothing to say
     const double now = os::now_ms();
     if (now - *last < interval_ms && p.done < p.total) return;
     *last = now;

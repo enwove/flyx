@@ -192,6 +192,7 @@ struct Progress {
   uint64_t done = 0, total = 0;      // bytes of all the files asked for
   double bytes_per_s = 0;
   bool checking = false;             // hashing what came
+  bool fetched = false;              // a file had to come from the Hub (false: all of them were in the cache)
 };
 using ProgressFn = std::function<void(const Progress&)>;
 

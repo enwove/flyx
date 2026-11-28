@@ -39,6 +39,7 @@ struct Meter {  // bytes of all the files of one fetch, for its progress reports
   std::atomic<uint64_t> done{0};
   uint64_t total = 0;
   std::string file;
+  bool fetched = false;  // a file is being, or was, fetched (Progress::fetched)
   double last_ms = 0, rate = 0;
   uint64_t last_bytes = 0;
   void report(bool checking, bool force = false) {
@@ -50,7 +51,7 @@ struct Meter {  // bytes of all the files of one fetch, for its progress reports
       rate = rate > 0 ? 0.7 * rate + 0.3 * r : r;
     }
     last_ms = now, last_bytes = d;
-    fn(Progress{file, d, total, rate, checking});
+    fn(Progress{file, d, total, rate, checking, fetched});
   }
 };
 
@@ -822,6 +823,7 @@ bool fetch(const Repo& r, const std::vector<RepoFile>& files, std::vector<std::s
         if (!has_room(r, blobs, missing, err)) return false;
         checked_space = true;
       }
+      meter.fetched = true;
       if (!fetch_blob(r, *f, blob, &meter, stop, err)) return false;
     }
     if (!detail::place(blob, dst, err)) return false;
