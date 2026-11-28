@@ -5,9 +5,7 @@
 #pragma once
 
 #include "backends/cuda/kernels/kernels.cuh"
-#ifdef __CUDACC__
-#include "backends/cuda/kernels/common/device.cuh"
-#endif
+#include "backends/cuda/kernels/moe_act.cuh"
 #include "flyx/gemm_tables.inc"
 
 #ifndef FLYX_TUNE_CANDIDATES
@@ -16,26 +14,6 @@
 
 namespace flyx::cuda {
 
-#ifdef __CUDACC__
-// mact's activation (kernels.cuh MoeAct) of expert e's gate value g and up value u at column col of I, its biases
-// added first where it has them; SITU with no beta is SWIGLU.
-__device__ __forceinline__ float moe_act_val(const MoeAct& mact, float g, float u, int e, int col, int I) {
-  if (mact.bias) {
-    const float* br = mact.bias + size_t(e) * 2 * I;
-    g += br[col];
-    u += br[I + col];
-  }
-  if (mact.kind == FLYX_MOE_SWIGLU_OAI) {
-    const float gc = fminf(g, mact.b), uc = fminf(fmaxf(u, -mact.b), mact.b);
-    return (uc + 1.f) * gc * sigm(mact.a * gc);
-  }
-  if (mact.kind == FLYX_MOE_SITU && mact.a > 0.f) {
-    const float act = mact.a * tanhf(g / mact.a) * sigm(g);
-    return act * (mact.b > 0.f ? mact.b * tanhf(u / mact.b) : u);
-  }
-  return silu(g) * u;
-}
-#endif
 
 // Whether moe_dp4a configuration `cfg` (FLYX_MOE_DP4A) is compiled for block type `dtype`, op kind (`fused_gate_up`:
 // fused gate|up vs unfused gate|up or down), row band (`rows == 1` vs `rows > 1`), and compute capability `cc`

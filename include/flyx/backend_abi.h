@@ -30,7 +30,7 @@
 extern "C" {
 #endif
 
-#define FLYX_BACKEND_ABI_VERSION 56u
+#define FLYX_BACKEND_ABI_VERSION 57u
 #define FLYX_BACKEND_ENTRY "flyx_backend_get_api"
 /* How a backend library exports its entry. */
 #if defined(_WIN32)
@@ -166,13 +166,19 @@ typedef struct {
  * 0032).  models/ fills it from what the file says, so it is the same on
  * every backend and GPU; ops/ holds each rounding in float64. */
 typedef enum {
-  FLYX_ACT_FORMAT = 0,  /* the format's own: bf16 (bf16, F16, F32 and NVFP4 weights); binary16 over a row's
-                              power-of-two scale (GGML blocks) */
-  FLYX_ACT_Q8 = 1,      /* GGML blocks, every pass: 8-bit integers with a scale per 32 values (ops/dtype/ref.h:
-                              round_q8).  ABI 18: before, rounds (up to FLYX_MAX_ROWS rows) kept FORMAT */
-  FLYX_ACT_NVFP4 = 2,   /* NVFP4 weights, passes of more rows: NVFP4 as well (e2m1 values, an e4m3 scale per 16, a
-                              scale per row; ops/dtype/ref.h: round_nvfp4).  ABI 17: a backend built before would
-                              not know it and compute bf16 */
+  /* Each as PREFILL/DECODE: the inputs of passes of more than FLYX_MAX_ROWS rows / of rounds and shorter passes
+   * (--activations names them so). */
+  FLYX_ACT_FORMAT = 0,    /* the format's own in both: bf16 (bf16, F16, F32 and NVFP4 weights); binary16 over a row's
+                             power-of-two scale (GGML blocks) */
+  FLYX_ACT_Q8 = 1,        /* GGML blocks, q8/q8: 8-bit integers with a scale per 32 values (ops/dtype/ref.h:
+                             round_q8), llama.cpp's q8_1 */
+  FLYX_ACT_NVFP4_BF16 = 2,     /* NVFP4 weights, nvfp4/bf16: e2m1 values, an e4m3 scale per 16 and a scale per row
+                             (ops/dtype/ref.h: round_nvfp4), then bf16 */
+  FLYX_ACT_BF16 = 3,      /* MXFP4 weights, bf16/bf16: round_bf16 of the float32 values, the weights' values exact in
+                             bf16 as well (vLLM's MXFP4 experts, Marlin) */
+  FLYX_ACT_MXFP8 = 4,     /* MXFP4 weights, mxfp8/mxfp8: e4m3 values with a power-of-two scale per 32 (ops/dtype/ref.h:
+                             round_mxfp8) on block-scaled tensor cores (SGLang's, FlashInfer's CUTLASS kernels) */
+  FLYX_ACT_MXFP8_Q8 = 5,  /* MXFP4 weights, mxfp8/q8: FLYX_ACT_MXFP8's in prefill, FLYX_ACT_Q8's in rounds */
 } flyx_activations;
 
 /* Host memory in pieces of one size (ABI 22): bytes go piece after piece, so
@@ -972,7 +978,7 @@ typedef struct {
 typedef struct {
   char name[96];
   int32_t sm_major, sm_minor, sm_count;
-  /* Whether the backend computes NVFP4 inputs (FLYX_ACT_NVFP4) on this device (ABI 25): the engine opens a model
+  /* Whether the backend computes NVFP4 inputs (FLYX_ACT_NVFP4_BF16) on this device (ABI 25): the engine opens a model
    * whose file says NVFP4 inputs with bf16 ones where it does not. */
   int32_t fp4_inputs;
   uint64_t mem_total, mem_free;

@@ -144,6 +144,16 @@ void rows_to_bf16(const float* x, int ldx, int rows, int K, bf16* out, cudaStrea
 
 namespace {
 
+// Packed GGML blocks with the inputs the weight takes (flyx_weight::activations).
+BlockMat block_mat(const uint8_t* data, const uint16_t* scales, int dtype, int rows, int activations) {
+  BlockMat b{data, scales, dtype, rows};
+  b.q8 = activations == FLYX_ACT_Q8 || activations == FLYX_ACT_MXFP8_Q8;  // the latter's rounds
+  b.bf16 = activations == FLYX_ACT_BF16;
+  b.mxfp8 = activations == FLYX_ACT_MXFP8;
+  b.mxfp8_q8 = activations == FLYX_ACT_MXFP8_Q8;
+  return b;
+}
+
 // Gives back the certified head's copy (what of it was allocated: null fields were not).  Only the certified head's:
 // the copy option head_fp8 reads changes the logits and is the user's choice.
 void release_cert(flyx_bmodel* m, HeadBlock* h) {
@@ -917,7 +927,7 @@ ExpertMat WeightLoader::expert_mat(const std::vector<int>& ws) {
       times_.copy_s += t1 - t0;
       times_.pack_s += load_clock() - t1;
     }
-    em.blk = BlockMat{data, scales, v->dtype, int(total_rows), weights_[w].activations == FLYX_ACT_Q8};
+    em.blk = block_mat(data, scales, v->dtype, int(total_rows), weights_[w].activations);
     em.rs = upload_expert_scales();
     return experts_[ws] = em;
   }
@@ -1398,7 +1408,7 @@ VisionLin WeightLoader::vision_lin_stack(const std::vector<int>& ws, int* rows_o
     for (int w : ws)
       if (weights_[w].activations != weights_[ws[0]].activations)
         throw std::runtime_error(std::string(t(w)->name) + ": mixed activation rounding in vision stack");
-    vl.a4 = weights_[ws[0]].activations == FLYX_ACT_NVFP4;
+    vl.a4 = weights_[ws[0]].activations == FLYX_ACT_NVFP4_BF16;
     if (!host && !disk) {
       vl.w = lin_stack(ws);
       record_bytes(total_rows * K / 2 + total_rows * K / 16 + total_rows * sizeof(float));
@@ -1641,7 +1651,7 @@ BlockMat WeightLoader::pack_run(const std::vector<int>& ws, const std::vector<Ro
               scales + r_first * row_scales, host);
     r_first += size_t(t(ws[i])->shape[0]);
   }
-  return BlockMat{data, scales, first->dtype, int(total), weights_[ws[0]].activations == FLYX_ACT_Q8};
+  return block_mat(data, scales, first->dtype, int(total), weights_[ws[0]].activations);
 }
 
 void parallel_rows(size_t n, const std::function<void(size_t, size_t)>& fn) {

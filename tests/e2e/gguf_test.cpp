@@ -17,7 +17,7 @@
 //   W4A4 kernels, tiny_w4a4.flyx, a Qwen3.5 128 wide): the
 //   float64 backend's tokens, teacher forced, with the same prefill passes
 //   (the rounding depends on a pass's rows); asked for by name
-//   (--activations nvfp4) in a file that says bf16 inputs, the same tokens.
+//   (--activations nvfp4/bf16) in a file that says bf16 inputs, the same tokens.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -313,10 +313,28 @@ void gpt_oss(const std::string& dir, const std::string& backend) {
   const json golden = json::parse(f);
   auto plain = engine(path, backend), lookup = engine(path, backend, {.speculative = true, .drafter = "none",
                                                                       .lookup = true});
-  std::unique_ptr<Engine> unfused, ref;
+  auto plain_bf16 = engine(path, backend, {.activations = "bf16"});
+  auto lookup_bf16 = engine(path, backend, {.speculative = true, .drafter = "none", .activations = "bf16",
+                                            .lookup = true});
+  // MXFP8 inputs where the backend computes them (CUDA: sm_120's block-scaled tensor cores)
+  std::string no_mxfp8;
+  auto plain_mxfp8 = engine(path, backend, {.activations = "mxfp8"}, &no_mxfp8);
+  auto lookup_mxfp8 = plain_mxfp8 ? engine(path, backend, {.speculative = true, .drafter = "none",
+                                                       .activations = "mxfp8", .lookup = true})
+                              : nullptr;
+  if (!plain_mxfp8) std::printf("  skip MXFP8 inputs on %s: %s\n", backend.c_str(), no_mxfp8.c_str());
+  // MXFP8 in prefill passes, 8 bits in rounds
+  auto plain_mxfp8_q8 = plain_mxfp8 ? engine(path, backend, {.activations = "mxfp8/q8"}) : nullptr;
+  auto lookup_mxfp8_q8 = plain_mxfp8 ? engine(path, backend, {.speculative = true, .drafter = "none",
+                                                        .activations = "mxfp8/q8", .lookup = true})
+                               : nullptr;
+  std::unique_ptr<Engine> unfused, ref, ref_bf16, ref_mxfp8, ref_mxfp8_q8;
   if (backend != "cpu_ref") {
     unfused = engine(path, backend, {.options = "fusion=0"});
     ref = engine(path, "cpu_ref");
+    ref_bf16 = engine(path, "cpu_ref", {.activations = "bf16"});
+    ref_mxfp8 = engine(path, "cpu_ref", {.activations = "mxfp8"});
+    ref_mxfp8_q8 = engine(path, "cpu_ref", {.activations = "mxfp8/q8"});
   }
   for (const auto& item : golden.at("cases")) {
     auto p = item.at("prompt").get<std::vector<int32_t>>();
@@ -326,6 +344,15 @@ void gpt_oss(const std::string& dir, const std::string& backend) {
     check(tokens_of(*lookup, p, 24) == want, "tiny gpt_oss: prompt lookup's rounds give plain decoding's tokens");
     check(tokens_of(*lookup, p, 24, true) == tokens_of(*plain, p, 24, true),
           "tiny gpt_oss: prompt lookup preserves seeded sampling");
+    check(tokens_of(*lookup_bf16, p, 24) == tokens_of(*plain_bf16, p, 24),
+          "tiny gpt_oss, the experts' inputs in bf16: prompt lookup's rounds give plain decoding's tokens");
+    if (plain_mxfp8)
+      check(tokens_of(*lookup_mxfp8, p, 24) == tokens_of(*plain_mxfp8, p, 24),
+            "tiny gpt_oss, the experts' inputs in MXFP8: prompt lookup's rounds give plain decoding's tokens");
+    if (plain_mxfp8_q8)
+      check(tokens_of(*lookup_mxfp8_q8, p, 24) == tokens_of(*plain_mxfp8_q8, p, 24),
+            "tiny gpt_oss, the experts' inputs in MXFP8 in prefill, 8 bits in rounds: prompt lookup's rounds give "
+            "plain decoding's tokens");
     if (unfused) {
       check(tokens_of(*unfused, p, 24) == want, "tiny gpt_oss: fusion=0 gives the fused kernels' tokens");
       const auto ref_tokens = tokens_of(*ref, p, 24);
@@ -333,6 +360,18 @@ void gpt_oss(const std::string& dir, const std::string& backend) {
       // these prompts are not the golden cases' (no margin kept): where the reference's two best nearly tie
       check(agree >= 20, "tiny gpt_oss: teacher forced, the float64 backend's tokens at " + std::to_string(agree) +
                              " of 24 places (8-bit inputs)");
+      const int agree_bf16 = forced_agreement(*plain_bf16, p, tokens_of(*ref_bf16, p, 24));
+      check(agree_bf16 >= 20, "tiny gpt_oss, the experts' inputs in bf16: teacher forced, the float64 backend's "
+                              "tokens at " + std::to_string(agree_bf16) + " of 24 places");
+      if (plain_mxfp8) {
+        const int agree_mxfp8 = forced_agreement(*plain_mxfp8, p, tokens_of(*ref_mxfp8, p, 24));
+        check(agree_mxfp8 >= 20, "tiny gpt_oss, the experts' inputs in MXFP8: teacher forced, the float64 backend's "
+                               "tokens at " + std::to_string(agree_mxfp8) + " of 24 places");
+        const int agree_mxfp8_q8 = forced_agreement(*plain_mxfp8_q8, p, tokens_of(*ref_mxfp8_q8, p, 24));
+        check(agree_mxfp8_q8 >= 20, "tiny gpt_oss, the experts' inputs in MXFP8 in prefill, 8 bits in rounds: teacher "
+                                "forced, the float64 backend's tokens at " + std::to_string(agree_mxfp8_q8) +
+                                " of 24 places");
+      }
     }
   }
 }
@@ -1038,7 +1077,7 @@ void nvfp4_inputs(const std::string& dir, const std::string& backend) {
   const std::string path = dir + "/tiny_w4a4.flyx";
   if (!fp4_inputs_here(path, backend, "NVFP4 inputs").empty()) {  // what this checks needs FP4 tensor cores
     // Asked for by name where the device cannot compute them: refused at open, not bf16 inputs instead.
-    const std::string why = refusal(dir + "/tiny_w4a4_a16.flyx", backend, {.activations = "nvfp4"});
+    const std::string why = refusal(dir + "/tiny_w4a4_a16.flyx", backend, {.activations = "nvfp4/bf16"});
     check(why.find("cannot compute") != std::string::npos,
           "NVFP4 inputs asked for without FP4 tensor cores: refused (" + why + ")");
     return;
@@ -1073,10 +1112,10 @@ void nvfp4_inputs(const std::string& dir, const std::string& backend) {
   }
   auto spec = engine(path, backend, {.speculative = true, .prefill_chunk = 64});
   check(tokens_of(*plain, prompt, 32) == tokens_of(*spec, prompt, 32), "NVFP4 inputs: the MTP drafter changes nothing");
-  // Asked for by name (--activations nvfp4) in a file of the same weights that says bf16 inputs: the tokens of the
-  // file that says NVFP4, greedy and sampled; by default, that file's with --activations exact.
+  // Asked for by name (--activations nvfp4/bf16) in a file of the same weights that says bf16 inputs: the tokens of
+  // the file that says NVFP4, greedy and sampled; by default, that file's with --activations exact.
   const std::string a16 = dir + "/tiny_w4a4_a16.flyx";
-  auto asked = engine(a16, backend, {.prefill_chunk = 64, .activations = "nvfp4"});
+  auto asked = engine(a16, backend, {.prefill_chunk = 64, .activations = "nvfp4/bf16"});
   auto as_said = engine(a16, backend, {.prefill_chunk = 64});
   auto exact = engine(path, backend, {.prefill_chunk = 64, .activations = "exact"});
   for (bool sampling : {false, true}) {
@@ -1088,13 +1127,17 @@ void nvfp4_inputs(const std::string& dir, const std::string& backend) {
   }
   // Asked for where this backend cannot compute them, refused: 64-wide NVFP4 weights (the W4A4 kernels' tile of K is
   // 128). A model without NVFP4 weights gives what it gives without the word.
-  const std::string why = refusal(dir + "/tiny_nvfp4.flyx", backend, {.activations = "nvfp4"});
+  const std::string why = refusal(dir + "/tiny_nvfp4.flyx", backend, {.activations = "nvfp4/bf16"});
   check(why.find("a multiple of 128") != std::string::npos,
         "NVFP4 inputs asked for with K = 64: refused (" + why + ")");
   const std::vector<int32_t> short_prompt(prompt.begin(), prompt.begin() + 40);
-  check(tokens_of(*engine(dir + "/tiny.flyx", backend, {.prefill_chunk = 64, .activations = "nvfp4"}), short_prompt,
-                  16) == tokens_of(*engine(dir + "/tiny.flyx", backend, {.prefill_chunk = 64}), short_prompt, 16),
+  auto no_nvfp4 = engine(dir + "/tiny.flyx", backend, {.prefill_chunk = 64, .activations = "nvfp4/bf16"});
+  check(tokens_of(*no_nvfp4, short_prompt, 16) ==
+            tokens_of(*engine(dir + "/tiny.flyx", backend, {.prefill_chunk = 64}), short_prompt, 16),
         "NVFP4 inputs asked for without NVFP4 weights: the tokens without the word");
+  // PREFILL/DECODE: NVFP4 rounds are no mode of its (refused, naming the modes)
+  const std::string bare = refusal(path, backend, {.activations = "nvfp4"});
+  check(bare.find("nvfp4/bf16") != std::string::npos, "--activations nvfp4 (NVFP4 rounds too): refused (" + bare + ")");
 }
 void split_shards(const std::string& dir, const std::string& backend) {
   auto single = engine(dir + "/tiny_gguf.gguf", backend);

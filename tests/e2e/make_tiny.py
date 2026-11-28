@@ -871,7 +871,7 @@ def make_core(out: str):
     make_target(wdir, vocab, gen, gdn_dims=(32, 32), hidden=128, inter=256)
     make_nvfp4_dir(wdir, wq)
     convert(wq, os.path.join(out, "tiny_w4a4.flyx"), None, log=lambda *_: None, activations="nvfp4")
-    # The same weights in a file that says bf16 inputs: --activations nvfp4 gives it the first file's NVFP4 ones.
+    # The same weights in a file that says bf16 inputs: --activations nvfp4/bf16 gives it the first file's NVFP4 ones.
     convert(wq, os.path.join(out, "tiny_w4a4_a16.flyx"), None, log=lambda *_: None, activations="bf16")
     # Llama's attention without q/k norms (MiniCPM5's layers), with MiniCPM5's pre-tokenizer: no
     # drafter, golden from transformers.  Made last, so the random weights above stay what they were.

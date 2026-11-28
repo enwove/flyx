@@ -54,6 +54,8 @@ struct RefModel {
   std::unordered_set<const flyx_tensor_view*> q8;    // ... or, in every pass, as 8-bit integers with a scale per
                                                          // 32 values (FLYX_ACT_Q8)
   std::unordered_set<const flyx_tensor_view*> a4;    // NVFP4 weights whose inputs are NVFP4 in those passes
+  std::unordered_set<const flyx_tensor_view*> amxfp8;  // MXFP4 weights whose inputs are MXFP8 (FLYX_ACT_MXFP8)
+  std::unordered_set<const flyx_tensor_view*> amxfp8_q8;  // ... MXFP8 in passes of more rows, 8 bits in rounds
   mutable std::unordered_map<int, Vec> cache;
   int dflash = -1;  // the tapped drafter's block (DFlash2's, DSpine's or EAGLE-4's), -1: none
   int dspark = -1;  // the DSpark drafter block, -1: none
@@ -112,6 +114,9 @@ double residual_add(const RefModel* M, int rows, double x, double y) {
 void lin(const RefModel* M, int wi, const double* x, int rows, int K, int N, double* y, int gemm_rows) {
   const flyx_tensor_view* w = M->w(wi);
   if (M->q8.count(w)) flyx::ops::linear_a8(x, rows, K, w, N, y);
+  else if (M->amxfp8.count(w)) flyx::ops::linear_amxfp8(x, rows, K, w, N, y);
+  else if (M->amxfp8_q8.count(w) && gemm_rows > FLYX_MAX_ROWS) flyx::ops::linear_amxfp8(x, rows, K, w, N, y);
+  else if (M->amxfp8_q8.count(w)) flyx::ops::linear_a8(x, rows, K, w, N, y);
   else if (gemm_rows > FLYX_MAX_ROWS && M->a4.count(w)) flyx::ops::linear_a4(x, rows, K, w, N, y);
   else if (M->a16h.count(w)) flyx::ops::linear_a16h(x, rows, K, w, N, y);
   else if (M->a16.count(w)) flyx::ops::linear_a16(x, rows, K, w, N, y);
@@ -128,6 +133,9 @@ void lin_expert(const RefModel* M, int wi, int e, const double* x, int K, int N,
   slice.data = static_cast<const double*>(w->data) + size_t(e) * size_t(N) * size_t(K);
   slice.nbytes = uint64_t(N) * uint64_t(K) * sizeof(double);
   if (M->q8.count(w)) flyx::ops::linear_a8(x, 1, K, &slice, N, y);
+  else if (M->amxfp8.count(w)) flyx::ops::linear_amxfp8(x, 1, K, &slice, N, y);
+  else if (M->amxfp8_q8.count(w) && gemm_rows > FLYX_MAX_ROWS) flyx::ops::linear_amxfp8(x, 1, K, &slice, N, y);
+  else if (M->amxfp8_q8.count(w)) flyx::ops::linear_a8(x, 1, K, &slice, N, y);
   else if (gemm_rows > FLYX_MAX_ROWS && M->a4.count(w)) flyx::ops::linear_a4(x, 1, K, &slice, N, y);
   else if (M->a16h.count(w)) flyx::ops::linear_a16h(x, 1, K, &slice, N, y);
   else if (M->a16.count(w)) flyx::ops::linear_a16(x, 1, K, &slice, N, y);
@@ -1736,10 +1744,15 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       v->data = data->data();
       v->nbytes = data->size() * sizeof(double);
       m->W.push_back(v.get());
-      if (blocks) m->a16h.insert(v.get());
-      if (nvfp4 || q_fp4) m->a16.insert(v.get());
+      const bool bf16_in = blocks && w.activations == FLYX_ACT_BF16;  // MXFP4 weights asked for bf16 inputs
+      const bool mxfp8_in = blocks && w.activations == FLYX_ACT_MXFP8;  // ... or MXFP8 ones
+      const bool mxfp8_q8_in = blocks && w.activations == FLYX_ACT_MXFP8_Q8;  // ... in prefill, 8 bits in rounds
+      if (blocks && !bf16_in && !mxfp8_in && !mxfp8_q8_in) m->a16h.insert(v.get());
+      if (nvfp4 || q_fp4 || bf16_in) m->a16.insert(v.get());
+      if (mxfp8_in) m->amxfp8.insert(v.get());
+      if (mxfp8_q8_in) m->amxfp8_q8.insert(v.get());
       if ((blocks && w.activations == FLYX_ACT_Q8) || q_q8) m->q8.insert(v.get());
-      if (nvfp4 && w.activations == FLYX_ACT_NVFP4) m->a4.insert(v.get());
+      if (nvfp4 && w.activations == FLYX_ACT_NVFP4_BF16) m->a4.insert(v.get());
       m->owned.push_back(std::move(data));
       m->owned_views.push_back(std::move(v));
     }

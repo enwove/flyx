@@ -216,11 +216,11 @@ std::string engine_flags_help(int ctx) {
          "                       every round\n"
          "  --cycle I,J,...      measurements: launch these rounds in turn (indices into the rounds -v lists),\n"
          "                       no lookup round, instead of choosing\n"
-         "  --activations A      exact: every linear rounds its inputs as its format does everywhere; nvfp4: NVFP4\n"
-         "                       weights take NVFP4 inputs in prefill passes whatever the file says (a GPU with FP4\n"
-         "                       tensor cores); default: as the file has it (GGML block weights take 8-bit inputs,\n"
-         "                       NVFP4 weights NVFP4 ones in prefill passes on a GPU with FP4 tensor cores unless\n"
-         "                       the file says bf16)\n"
+         "  --activations P[/D]  the inputs of prefill passes / of rounds (D = P where left out): q8 (GGML\n"
+         "                       blocks, their default: llama.cpp's), bf16 or mxfp8 or mxfp8/q8 (MXFP4 experts: as\n"
+         "                       vLLM, as SGLang (sm_120), or SGLang's prefill with llama.cpp's rounds),\n"
+         "                       nvfp4/bf16 (NVFP4 weights' NVFP4 prefill whatever the file says), exact (every\n"
+         "                       format's own rounding everywhere); default: as the file has it\n"
          "  --chat-template F    a Jinja chat template file instead of the model's\n";
 }
 

@@ -144,9 +144,11 @@ class Tables {
   int head_block(int hidden, int vocab, int embed_block_idx, double norm_offset, double eps, const NameFn& n);
   int attn_block(const std::string& prefix, const AttnBlockSpec& s, const NameFn& n);
   int mlp_block(const std::string& prefix, int hidden, int inter, double norm_offset, double eps, const NameFn& n);
-  // How weights round their inputs: `how` (ModelOptions::activations) "" = as the file has it, "exact" = the
-  // formats' own rounding in every pass, "nvfp4" = NVFP4 weights take NVFP4 inputs in passes of more rows whatever
-  // the file says (other weights as the file has it); `declared` what the file says of its NVFP4 weights' inputs
+  // How weights round their inputs: `how` (ModelOptions::activations) PREFILL[/DECODE], the inputs of passes of more
+  // rows then of rounds (the same where left out): "" = as the file has it, "exact" = the formats' own rounding in
+  // every pass, "q8" = GGML blocks' 8 bits (their default), "nvfp4/bf16" = NVFP4 weights take NVFP4 inputs in passes of
+  // more rows whatever the file says, "bf16" / "mxfp8" / "mxfp8/q8" = MXFP4 weights take bf16, MXFP8, or MXFP8 then 8
+  // bits (other weights as the file has it); `declared` what the file says of its NVFP4 weights' inputs
   // ("bf16", "nvfp4", or "": NVFP4); `fp4_inputs` whether the device computes NVFP4 inputs (else bf16 ones by
   // default, asked for, NVFP4 ones, which the backend refuses). False with *err set for anything else.
   bool set_activations(const std::string& how, const std::string& declared, bool fp4_inputs, std::string* err);
@@ -161,6 +163,7 @@ class Tables {
   std::map<std::string, int> index_;
   bool exact_ = false;
   bool nvfp4_inputs_ = true;  // NVFP4 weights take NVFP4 inputs in passes of more rows
+  std::string mxfp4_inputs_;  // "bf16", "mxfp8", "mxfp8/q8": MXFP4 weights' inputs (FLYX_ACT_BF16, _MXFP8, _MXFP8_Q8)
 };
 
 // The engine's view of a model (core/interfaces/model.h) with the tables it is built from.

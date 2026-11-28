@@ -127,7 +127,7 @@ struct KernelOptions {
   bool lora_glu = true;       // the SwiGLU takes gate's and up's adapter products, for ranks of one lane (LoraGlu)
   bool log_shapes = false;    // the backend prints every GEMM shape once
   bool prefill_fp4 = false;   // NVFP4 weights in prefill GEMMs take NVFP4 activations (W4A4, sm_120a; gemm_w4a4):
-                              // set from the model's weights (FLYX_ACT_NVFP4), not an option
+                              // set from the model's weights (FLYX_ACT_NVFP4_BF16), not an option
   bool head_fp8 = false;      // the target's output head in FP8 (e4m3 per row; gemm_fp8_skinny)
   bool head_w12 = true;       // the target's output head in W12 for 1..16 rows (lossless; gemm_w12_skinny)
   bool rows_mma = true;       // decode and verification attention on tensor cores, binary16 caches (attention_rows_mma)
@@ -503,6 +503,10 @@ struct BlockMat {
   int dtype = 0;
   int rows = 0;
   bool q8 = false;                  // every pass takes its inputs in 8 bits (FLYX_ACT_Q8)
+  bool bf16 = false;                // every pass takes its inputs in bf16 (FLYX_ACT_BF16; MXFP4 experts)
+  bool mxfp8 = false;                 // ... in MXFP8 (FLYX_ACT_MXFP8; MXFP4 experts on sm_120a, moe_mxfp4_mxfp8.cu)
+  bool mxfp8_q8 = false;              // MXFP8 in passes of more than FLYX_MAX_ROWS rows, 8 bits in the others
+                                    // (FLYX_ACT_MXFP8_Q8)
 };
 // Builds the device tables the decoders read (ggml's codebooks as selectors
 // of their rows' magnitudes, bit fields and scales as binary16), once per
@@ -1980,6 +1984,24 @@ bool moe_round_bf16_down(const ExpertMat& W, int rows, int top_k, int K, const M
 int moe_gate_up(const float* x, int ldx, const ExpertMat& W, const int* eidx, int rows, int top_k, int I, int K,
                 const MoeAct& act, bool fuse_act, float* out, int ld_out, const MoeScratch* sc, const Launch& L,
                 bool q8_ready = false, bf16* act_bf16 = nullptr);
+// MXFP4 experts with MXFP8 inputs (FLYX_ACT_MXFP8) on sm_120a's block-scaled tensor cores (moe_mxfp4_mxfp8.cu; a stub
+// where sm_120 is not built): whether this device runs them, and the expert GEMM over the tasks sc holds (grouped by
+// moe_gate_up / moe_down, bm rows a task: moe_mxfp4_bm) of the inputs xa (e4m3 [rows][K]) with their scales xs (ue8m0
+// [rows][K/32]): is_down the down projection (to sc's down_buf), else gate | up, fuse_act its activation.
+bool moe_mxfp4_mxfp8_supported();
+void moe_mxfp4_mxfp8_mma(bool fuse_act, bool is_down, int bm, const uint8_t* xa, const uint8_t* xs, const ExpertMat& W,
+                   int N_work, int I_or_H, int K, const MoeScratch& sc, int max_tiles, int top_k, MoeAct mact,
+                   float* out, int ld_out, const Launch& L);
+// MXFP4 experts with bf16 inputs (FLYX_ACT_BF16) on the bf16 tensor cores (moe_mxfp4_bf16.cu): float32 rows staged as
+// bf16 with each 32-value block's values in the pairs (c, c + 16) (K a multiple of 32); the rows a task of the MXFP4
+// expert GEMMs (these and moe_mxfp4_mxfp8_mma) for `pairs` (row, expert) pairs over n_experts (16 or 32: the same
+// bits); and the expert GEMM over the tasks sc holds (grouped bm rows a task) of the staged rows xa [rows][K]: is_down
+// the down projection, else gate | up, fuse_act its activation.
+void moe_mxfp4_bf16_stage(const float* x, int ldx, int K, int rows, bf16* out, const Launch& L);
+int moe_mxfp4_bm(int pairs, int n_experts);
+void moe_mxfp4_bf16_mma(bool fuse_act, bool is_down, int bm, const bf16* xa, const ExpertMat& W, int N_work, int I_or_H,
+                    int K, const MoeScratch& sc, int max_tiles, int top_k, MoeAct mact, float* out, int ld_out,
+                    const Launch& L);
 // Weighted down-projection: out[r, n] (=|+=) sum_{k=0..top_k-1} ew[r, k] * (down_{eidx[r, k]}(act[r * top_k + k])[n]
 // + bias[eidx[r, k], n]) (bias [E, H], null: none).
 // act_bf16 (with moe_round_bf16_down): its input [rows*top_k, K] in bf16 already, read in place of act.

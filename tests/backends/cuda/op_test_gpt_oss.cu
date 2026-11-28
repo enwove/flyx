@@ -45,10 +45,28 @@ MoeScratch moe_scratch(int R, int top_k, int E, int H, int I) {
   return msc;
 }
 
-// The experts at (E, top_k, H, I), R rows, MXFP4 with 8-bit or binary16-pair inputs.
-void moe_case(int E, int top_k, int H, int I, int R, bool q8) {
+// How the experts take their inputs: binary16 pairs (the format's own), 8 bits (FLYX_ACT_Q8), bf16 (FLYX_ACT_BF16),
+// MXFP8 (FLYX_ACT_MXFP8), or MXFP8 in passes of more than FLYX_MAX_ROWS rows and 8 bits in the others
+// (FLYX_ACT_MXFP8_Q8).
+enum class In { a16h, q8, bf16, mxfp8, mxfp8_q8 };
+const char* in_name(In in) {
+  return in == In::q8 ? " q8" : in == In::bf16 ? " bf16" : in == In::mxfp8 ? " mxfp8"
+         : in == In::mxfp8_q8 ? " mxfp8/q8" : " a16h";
+}
+void round_in(In in, double* row, int K) {
+  if (in == In::q8) round_q8_row(row, K);
+  else if (in == In::bf16) for (int i = 0; i < K; ++i) row[i] = ops::round_bf16(row[i]);
+  else if (in == In::mxfp8) ops::round_mxfp8(row, K);
+  else ops::round_a16h(row, K);
+}
+
+// The experts at (E, top_k, H, I), R rows, MXFP4 with inputs as `in` says.
+void moe_case(int E, int top_k, int H, int I, int R, In in) {
   const float alpha = 1.702f, limit = 7.f;
-  seed("gpt_oss_moe", E, top_k, H, I, R, int(q8));
+  const bool q8 = in == In::q8 || in == In::mxfp8_q8;
+  // the rounding this pass's rows take
+  const In pass_in = in != In::mxfp8_q8 ? in : R > FLYX_MAX_ROWS ? In::mxfp8 : In::q8;
+  seed("gpt_oss_moe", E, top_k, H, I, R, int(in));
   const BlockType& bt = block_type(FLYX_DT_GGML_MXFP4);
   auto experts = [&](int N, int K, ExpertMat* out, Vec* f64) {
     const std::vector<uint8_t> raw = random_blocks(bt, size_t(E) * N * (K / 32));
@@ -58,6 +76,9 @@ void moe_case(int E, int top_k, int H, int I, int R, bool q8) {
     out->N = N;
     out->blk = up_blocks(FLYX_DT_GGML_MXFP4, raw, E * N);
     out->blk.q8 = q8;
+    out->blk.bf16 = in == In::bf16;
+    out->blk.mxfp8 = in == In::mxfp8;
+    out->blk.mxfp8_q8 = in == In::mxfp8_q8;
   };
   ExpertMat w_gu{}, w_dn{};
   Vec gu, dn;
@@ -77,7 +98,7 @@ void moe_case(int E, int top_k, int H, int I, int R, bool q8) {
   Vec want_act(size_t(R) * top_k * I), want_y(size_t(R) * H, 0.0);
   for (int r = 0; r < R; ++r) {
     Vec xr(x.begin() + ptrdiff_t(r) * H, x.begin() + ptrdiff_t(r + 1) * H);
-    q8 ? round_q8_row(xr.data(), H) : ops::round_a16h(xr.data(), H);
+    round_in(pass_in, xr.data(), H);
     for (int k = 0; k < top_k; ++k) {
       const int e = eidx[size_t(r) * top_k + k];
       Vec g(size_t(2) * I);
@@ -87,7 +108,7 @@ void moe_case(int E, int top_k, int H, int I, int R, bool q8) {
         a[size_t(i)] = ops::swiglu_oai(g[size_t(i)] + gu_b[size_t(e) * 2 * I + i],
                                         g[size_t(I + i)] + gu_b[size_t(e) * 2 * I + I + i], alpha, limit);
       std::copy(a.begin(), a.end(), want_act.begin() + ptrdiff_t(r * top_k + k) * I);
-      q8 ? round_q8_row(a.data(), I) : ops::round_a16h(a.data(), I);
+      round_in(pass_in, a.data(), I);
       Vec y(static_cast<size_t>(H));
       ops::linear_expert_f64(a.data(), I, dn.data(), e, H, y.data());
       for (int c = 0; c < H; ++c)
@@ -112,12 +133,15 @@ void moe_case(int E, int top_k, int H, int I, int R, bool q8) {
   const int grouped = moe_gate_up(d_x, H, w_gu, d_eidx, R, top_k, I, H, act, true, d_fused, I, &msc, TL);
   moe_down(d_fused, I, w_dn, d_eidx, d_ew, R, top_k, H, I, d_y, H, false, &msc, TL, nullptr, grouped, d_dnb);
   const std::string tag = "E " + std::to_string(E) + " k " + std::to_string(top_k) + " H " + std::to_string(H) +
-                          " I " + std::to_string(I) + " R " + std::to_string(R) + (q8 ? " q8" : " a16h");
+                          " I " + std::to_string(I) + " R " + std::to_string(R) + in_name(in);
   const Vec unfused = down(d_act, want_act.size()), fused = down(d_fused, want_act.size());
   expect("gpt-oss experts' activation " + tag, unfused, want_act, 5e-5);
   expect("gpt-oss experts' activation fused in the GEMM, as moe_act_rows' " + tag, fused, unfused, 0.0);
-  expect("gpt-oss experts' output " + tag, down(d_y, want_y.size()), want_y, 5e-5);
-  if (R > FLYX_MAX_ROWS) {  // the grouped MMA kernel's rows: the bits of each row alone (R = 1, dp4a)
+  // MXFP8: the down GEMM's inputs rounded from the float32 activations here, from float64 ones there: a value at an
+  // e4m3 tie of one is 2^-4 of itself off in the other
+  expect("gpt-oss experts' output " + tag, down(d_y, want_y.size()), want_y, pass_in == In::mxfp8 ? 1e-4 : 5e-5);
+  // the grouped MMA kernel's rows: the bits of each row alone (R = 1); not with MXFP8 in passes alone (8 bits alone)
+  if (R > FLYX_MAX_ROWS && in != In::mxfp8_q8) {
     float* d_act1 = dev<float>(size_t(top_k) * I);
     float* d_y1 = dev<float>(size_t(H));
     Vec act1(want_act.size()), y1(want_y.size());
@@ -288,11 +312,15 @@ void yarn_case() {
 
 void test_gpt_oss() {
   std::printf("gpt-oss (experts with biases and the clamped activation, attention with sinks and windows, YaRN)\n");
-  for (bool q8 : {true, false}) {
-    for (auto [H, I] : {std::pair{64, 96}, {64, 160}, {256, 192}}) {
-      for (int R : {1, 5, 37}) moe_case(4, 2, H, I, R, q8);
+  for (In in : {In::q8, In::a16h, In::bf16, In::mxfp8, In::mxfp8_q8}) {
+    if ((in == In::mxfp8 || in == In::mxfp8_q8) && !moe_mxfp4_mxfp8_supported()) {
+      std::printf("  skip MXFP8 inputs: no block-scaled tensor cores here (sm_120)\n");
+      continue;
     }
-    for (int R : {1, 3, 40}) moe_case(32, 4, 2880, 2880, R, q8);  // gpt-oss-20b's experts
+    for (auto [H, I] : {std::pair{64, 96}, {64, 160}, {256, 192}}) {
+      for (int R : {1, 5, 37}) moe_case(4, 2, H, I, R, in);
+    }
+    for (int R : {1, 3, 40}) moe_case(32, 4, 2880, 2880, R, in);  // gpt-oss-20b's experts
   }
   // Rounds and prefills, with and without sinks, the grouped kernel's 8 heads of 64 a KV head, and a sliding window of
   // 128 over a ring of 128 + a round's slots.

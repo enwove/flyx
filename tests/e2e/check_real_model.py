@@ -106,8 +106,8 @@ def main():
     ap.add_argument("--tokens", type=int, default=128)
     ap.add_argument("--quick", action="store_true", help="tokenizer and template checks only (no GPU)")
     ap.add_argument("--kv-fp8", action="store_true", help="run the engine with an FP8 K/V cache")
-    ap.add_argument("--activations", choices=("exact", "nvfp4"),
-                    help="exact: bf16 inputs for every matrix; nvfp4: NVFP4 weights take NVFP4 inputs in prefill "
+    ap.add_argument("--activations", choices=("exact", "nvfp4/bf16"),
+                    help="exact: bf16 inputs for every matrix; nvfp4/bf16: NVFP4 weights take NVFP4 inputs in prefill "
                          "passes whatever the file says (default: as the file has it; NVFP4 weights take bf16 ones "
                          "by themselves on a GPU without FP4 tensor cores)")
     ap.add_argument("--drafters", nargs="*", choices=("mtp", "dflash2", "dflash", "dspark", "dspine", "eagle4"),

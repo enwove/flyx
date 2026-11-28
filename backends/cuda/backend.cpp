@@ -586,7 +586,7 @@ bool parse_options(const char* text, BackendOptions* o, std::string* err) {
   return true;
 }
 
-// Whether the model's NVFP4 weights take NVFP4 inputs in passes of more than 16 rows (FLYX_ACT_NVFP4: the W4A4
+// Whether the model's NVFP4 weights take NVFP4 inputs in passes of more than 16 rows (FLYX_ACT_NVFP4_BF16: the W4A4
 // kernels): all of them or none, on a device that has those kernels, every K a multiple of 128 (their tile).
 // A contract this backend cannot compute fails here rather than turning into another one.
 bool nvfp4_inputs(const flyx_model_desc& desc, bool* on, std::string* err) {
@@ -594,7 +594,7 @@ bool nvfp4_inputs(const flyx_model_desc& desc, bool* on, std::string* err) {
   for (int i = 0; i < desc.n_weights; ++i) {
     const flyx_weight& w = desc.weights[i];
     if (!w.t || (w.t->dtype != FLYX_DT_NVFP4 && w.t->dtype != FLYX_DT_GGML_NVFP4)) continue;
-    if (w.activations != FLYX_ACT_NVFP4) {
+    if (w.activations != FLYX_ACT_NVFP4_BF16) {
       if (w.t->ndim == 2) ++without;  // 3D MoE experts always use bf16 activations (FLYX_ACT_FORMAT)
       continue;
     }
@@ -607,6 +607,23 @@ bool nvfp4_inputs(const flyx_model_desc& desc, bool* on, std::string* err) {
     return *err = "the model's NVFP4 weights take NVFP4 inputs, which this device or build cannot compute (use "
                   "--activations exact)", false;
   *on = with > 0;
+  return true;
+}
+
+// The weights that take bf16 or MXFP8 inputs (FLYX_ACT_BF16, FLYX_ACT_MXFP8, _MXFP8_Q8): MXFP4 experts alone,
+// which the bf16 tensor-core kernels (moe_mxfp4_bf16.cu) and the block-scaled ones (moe_mxfp4_mxfp8.cu, sm_120) take;
+// refused here otherwise rather than computed another way.
+bool mxfp4_inputs(const flyx_model_desc& desc, std::string* err) {
+  for (int i = 0; i < desc.n_weights; ++i) {
+    const flyx_weight& w = desc.weights[i];
+    const bool mxfp8 = w.activations == FLYX_ACT_MXFP8 || w.activations == FLYX_ACT_MXFP8_Q8;
+    if (!w.t || (w.activations != FLYX_ACT_BF16 && !mxfp8)) continue;
+    const char* what = w.activations == FLYX_ACT_BF16 ? "bf16" : "MXFP8";
+    if (w.t->dtype != FLYX_DT_GGML_MXFP4 || w.t->ndim != 3)
+      return *err = std::string(w.t->name) + ": " + what + " inputs on CUDA are MXFP4 experts' alone", false;
+    if (mxfp8 && !moe_mxfp4_mxfp8_supported())
+      return *err = "MXFP8 inputs need block-scaled tensor cores this device or build does not have (sm_120)", false;
+  }
   return true;
 }
 
@@ -684,6 +701,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     }
     if (!resolve_options(opts ? opts->options : nullptr, &m->opt, &err)) return fail("options: " + err);
     if (!nvfp4_inputs(*desc, &m->opt.kernels.prefill_fp4, &err)) return fail(err);
+    if (!mxfp4_inputs(*desc, &err)) return fail(err);
     if (m->opt.embed == 0) {
       // embed=auto: host memory frees the table's GPU memory for a few kilobytes of reads a token; where 32 GB stay
       // free after the weights the memory is not missed, and a prefill pass reads its rows faster on the GPU (the
@@ -730,16 +748,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     if (!m->opt.pdl_given) m->opt.kernels.pdl = gemm_tuning_pdl(m->opt.kernels.tuning);
     if (m->verbose) {
       const std::string table = gemm_tuning_label(m->opt.kernels.tuning, arch_cc, dev_cc);
-      int q8 = 0, a4 = 0;  // the weights' inputs, as their file says
-      for (int i = 0; i < desc->n_weights; ++i) {
-        q8 += desc->weights[i].activations == FLYX_ACT_Q8;
-        a4 += desc->weights[i].activations == FLYX_ACT_NVFP4;
-      }
-      std::string inputs = q8 ? std::to_string(q8) + " weights 8-bit (every pass)" : "";
-      if (a4) inputs += (q8 ? ", " : "") + std::to_string(a4) + " weights NVFP4 (prefill)";
-      if (inputs.empty()) inputs = "exact";
-      std::fprintf(stderr, "flyx-cuda: options %s; tuning table %s; inputs %s\n", describe(m->opt).c_str(),
-                   table.c_str(), inputs.c_str());
+      std::fprintf(stderr, "flyx-cuda: options %s; tuning table %s\n", describe(m->opt).c_str(), table.c_str());
     }
   }
   // The kernels' hard limits, before anything is allocated for the model.
@@ -761,7 +770,9 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
     make_draft_weights(m.get());
     t[3] = load_clock();
     m->need = row_needs(m.get());
-    for (int i = 0; i < desc->n_weights; ++i) m->need.q8 = m->need.q8 || desc->weights[i].activations == FLYX_ACT_Q8;
+    for (int i = 0; i < desc->n_weights; ++i)
+      m->need.q8 = m->need.q8 || desc->weights[i].activations == FLYX_ACT_Q8 ||
+                   desc->weights[i].activations == FLYX_ACT_MXFP8_Q8;
     // Prefill passes must start at multiples of the chunk to reproduce a longer pass (numerics.md: K).
     bool chunked = !m->states.gdn.empty();
     for (const GdnDims& gd : m->states.gdn) chunked = chunked && gdn_chunk_takes(gd);

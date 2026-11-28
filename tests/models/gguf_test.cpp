@@ -213,14 +213,15 @@ void fp4_inputs_by_device(const std::string& path) {
     return act;
   };
   const std::vector<int32_t> on = inputs(true), off = inputs(false);
-  check(std::count(on.begin(), on.end(), FLYX_ACT_NVFP4) > 0, path + ": NVFP4 inputs where the device computes them");
+  check(std::count(on.begin(), on.end(), FLYX_ACT_NVFP4_BF16) > 0,
+        path + ": NVFP4 inputs where the device computes them");
   bool same = !off.empty() && off.size() == on.size();
   for (size_t i = 0; same && i < on.size(); ++i)
-    same = off[i] == (on[i] == FLYX_ACT_NVFP4 ? FLYX_ACT_FORMAT : on[i]);
+    same = off[i] == (on[i] == FLYX_ACT_NVFP4_BF16 ? FLYX_ACT_FORMAT : on[i]);
   check(same, path + ": bf16 inputs for those weights alone where it does not");
 }
 
-// NVFP4 inputs asked for by name (--activations nvfp4): every NVFP4 weight takes them whatever its file says (bf16
+// NVFP4 inputs asked for by name (--activations nvfp4/bf16): every NVFP4 weight takes them whatever its file says (bf16
 // inputs, or GGML NVFP4 of a K no multiple of 128, which keeps bf16 ones by default) and whatever the device (its
 // backend refuses what it cannot compute), every other weight what it takes by default; the word a file says is only
 // the default. A model without NVFP4 weights is what it is without the word; an unknown word is refused.
@@ -242,18 +243,19 @@ void activations_asked(const std::string& dir) {
     return w;
   };
   auto nvfp4_inputs = [](const std::vector<Weight>& w) {
-    return int(std::count_if(w.begin(), w.end(), [](const Weight& x) { return x.inputs == FLYX_ACT_NVFP4; }));
+    return int(std::count_if(w.begin(), w.end(), [](const Weight& x) { return x.inputs == FLYX_ACT_NVFP4_BF16; }));
   };
   for (const char* name : {"tiny_w4a4_a16.flyx", "tiny_nvfp4.flyx", "tiny_nvfp4.gguf", "tiny_w4a4.flyx"}) {
     const std::string path = dir + "/" + name;
     std::string error;
-    const std::vector<Weight> asked = weights(path, "nvfp4", true, &error), as_said = weights(path, "", true, &error);
+    const std::vector<Weight> asked = weights(path, "nvfp4/bf16", true, &error);
+    const std::vector<Weight> as_said = weights(path, "", true, &error);
     bool same = !asked.empty() && asked.size() == as_said.size();
     int nvfp4 = 0;
     for (size_t i = 0; same && i < asked.size(); ++i) {
       const bool fp4 = asked[i].dtype == FLYX_DT_NVFP4 || asked[i].dtype == FLYX_DT_GGML_NVFP4;
       nvfp4 += fp4;
-      same = asked[i].dtype == as_said[i].dtype && asked[i].inputs == (fp4 ? FLYX_ACT_NVFP4 : as_said[i].inputs);
+      same = asked[i].dtype == as_said[i].dtype && asked[i].inputs == (fp4 ? FLYX_ACT_NVFP4_BF16 : as_said[i].inputs);
     }
     check(same && nvfp4 > 0, path + ": asked for, NVFP4 inputs for its " + std::to_string(nvfp4) +
                                  " NVFP4 weights, the others' as the file has them" +
@@ -269,20 +271,28 @@ void activations_asked(const std::string& dir) {
   };
   std::string error;
   const std::string a16 = dir + "/tiny_w4a4_a16.flyx";
-  check(same_weights(weights(a16, "nvfp4", false, &error), weights(a16, "nvfp4", true, &error)),
+  check(same_weights(weights(a16, "nvfp4/bf16", false, &error), weights(a16, "nvfp4/bf16", true, &error)),
         a16 + ": asked for, the same on a device without FP4 tensor cores (its backend refuses them)" +
             (error.empty() ? "" : " (" + error + ")"));
   for (const char* name : {"tiny.flyx", "tiny_q8.gguf"}) {
     const std::string path = dir + "/" + name;
     error.clear();
-    const std::vector<Weight> asked = weights(path, "nvfp4", true, &error);
+    const std::vector<Weight> asked = weights(path, "nvfp4/bf16", true, &error);
     check(same_weights(asked, weights(path, "", true, &error)) && nvfp4_inputs(asked) == 0,
           path + ": no NVFP4 weights, asked for or not the same inputs" + (error.empty() ? "" : " (" + error + ")"));
   }
-  error.clear();
-  const bool turned_down = weights(dir + "/tiny_w4a4.flyx", "fp4", true, &error).empty();
-  check(turned_down && error.find("exact, nvfp4") != std::string::npos,
-        "an unknown activations word: refused (" + error + ")");
+  // PREFILL[/DECODE]: a mode named once or twice is the same; a pair no backend computes (NVFP4 rounds) and an unknown
+  // word are refused, naming the modes
+  const std::string w4 = dir + "/tiny_w4a4.flyx";
+  check(same_weights(weights(w4, "q8/q8", true, &error), weights(w4, "q8", true, &error)) &&
+            same_weights(weights(w4, "nvfp4/bf16", true, &error), weights(w4, "", true, &error)),
+        "q8/q8 is q8; nvfp4/bf16 is what a file that says NVFP4 gives" + (error.empty() ? "" : " (" + error + ")"));
+  for (const char* word : {"fp4", "nvfp4", "bf16/q8", "mxfp8-prefill"}) {
+    error.clear();
+    const bool turned_down = weights(w4, word, true, &error).empty();
+    check(turned_down && error.find("PREFILL[/DECODE]") != std::string::npos,
+          std::string("activations '") + word + "': refused (" + error + ")");
+  }
 }
 
 // One drafter, two files: tiny.flyx's DFlash2 drafter as llama.cpp's GGUF file (arch "dflash", its own tensor

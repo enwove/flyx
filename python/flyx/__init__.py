@@ -159,8 +159,9 @@ class Engine:
                  vision_max_tokens: int = 0):
         """max_ctx: tokens, or "max": the model's own context, or the longest the GPU and host memory hold.
         width: drafts per round (0: chosen each round by the speculation controller).
-        activations: None (as the file has it), "exact" (every format's own rounding everywhere) or "nvfp4"
-        (NVFP4 weights take NVFP4 inputs in prefill passes whatever the file says).
+        activations: PREFILL[/DECODE] (docs/models.md, Precision), None as the file has it: "q8", "bf16", "mxfp8",
+        "mxfp8/q8" (gpt-oss's MXFP4 experts), "nvfp4/bf16" (NVFP4 weights' NVFP4 prefill whatever the file says) or
+        "exact" (every format's own rounding everywhere).
         kv: None (the model's: FP8, binary16 on Llama models), "fp8" or "16" (binary16, llama.cpp's).
         chat_template: a Jinja template's source (not a path), used instead of the model file's.
         drafter_file: drafters in files of their own, one path or a list: the MTP layer from a GGUF (unsloth's

@@ -170,7 +170,7 @@ inline uint8_t e4m3_nearest(float v) {
   const int up = q >= 16, m = int(q) - 8 * (1 + up);
   return uint8_t(std::min(((E + up + 7) << 3) | m, 0x7E));
 }
-// Round a row as NVFP4 weights hold their inputs in passes of more than FLYX_MAX_ROWS rows (FLYX_ACT_NVFP4,
+// Round a row as NVFP4 weights hold their inputs in passes of more than FLYX_MAX_ROWS rows (FLYX_ACT_NVFP4_BF16,
 // the W4A4 kernels): from the float32 values the kernels hold, one rounding (bf16 first before, a
 // second rounding, coarser than llama.cpp's); a row scale g = 6 * 448 / m (m the row's largest magnitude: every
 // block scale stays within e4m3); per 16 values an e4m3 scale s = nearest((b / 6) g) (b their largest magnitude)
@@ -209,6 +209,39 @@ inline void round_q8(const double* x, int K, int8_t* p, float* d) {
     d[g] = dg;
     const bool scaled = dg > 0.f && std::isfinite(dg);
     for (int i = 0; i < 32; ++i) p[32 * g + i] = scaled ? static_cast<int8_t>(std::nearbyint(a[i] / dg)) : int8_t(0);
+  }
+}
+
+// Round a row to MXFP8 (FLYX_ACT_MXFP8: MXFP4 weights asked for it, the block-scaled tensor cores' inputs): from the
+// float32 values the kernels hold, per 32 values a power of two 2^(s - 127), s = the exponent field of m (their
+// largest magnitude) less 8 (e4m3's largest binade, 448 = 1.75 2^8, OCP's), within [1, 254]; each value the nearest
+// e4m3 of value / 2^(s - 127), saturating at 448 (__NV_SATFINITE); q: K e4m3 bytes, s: K / 32 biased exponents.
+inline uint8_t mxfp8_exponent(float m) {
+  uint32_t bits;
+  std::memcpy(&bits, &m, sizeof bits);
+  return uint8_t(std::clamp(int((bits >> 23) & 0xFFu) - 8, 1, 254));
+}
+inline void round_mxfp8(const double* x, int K, uint8_t* q, uint8_t* s) {
+  for (int g = 0; g < K / 32; ++g) {
+    float a[32], m = 0.f;
+    for (int i = 0; i < 32; ++i) {
+      a[i] = static_cast<float>(x[32 * g + i]);
+      m = std::max(m, std::fabs(a[i]));
+    }
+    s[g] = mxfp8_exponent(m);
+    for (int i = 0; i < 32; ++i) {
+      const uint8_t c = e4m3_nearest(std::ldexp(std::fabs(a[i]), 127 - int(s[g])));
+      q[32 * g + i] = uint8_t(c | (a[i] < 0.f ? 0x80u : 0u));
+    }
+  }
+}
+// round_mxfp8 in place: each value as its e4m3 code times its group's power of two.
+inline void round_mxfp8(double* row, int K) {
+  std::vector<uint8_t> q(static_cast<size_t>(K)), s(static_cast<size_t>(K / 32));
+  round_mxfp8(row, K, q.data(), s.data());
+  for (int k = 0; k < K; ++k) {
+    const double v = e4m3_to_double(q[size_t(k)] & 0x7Fu);
+    row[k] = std::ldexp(q[size_t(k)] & 0x80u ? -v : v, int(s[size_t(k / 32)]) - 127);
   }
 }
 

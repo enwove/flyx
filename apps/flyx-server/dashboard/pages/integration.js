@@ -342,7 +342,7 @@ export function Integration({ active }) {
           <tr><td><code>--prefill-chunk N</code></td>${Td(String.raw`prompt rows per prefill pass (1024 to 4096 by free GPU memory)`)}</tr>
           <tr><td><code>--backend cuda|cpu_ref</code></td>${Td(String.raw`the GPU, or the float64 reference; <code>CUDA_VISIBLE_DEVICES</code> picks the GPU`)}</tr>
           <tr><td><code>--backend-opt K=V</code></td>${Td(String.raw`a backend option, repeatable (also <code>FLYX_BACKEND_OPTIONS</code>)`)}</tr>
-          <tr><td><code>--activations exact|nvfp4</code></td>${Td(String.raw`exact: every linear rounds its inputs as its format does; nvfp4: NVFP4 weights take NVFP4 inputs in prefill passes whatever the file says (a GPU with FP4 tensor cores)`)}</tr>
+          <tr><td><code>--activations PREFILL[/DECODE]</code></td>${Td(String.raw`the inputs of prefill passes, then of decoding rounds (the same where /DECODE is left out): q8 (GGML blocks, their default: llama.cpp's); bf16, mxfp8, mxfp8/q8 (gpt-oss's MXFP4 experts: as vLLM, as SGLang (sm_120), or SGLang's prefill with llama.cpp's decoding); nvfp4/bf16 (NVFP4 weights' NVFP4 prefill whatever the file says); exact (every format's own rounding)`)}</tr>
           <tr><td><code>--chat-template F</code></td>${Td(String.raw`a Jinja template file instead of the model's`)}</tr>
         </tbody></table>
       </section>
