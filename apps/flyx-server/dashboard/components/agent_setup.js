@@ -120,7 +120,7 @@ function PiSetup({ origin, model, context, outputLimit, keyed }) {
   };
   return html`
     <p>${t("Add the flyx provider to your Pi model configuration.")} <code>~/.pi/agent/models.json</code>
-      ${t("If PI_CODING_AGENT_DIR is set, use models.json in that directory.")}</p>
+      ${" "}${t("If PI_CODING_AGENT_DIR is set, use models.json in that directory.")}</p>
     <${CodeSnippet} text=${JSON.stringify({ providers: { flyx: provider } }, null, 2)}/>
     <p>${t("Start the agent in your project.")}</p>
     <${CodeSnippet} text="pi --provider flyx --model flyx-local"/>`;
@@ -145,7 +145,7 @@ function DeepSeekSetup({ origin, model, context, outputLimit, keyed, shell }) {
   const key = keyed ? "" : shell === "powershell" ? "$env:FLYX_LOCAL_KEY = 'flyx'\n" : "FLYX_LOCAL_KEY=flyx ";
   return html`
     <p>${t("Merge these plugin settings into your DeepSeek Harness headless profile.")} <code>~/.dsh/profiles/headless/cordis.patch.yml</code>
-      ${t("If DSH_HOME is set, look under that directory for profiles/headless/.")}</p>
+      ${" "}${t("If DSH_HOME is set, look under that directory for profiles/headless/.")}</p>
     <${CodeSnippet} text=${config}/>
     <p>${t("Run a task in your project. Replace the example prompt with your own.")}</p>
     <${CodeSnippet} text=${key + 'dsh headless "Say hello."'}/>`;
@@ -160,7 +160,7 @@ function CodexSetup({ origin, model, context, keyed }) {
   ];
   return html`
     <p>${t("Save this profile as")} <code>~/.codex/flyx.config.toml</code>.
-      ${t("If CODEX_HOME is set, save flyx.config.toml in that directory.")}</p>
+      ${" "}${t("If CODEX_HOME is set, save flyx.config.toml in that directory.")}</p>
     <${CodeSnippet} text=${config.join("\n")}/>
     <p>${t("Start the agent in your project.")}</p>
     <${CodeSnippet} text="codex --profile flyx"/>
