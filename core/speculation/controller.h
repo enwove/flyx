@@ -13,9 +13,10 @@
 
 namespace flyx {
 
-// What an engine's sessions' trees without a trunk gave a round, by round (tokens, the counts kept kKeep a round): the
-// means every reply's estimate of them starts from (SpecController::reply, a session's first reply too); and the
-// engine's credit (ms) for probing a drafter whose state follows its own rounds only.  Any thread.
+// What an engine's sessions' trees gave a round, by round (the counts kept kKeep a round): a tree without a trunk its
+// tokens, a tree with one what its branches added past its trunk (a round is of one kind or the other); the means every
+// reply's estimate of them starts from (SpecController::reply, a session's first reply too); and the engine's credit
+// (ms) for probing a drafter whose state follows its own rounds only.  Any thread.
 class SharedTokens {
  public:
   static constexpr double kKeep = 0.998;
