@@ -17,6 +17,12 @@ inline size_t size_mul(size_t a, size_t b) {
   return a * b;
 }
 
+// Pageable spill buffers share the device arena's final VMM allocation.
+inline size_t arena_padding(size_t device, size_t spill, size_t granularity) {
+  const size_t remainder = (device + spill) % granularity;
+  return remainder ? granularity - remainder : 0;
+}
+
 inline size_t checkpoint_align(size_t bytes) { return size_add(bytes, 255) & ~size_t(255); }
 
 }  // namespace flyx::cuda

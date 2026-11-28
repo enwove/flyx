@@ -290,7 +290,7 @@ bool Inkling2::build(const ModelFile& file, const ModelOptions& o, std::string* 
     if (ch.is_object() && ch.value("arch", "") == "clip")
       return *err = "an inkling2_loop model does not support a vision projector (--mmproj)", false;
     return *err = "companion file " + std::to_string(i + 1) +
-                  ": inkling2_loop takes only DSpark or DFlash2 companion drafters",
+                  ": inkling2_loop requires a supported companion drafter",
            false;
   }
 

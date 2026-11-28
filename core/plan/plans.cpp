@@ -95,9 +95,13 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
   };
   auto lower_given_trees = [&]() {
     for (int k : tree_widths()) {
-      if (probe_round(k, -1, true, &out->trees, true)) break;  // the backend has no tree rounds
+      if (auto why = probe_round(k, -1, true, &out->trees, true)) {
+        if (why->oom) return out->oom = true, *err = why->msg, false;
+        break;
+      }
       out->tree_widths.push_back(k);
     }
+    return true;
   };
   // A drafter that drafts nothing but trees (DV): its widths where the backend lowers them, each refused said
   // (cpu_ref has no tree rounds); none lowered, the rounds are the ones without it.  Pinned (a width asked for), its
@@ -193,13 +197,15 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
       for (int k : draft_tree_widths()) {
         if (model.drafts_trees(d)) break;  // its rounds are trees already
         if (model.widest_trees(d) && k != FLYX_MAX_ROWS - 1) continue;
-        if (probe_round(k, d, false, &out->rounds, true)) break;  // a drafter (or backend) that drafts no trees
+        if (auto why = probe_round(k, d, false, &out->rounds, true)) {
+          if (why->oom) return out->oom = true, *err = why->msg, false;
+          break;
+        }
         add(k, d);
         out->drafter_trees.back() = true;
       }
   if (pinned >= 0) {  // a drafter's rounds alone, pinned: no lookup rounds beside them
-    lower_given_trees();
-    return true;
+    return lower_given_trees();
   }
   if (given) {
     for (int k : given_widths()) {
@@ -207,11 +213,14 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
       out->given_widths.push_back(k);
     }
     for (int k : wide_given_widths()) {
-      if (probe_round(k, -1, true, &out->given, false)) break;  // the backend has no wide rounds
+      if (auto why = probe_round(k, -1, true, &out->given, false)) {
+        if (why->oom) return out->oom = true, *err = why->msg, false;
+        break;
+      }
       out->given_widths.push_back(k);
     }
   }
-  lower_given_trees();
+  if (!lower_given_trees()) return false;
   if (adaptive && fixed_width < 0 && model.drafters() > 0) {
     out->adaptive.assign(size_t(model.drafters()), nullptr);
     out->adaptive_checkpoints.resize(size_t(model.drafters()));
@@ -222,7 +231,9 @@ bool build(const flyx_backend_api* api, flyx_bmodel* bm, const interfaces::Model
       flyx_program rp{FLYX_PHASE_ROUND, cps.back(), cps.back() + 1, static_cast<int32_t>(rnd.size()), rnd.data(),
                       static_cast<int32_t>(cps.size()), cps.data(), model.draft_steps_cheap(d) ? 1 : 0};
       flyx_plan* plan = nullptr;
-      if (api->lower(bm, &rp, &plan) == 0 && plan) {
+      const int rc = api->lower(bm, &rp, &plan);
+      if (rc == FLYX_ERR_OOM) return out->oom = true, *err = std::string("lower adaptive: ") + api->last_error(), false;
+      if (rc == 0 && plan) {
         out->adaptive[size_t(d)] = plan;
         out->adaptive_checkpoints[size_t(d)] = cps;
       }

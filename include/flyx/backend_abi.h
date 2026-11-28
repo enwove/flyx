@@ -38,6 +38,7 @@ extern "C" {
 #else
 #define FLYX_BACKEND_EXPORT __attribute__((visibility("default")))
 #endif
+#define FLYX_SEQUENTIAL_TRUNK 7 /* trained chain used as the trunk of a sequential drafter tree */
 #define FLYX_MAX_ROWS 16       /* rows in one round: the anchor plus up to 15 drafts */
 #define FLYX_DSPINE_MAX_TOPK 16 /* the head's candidates DSpine's walk scores a row, at most (ABI 51) */
 /* Rows of a round whose drafts are given (a lookup round, ABI 36), where the backend lowers such plans: a copy of
@@ -424,8 +425,8 @@ typedef enum {
  * ABI 49: convolutions optional (conv_taps 0: attn_conv_* and mlp_conv_* are
  * -1), the block's first drafting row draft_from (1: rows 1.., 0: the anchor's
  * too, predicting the token after it: up to `block` drafts), sel_hid optional
- * (-1: the selector's score with a unit gate), and q8_weights (1: the model
- * asks its projections in Q8_0 beside a target of float weights).  ABI 52: the
+ * (-1: the selector's score with a unit gate), and q8_weights (a projection
+ * precision hint beside a target of float weights).  ABI 52: the
  * selector optional (sel_rank 0: sel_pred, sel_succ and sel_hid are -1, the
  * walk takes the head's top sel_topk by their logits alone; DFlash: one, each
  * row's best). */
@@ -442,7 +443,7 @@ typedef struct {
   float softcap;                       /* ABI 46: selector logit softcap (0 = none) */
   int32_t softcap_mode;                /* ABI 46: flyx_dflash2_softcap_mode */
   int32_t draft_from;                  /* ABI 49: the block's first row that drafts: 1, or 0 (the anchor's) */
-  int32_t q8_weights;                  /* ABI 49: 1: its projections Q8_0 beside a target of float weights */
+  int32_t q8_weights;                  /* ABI 49: beside float target weights, 0: backend chooses, 1: request Q8_0 */
 } flyx_dflash2_block;
 
 /* A DFlash2 layer: attention (q, k, v, o; q/k norms; rotary on all dims) and
@@ -483,7 +484,7 @@ typedef struct {
   int32_t gate, pred, prev;            /* [rank, code] */
   int32_t gate_bias;                   /* [rank] */
   int32_t kv;                          /* state: one cache per layer */
-  int32_t float_weights;               /* flyx_draft_weights beside a float target (AUTO, Q8, NVFP4) */
+  int32_t float_weights;               /* beside a float target: AUTO lets the backend choose, or request Q8 / NVFP4 */
 } flyx_dspine_block;
 
 /* A DSpine layer: attention (q, k, v, o; q/k norms; rotary on all dims), MLP, and the bridge's read [code, hidden]
@@ -528,7 +529,7 @@ typedef struct {
   int32_t cand_rank, n_cands;
   int32_t kv;                          /* state: its K/V cache */
   int32_t ring;                        /* state (width hidden): h per position */
-  int32_t float_weights;               /* flyx_draft_weights beside a float target (AUTO, Q8, NVFP4) */
+  int32_t float_weights;               /* beside a float target: AUTO lets the backend choose, or request Q8 / NVFP4 */
 } flyx_eagle4_block;
 
 /* The tree DV drafts (flyx_dv_block.tree; ops/draft/ref.h). */
@@ -992,7 +993,7 @@ typedef enum {
 
 /* Drafter linear weight precision policy (ABI 48). */
 typedef enum {
-  FLYX_DRAFT_WEIGHTS_AUTO  = 0, /* default: target-matched precision (e.g. Q8_0 beside packed targets, BF16 beside BF16) */
+  FLYX_DRAFT_WEIGHTS_AUTO  = 0, /* backend chooses precision for the drafter and target weights */
   FLYX_DRAFT_WEIGHTS_NVFP4 = 1, /* quantize float/wider drafter linears to NVFP4 (~4.5 bpw) when it shrinks VRAM */
   FLYX_DRAFT_WEIGHTS_Q8    = 2, /* quantize float drafter linears to Q8_0 (~8.5 bpw); pre-quantized stay packed */
   FLYX_DRAFT_WEIGHTS_EXACT = 3  /* keep drafter weights in file format (and uncompacted draft head) */

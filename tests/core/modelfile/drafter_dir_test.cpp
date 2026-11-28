@@ -12,6 +12,8 @@
 
 #include "core/modelfile/modelfile.h"
 #include "core/os/os.h"
+#include "models/drafters/directory.h"
+#include "core/interfaces/model.h"
 #include "nlohmann/json.hpp"
 #include "tests/common/check.h"
 
@@ -34,14 +36,16 @@ void same(const std::string& dir, const std::string& model, const std::string& p
   flyx::ModelFile a, b;
   if (!with(model, dir + "/" + published, &a) || !with(model, dir + "/" + file, &b)) return;
   const auto& da = a.header()["companions"][0], &db = b.header()["companions"][0];
+  auto selected = flyx::models::drafters::directory_draft(a.companion(0));
   auto want = db["draft"];
   if (!target_layers) want["target"]["layers"] = nullptr;
-  check(da.value("kind", "") == "drafter" && da["draft"] == want,
+  check(da.value("kind", "") == "drafter" && selected.config == want,
         published + ": the draft description python/convert wrote into " + file);
   int tensors = 0, differ = 0;
   for (auto it = db["tensors"].begin(); it != db["tensors"].end(); ++it, ++tensors) {
     const std::string name = flyx::ModelFile::companion_name(0, it.key());
-    const flyx_tensor_view *x = a.tensor(name), *y = b.tensor(name);
+    const auto it_view = selected.tensors.find(it.key());
+    const flyx_tensor_view *x = it_view == selected.tensors.end() ? nullptr : &it_view->second, *y = b.tensor(name);
     const bool equal = x && y && x->dtype == y->dtype && x->ndim == y->ndim && x->nbytes == y->nbytes &&
                        std::memcmp(x->shape, y->shape, sizeof x->shape) == 0 &&
                        std::memcmp(x->data, y->data, size_t(x->nbytes)) == 0;
@@ -62,6 +66,22 @@ int main(int argc, char** argv) {
   same(dir, model, "hf_draft", "tiny_draft.flyx", false);  // speculators' layout: the same drafter
   same(dir, model, "hf_dspine", "tiny_draft_dspine.flyx");   // DSpine, its stacked bridge tensors cut per layer
   same(dir, model, "hf_dspine1", "tiny_draft_dspine1.flyx");  // one layer: no early reads ([0, code, hidden])
+  {
+    flyx::ModelFile file;
+    if (!with(model, dir + "/hf_dspine", &file)) return 1;
+    auto raw = file.companion(0);
+    uint32_t bits = 0x80000000u;
+    flyx_tensor_view terminal{"selected_prefix_bridge.out.weight", FLYX_DT_F32, 1, {1}, &bits, sizeof(bits)};
+    for (auto it = raw.tensors.begin(); it != raw.tensors.end(); ++it)
+      if (flyx::models::drafters::inner_name(it->name) == terminal.name) { raw.tensors.erase(it); break; }
+    raw.tensors.push_back(terminal);
+    check(!flyx::models::drafters::directory_draft(raw).tensors.empty(), "negative floating zero is a zero terminal");
+    raw.tensors.back().dtype = FLYX_DT_I32;
+    bool rejected = false;
+    try { flyx::models::drafters::directory_draft(raw); }
+    catch (const std::runtime_error& e) { rejected = std::string(e.what()).find("floating point") != std::string::npos; }
+    check(rejected, "the integer with only its sign bit set is an invalid terminal projection");
+  }
   same(dir, model, "hf_dflash", "tiny_draft_dflash.flyx");    // DFlash: DFlash2's layers, no convolutions or selector
   same(dir, model, "hf_eagle4", "tiny_draft_eagle4.flyx");    // EAGLE-4: its layer, tap norms and candidate head
   same(dir, model, "hf_eagle4_window", "tiny_draft_eagle4_window.flyx");  // a sliding window
@@ -79,19 +99,24 @@ int main(int argc, char** argv) {
     fs::remove_all(tmp, ec);
     fs::copy(fs::path(dir) / "hf_draft", tmp, fs::copy_options::recursive, ec);
     check(!ec, "copy hf_draft fixture: " + ec.message());
+    int vocab = 0;
     {
       std::ifstream in(tmp / "config.json");
       auto cfg = nlohmann::json::parse(in);
       cfg["draft_vocab_size"] = nullptr;
+      vocab = cfg["transformer_layer_config"].at("vocab_size").get<int>();
+      cfg["transformer_layer_config"].erase("rope_parameters");
       cfg["transformer_layer_config"]["rope_theta"] = nullptr;
       std::ofstream out(tmp / "config.json", std::ios::binary | std::ios::trunc);
       out << cfg.dump();
     }
     {
       flyx::ModelFile f;
-      std::string err;
-      check(f.open(model, &err) && f.add(tmp.string(), &err),
-            "drafter config.json with explicit null draft_vocab_size and rope_theta loads: " + err);
+      if (with(model, tmp.string(), &f)) {
+        const auto draft = flyx::models::drafters::directory_draft(f.companion(0));
+        check(draft.config.at("target").at("vocab") == vocab && draft.config.at("rope_theta") == 10000.0,
+              "explicit null draft_vocab_size and rope_theta select the layer vocabulary and default theta");
+      }
     }
     {
       std::ofstream out(tmp / "config.json", std::ios::binary | std::ios::trunc);
@@ -123,7 +148,7 @@ int main(int argc, char** argv) {
       flyx::ModelFile f3;
       std::string err;
       const bool ok = f3.open(model, &err) && f3.add(tmp.string(), &err);
-      const auto draft = ok ? f3.header()["companions"][0]["draft"] : nlohmann::json::object();
+      const auto draft = ok ? flyx::models::drafters::directory_draft(f3.companion(0)).config : nlohmann::json::object();
       const auto taps = ok ? draft["taps"].get<std::vector<int>>() : std::vector<int>{};
       const int n_target = ok ? draft["target"]["layers"].get<int>() : -1;
       check(ok && taps == std::vector<int>({1, 2, n_target}) && draft.value("softcap", 0.0) == 30.0 &&
@@ -154,7 +179,13 @@ int main(int argc, char** argv) {
       }
       flyx::ModelFile f;
       std::string err;
-      check(f.open(model, &err) && !f.add(tmp.string(), &err) && err.find("DSpine") != std::string::npos,
+      const bool added = f.open(model, &err) && f.add(tmp.string(), &err);
+      flyx::interfaces::ModelOptions o;
+      o.drafter = "none";
+      check(added && flyx::interfaces::open_model(f, o, &err), "unselected directory skips unsupported semantics: " + err);
+      o.speculative = true;
+      o.drafter = "dspine";
+      check(added && !flyx::interfaces::open_model(f, o, &err) && err.find("DSpine") != std::string::npos,
             std::string("a DSpine config with ") + what + " refused: " + err);
     };
     refused("a negative refinement weight",

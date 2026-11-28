@@ -23,7 +23,6 @@ struct DrafterTraits {
   bool trees_by_default;  // its trees beside its chains pay on attention-only targets (drafts_trees_by_default)
   bool trees_beside_recurrence;  // ... on a gated delta net's too, whose tree recurrence a tree's rows run
   bool widest_trees;      // its trees are of FLYX_MAX_ROWS - 1 drafts only (EAGLE-4's: its chain and the branches)
-  flyx_draft_weights beside_float;  // its projections beside a float target (draft_weights_beside_float)
   // A block drafted at once whose drafts a small head then refines one at a time: a step costs little beside the
   // verify row its draft adds, so a round that stops may verify fewer drafts than it has (draft_steps_cheap).  Not a
   // sequential drafter's, whose step is a pass of a layer: with earlier checkpoints allowed Qwen3.8-27B's MTP rounds
@@ -40,33 +39,21 @@ struct DrafterInfo {
   const char* title;
   DrafterTraits traits;
 };
-// DSpark's trees and Q8_0 projections: Qwen3-8B bf16 with DeepSpec's dspark_qwen3_8b_block7 on an RTX PRO 6000,
-// DeepSpec's 9 datasets: trees 5.51 tokens a round against 5.01 for chains of 7; Q8_0 5.53 against 5.50 in bf16,
-// 384 against 362 tok/s.  DSpine's NVFP4 layers beside a BF16 target: Qwen3-8B on the same GPU at 15 drafts, the eight
-// prompt sets of docs/benchmarks.md section 6, a round 2-3% faster than with Q8_0 layers at most 1% fewer tokens a
-// round (its walk re-scores the head's top 16 through its bf16 bridge); DFlash2's lost 9% of their acceptance in NVFP4
-// there.  DFlash's Q8_0 projections: Qwen3-8B bf16 with z-lab's Qwen3-8B-DFlash-b16, DeepSpec's 9 datasets (512
-// tokens), 356.0 against 340.3 tok/s in bf16 at 5.00 tokens a round both.  DSpine drafts its block at most
-// (DrafterReach).  EAGLE-4's trees and NVFP4 layers beside a BF16 target: Qwen3.8-27B (a gated delta net) with
-// EAGLE-Corp's Qwen3.8-27B-EAGLE4 on an RTX PRO 6000, docs/benchmarks.md section 7: its trees of 15 chosen beside its
-// chains 134.7 tok/s over the 174 prompts against 126.2 for its chains alone; NVFP4 layers 1% fewer tokens a round
-// than bf16, rounds 7% cheaper.
 constexpr DrafterInfo kDrafters[] = {
     {Drafter::kMtp, interfaces::DrafterMode::kMtp, "MTP", {.sequential = true}},
     {Drafter::kDFlash2, interfaces::DrafterMode::kDFlash2, "DFlash2", {.block = true}},
     {Drafter::kDFlash, interfaces::DrafterMode::kDFlash, "DFlash",
-     {.block = true, .beside_float = FLYX_DRAFT_WEIGHTS_Q8}},
+     {.block = true}},
     {Drafter::kDSpark, interfaces::DrafterMode::kDSpark, "DSpark",
-     {.block = true, .trees_by_default = true, .beside_float = FLYX_DRAFT_WEIGHTS_Q8, .refines_by_step = true}},
+     {.block = true, .trees_by_default = true, .refines_by_step = true}},
     {Drafter::kDSpine, interfaces::DrafterMode::kDSpine, "DSpine",
-     {.block = true, .beside_float = FLYX_DRAFT_WEIGHTS_NVFP4}},
+     {.block = true}},
     {Drafter::kEagle4, interfaces::DrafterMode::kEagle4, "EAGLE-4",
      {.sequential = true,
       .tapped = true,
       .trees_by_default = true,
       .trees_beside_recurrence = true,
-      .widest_trees = true,
-      .beside_float = FLYX_DRAFT_WEIGHTS_NVFP4}},
+      .widest_trees = true}},
     {Drafter::kDv, interfaces::DrafterMode::kDv, "DV", {.tree_only = true}},
 };
 
@@ -110,7 +97,6 @@ bool drafts_trees_by_default(Drafter d, bool recurrent) {
   const DrafterTraits& t = drafter_traits(d);
   return t.trees_by_default && (!recurrent || t.trees_beside_recurrence);
 }
-flyx_draft_weights draft_weights_beside_float(Drafter d) { return drafter_traits(d).beside_float; }
 
 // Width ladder and intra-round adaptive stopping, driven by drafter traits + target structure:
 // - Sequential drafters (MTP, EAGLE-4): tensor-core aligned 1, 3, 5, 7, ..., max_drafts (<= 15).
@@ -159,11 +145,12 @@ std::vector<int> Model::adaptive_checkpoints(int d) const {
   return cps.size() > 1 ? cps : std::vector<int>{};
 }
 
+bool Model::drafts_sequentially(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).sequential; }
 bool Model::draft_steps_cheap(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).refines_by_step; }
 
 int Model::block_drafts(int d) const {
   const DrafterBlock& b = drafters_.at(size_t(d));
-  return drafter_traits(b.kind).sequential ? std::min(7, b.max_drafts) : b.max_drafts;
+  return drafter_traits(b.kind).sequential ? std::min(FLYX_SEQUENTIAL_TRUNK, b.max_drafts) : b.max_drafts;
 }
 
 bool Model::drafts_trees(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).tree_only; }
@@ -171,6 +158,20 @@ bool Model::drafts_trees(int d) const { return drafter_traits(drafters_.at(size_
 bool Model::widest_trees(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).widest_trees; }
 
 bool Model::restarts(int d) const { return drafter_traits(drafters_.at(size_t(d)).kind).tree_only; }
+
+std::vector<std::string> Model::drafter_fallbacks() const {
+  std::vector<std::string> modes;
+  bool tapped = false;
+  for (const auto& d : drafters_) {
+    if (tables_.blocks[size_t(d.block)].kind == FLYX_BLOCK_DSPARK) {
+      if (drafters_.size() > 1) modes.emplace_back(models::drafter_name(d.kind));
+    } else if (is_tapped_drafter(d.kind)) {
+      tapped = true;
+    }
+  }
+  if (tapped || drafters_.size() > 1) modes.emplace_back(models::drafter_name(Drafter::kMtp));
+  return modes;
+}
 
 void Model::add_drafter(Drafter kind, int block, DrafterReach reach) {
   drafters_.push_back({kind, block, reach.max_drafts, reach.stretch});
@@ -244,7 +245,7 @@ std::string declared_activations(const ModelFile& file) {
 }
 
 bool is_lora_companion(const ModelFile& file, int i) {
-  return file.header().at("companions").at(size_t(i)).value("kind", "") == "lora";
+  return file.companion_role(i) == ModelFile::CompanionRole::Lora;
 }
 
 CompanionLora find_lora(const ModelFile& file, const std::set<std::string>& linears, int layers) {
@@ -287,7 +288,7 @@ flyx_lora Tables::lora(const CompanionLora& l, const std::string& name, int64_t 
 int Tables::weight(const std::string& name, std::vector<int64_t> shape, const std::string& ggml_scale_name) {
   auto it = index_.find(name);
   if (it != index_.end()) return it->second;
-  const flyx_tensor_view* t = file_->tensor(name);
+  const flyx_tensor_view* t = tensor(name);
   if (!t) throw std::runtime_error("missing tensor " + name);
   bool same = t->ndim == int32_t(shape.size());
   for (size_t i = 0; same && i < shape.size(); ++i) same = t->shape[i] == shape[i];

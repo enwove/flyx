@@ -5,6 +5,7 @@
 // checkpoints, restores and rewinds as runtime/runner.cpp drives them.  The MTP layer's entries (a position behind the
 // sequence's) as a sliding-window layer's rows.
 #include "backends/cuda/runtime/window_ring.h"
+#include "backends/cuda/runtime/checked_size.h"
 #include "tests/common/check.h"
 
 #include <algorithm>
@@ -207,6 +208,12 @@ void rewinds() {
 }  // namespace
 
 int main() {
+  constexpr size_t gran = 2097152, spill = 78592;
+  for (size_t arena : {gran - spill, gran - spill + 1, gran}) {
+    const size_t forced = ((arena + spill + gran - 1) / gran) * gran;
+    check(arena + spill + flyx::cuda::arena_padding(arena, spill, gran) == forced,
+          "automatic pageable spill bounds the forced spill at the same granule");
+  }
   flyx::test::print_passes = true;
   slots();
   mtp_checkpoints();

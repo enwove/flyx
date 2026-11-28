@@ -44,10 +44,6 @@ bool is_tapped_drafter(Drafter d);
 // A drafter whose trees beside its chains pay on attention-only targets (DSpark's, EAGLE-4's), and on a target of
 // gated delta nets too where `recurrent` (EAGLE-4's): drafted by default there.
 bool drafts_trees_by_default(Drafter d, bool recurrent);
-// What a block drafter's projections are under draft_weights=auto beside a target of float weights:
-// AUTO (the backend's own: as its file has them), Q8_0 or NVFP4, as measured to pay.
-flyx_draft_weights draft_weights_beside_float(Drafter d);
-
 // What a drafter drafts a round, as its blocks say: the most as trained, and whether its block stretches past them up
 // to a round's rows (DFlash2's block: one shared mask token every row) or drafts its block at most.
 struct DrafterReach {
@@ -111,7 +107,15 @@ class Tables {
   using NameFn = std::function<std::string(const std::string&)>;
 
   explicit Tables(const ModelFile& file) : file_(&file) {}
-  bool has(const std::string& name) const { return file_->tensor(name) != nullptr; }
+  void add_view(const std::string& name, flyx_tensor_view view) {
+    auto it = views_.emplace(name, view).first;
+    it->second.name = it->first.c_str();
+  }
+  const flyx_tensor_view* tensor(const std::string& name) const {
+    auto it = views_.find(name);
+    return it == views_.end() ? file_->tensor(name) : &it->second;
+  }
+  bool has(const std::string& name) const { return tensor(name) != nullptr; }
   // A weight of this shape (NVFP4: the logical [N, K], with its scales).
   // Asking for the same tensor twice gives the same index.  Throws when the
   // tensor is missing or has another shape.  Optional `ggml_scale_name` binds
@@ -149,6 +153,7 @@ class Tables {
 
  private:
   const ModelFile* file_;
+  std::map<std::string, flyx_tensor_view> views_;  // model-owned names and slices of mapped directory tensors
   std::map<std::string, int> index_;
   bool exact_ = false;
   bool nvfp4_inputs_ = true;  // NVFP4 weights take NVFP4 inputs in passes of more rows
@@ -160,9 +165,12 @@ class Model : public interfaces::Model {
   const flyx_model_desc& desc() const override { return desc_; }
   int drafters() const override { return int(drafters_.size()); }
   const char* drafter_name(int d) const override { return models::drafter_name(drafters_[size_t(d)].kind); }
+  const char* drafter_title(int d) const override { return models::drafter_title(drafters_[size_t(d)].kind); }
+  std::vector<std::string> drafter_fallbacks() const override;
   const char* drafter() const override { return drafter_names_.c_str(); }
   std::vector<int> draft_widths(int d) const override;
   std::vector<int> adaptive_checkpoints(int d) const override;
+  bool drafts_sequentially(int d) const override;
   bool draft_steps_cheap(int d) const override;
   int block_drafts(int d) const override;
   int trained_ctx() const override { return trained_ctx_; }
@@ -199,7 +207,7 @@ class Model : public interfaces::Model {
   std::shared_ptr<const interfaces::VisionAdapter> vision_adapter_;
   std::vector<flyx_node> vision_nodes_;
   bool kv_fp8_by_default_ = true;         // FP8 where a real model of the family showed no visible drop
-  bool file_drafts_trees_ = false;        // the file holds DV or a block drafter drafting trees by default (DSpark)
+  bool file_drafts_trees_ = false;        // the target file holds DV
   bool draft_trees_by_default_ = false;   // its tapped drafter drafts trees by default (drafts_trees_by_default)
   bool verify_scales_with_width_ = false; // sparse-MoE targets whose verify cost climbs steeply with verify width
 

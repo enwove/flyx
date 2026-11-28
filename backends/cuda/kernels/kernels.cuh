@@ -960,7 +960,7 @@ __host__ __device__ inline int tree_slot(const TreeRows* t, int r, int base, int
 // slot); the node on the oracle's path, and the end of the trunk: the drafter's chain (each node's best child), kept in
 // the frontier so that the tree's first drafts are its chain's.
 // kEagleTrunk: the chain a tree's first drafts are (Model::block_drafts of a sequential drafter, 7)
-constexpr int kEagleSlots = FLYX_MAX_WIDE_ROWS, kEagleNodes = 512, kEagleBeamMax = 8, kEagleTrunk = 7;
+constexpr int kEagleSlots = FLYX_MAX_WIDE_ROWS, kEagleNodes = 512, kEagleBeamMax = 8, kEagleTrunk = FLYX_SEQUENTIAL_TRUNK;
 struct EagleTree {
   int n, f0, fn, oracle_node, trunk_node;
   int tok[kEagleNodes], parent[kEagleNodes], depth[kEagleNodes], slot[kEagleNodes];

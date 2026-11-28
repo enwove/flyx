@@ -654,7 +654,7 @@ int probe(flyx_device_info* out) {
   out->sm_count = prop.multiProcessorCount;
   out->fp4_inputs = gemm_w4a4_supported() ? 1 : 0;  // the FP4 tensor cores of sm_120, and a build with them
   size_t fr = 0, tot = 0;
-  cudaMemGetInfo(&fr, &tot);
+  if (!gpu_memory(&fr, &tot)) return fail("cannot query device memory");
   out->mem_free = fr;
   out->mem_total = tot;
   out->reserve_floor = device_reserve_floor();
@@ -692,7 +692,7 @@ int open_model(const flyx_model_desc* desc, const flyx_open_options* opts, flyx_
       for (int i = 0; i < desc->n_weights; ++i)
         if (desc->weights[i].t) weights += desc->weights[i].t->nbytes;
       size_t free_b = 0, total_b = 0;
-      const bool roomy = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess && free_b > weights &&
+      const bool roomy = gpu_memory(&free_b, &total_b) && free_b > weights &&
                          free_b - weights >= size_t(32) * 1000000000;
       cudaGetLastError();
       m->opt.embed = roomy ? 2 : 1;

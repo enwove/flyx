@@ -318,8 +318,13 @@ int device_stats(flyx_device_stats* out) {
   unsigned int v = 0;
   NvmlUtilization u{};
   if (n.utilization(n.dev, &u) == 0) out->util = int(u.gpu), out->mem_util = int(u.memory);
+#if defined(_WIN32)
+  size_t free = 0, total = 0;
+  if (gpu_memory(&free, &total)) out->mem_used = total - free, out->mem_total = total;
+#else
   NvmlMemory m{};
   if (n.memory(n.dev, &m) == 0) out->mem_used = m.used, out->mem_total = m.total;
+#endif
   if (n.temperature(n.dev, kTemperatureGpu, &v) == 0) out->temp_c = int(v);
   if (n.power(n.dev, &v) == 0) out->power_w = v / 1000.0;
   if (n.power_limit(n.dev, &v) == 0) out->power_limit_w = v / 1000.0;

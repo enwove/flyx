@@ -41,6 +41,9 @@ class Model {
   virtual int drafters() const = 0;
   // Drafter d's name, and all of them ("mtp+dflash2"; "none" without one): for logs and reports.
   virtual const char* drafter_name(int d) const = 0;
+  virtual const char* drafter_title(int d) const { return drafter_name(d); }
+  // Single-drafter subsets to try when the active configuration runs out of memory.
+  virtual std::vector<std::string> drafter_fallbacks() const { return {}; }
   virtual const char* drafter() const = 0;
   // The draft counts a round of drafter d may verify, ascending; the last is
   // the most it is worth in one round.  The engine lowers a round plan for
@@ -50,6 +53,8 @@ class Model {
   // Sorted verify checkpoints (subset of draft_widths(d)) for an intra-round
   // adaptive stopping plan on drafter d; empty disables adaptive plans for d.
   virtual std::vector<int> adaptive_checkpoints(int /*d*/) const { return {}; }
+  // A sequential drafter runs one step per draft, so stopping early saves the remaining steps.
+  virtual bool drafts_sequentially(int /*d*/) const { return false; }
   // Whether one more draft of drafter d costs little beside the verify row it adds (a block drafted at once and
   // refined a draft at a time): an adaptive round that stops may then verify fewer drafts than it has
   // (flyx_program::earlier_checkpoints).  Where a draft step is a pass of a layer, what is drafted is verified.
@@ -66,9 +71,7 @@ class Model {
   // Drafter d's trees beside its chains are of FLYX_MAX_ROWS - 1 drafts only (EAGLE-4's: its chain of 7 and the
   // branches beside it), none narrower.
   virtual bool widest_trees(int) const { return false; }
-  // The file holds a drafter whose rounds are trees (DV's always, DSpark's by default), whether or not it was asked
-  // for: the engine's default K/V method then reads every position with it or without, so that naming it changes no
-  // token (AGENTS.md gate 4).
+  // The target file requires exact reads even in plain decoding (embedded DV).
   virtual bool file_drafts_trees() const { return false; }
   // Draft trees (FLYX_DRAFT_TREE rounds beside the chains, the chooser taking them where they pay) unless the caller
   // says otherwise: a chosen drafter's whose trees verify more tokens a round than its chains on the targets it is

@@ -110,10 +110,16 @@ std::string model_drafters_str(const interfaces::Model& m) {
   return out;
 }
 
-bool model_has_drafter(const interfaces::Model& m, std::string_view name) {
-  for (int d = 0; d < m.drafters(); ++d)
-    if (name == m.drafter_name(d)) return true;
-  return false;
+std::string nvfp4_adjustment(const interfaces::Model& m) {
+  const char* title = nullptr;
+  int companions = 0;
+  for (int d = 0; d < m.drafters(); ++d) {
+    if (std::string_view(m.drafter_name(d)) == "mtp") continue;
+    ++companions;
+    title = m.drafter_title(d);
+  }
+  const std::string subject = companions == 1 ? std::string(title) + " drafter" : "Drafter";
+  return subject + " weights quantized to NVFP4 (4-bit) to save VRAM";
 }
 
 }  // namespace
@@ -632,17 +638,11 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   double t[7] = {os::now_ms()};
   if (!file_.open(path, err, opt_.allow_path)) return false;
   for (const std::string& f : opt_.drafter_files)
-    if (!file_.add(f, err, opt_.allow_path)) return false;
-  if (!opt_.lora_file.empty()) {
-    const int before = file_.companions();
-    if (!file_.add(opt_.lora_file, err, opt_.allow_path)) return false;
-    if (file_.header()["companions"][size_t(before)].value("kind", "") != "lora")
-      return *err = opt_.lora_file + ": not a LoRA adapter (a directory of adapter_config.json and "
-                                     "adapter_model.safetensors)",
-             false;
-  }
+    if (!file_.add(f, err, opt_.allow_path, ModelFile::CompanionRole::Drafter)) return false;
+  if (!opt_.lora_file.empty() && !file_.add(opt_.lora_file, err, opt_.allow_path, ModelFile::CompanionRole::Lora))
+    return false;
   if (opt_.vision && !opt_.mmproj_file.empty())
-    if (!file_.add(opt_.mmproj_file, err, opt_.allow_path)) return false;
+    if (!file_.add(opt_.mmproj_file, err, opt_.allow_path, ModelFile::CompanionRole::Projector)) return false;
   ReadAhead ahead(file_);  // until the load returns
   t[1] = os::now_ms();
   if (!tok_.load(file_, err)) return false;
@@ -691,11 +691,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   mo.fp4_inputs = device_.fp4_inputs != 0;
   model_ = interfaces::open_model(file_, mo, err);
   if (!model_) return false;
-  // Draft trees where the model's drafter takes them by default (DSpark), unless the caller said (--draft-trees,
-  // FLYX_DRAFT_TREES) or asked for strata attention, which reads chains only.
-  if (!opt_.draft_trees_given && opt_.speculative && model_->draft_trees_by_default() &&
-      tiers.method != FLYX_KV_STRATA)
-    opt_.draft_trees = true;
+  const bool requested_trees = opt_.draft_trees;
   if (opt_.vision && !opt_.mmproj_file.empty() && !model_->vision())
     return *err = "--mmproj " + opt_.mmproj_file + ": file is not a supported vision projector (mmproj)", false;
   if (opt_.verbose && device_.fp4_inputs == 0 && opt_.activations.empty()) {
@@ -824,7 +820,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     }
   }
 
-  // A drafter the caller named (--drafter mtp, dflash2, dspark, dv) is never skipped: a load that cannot keep it
+  // A drafter the caller named explicitly is never skipped: a load that cannot keep it
   // fails, as one without elastic loading does.  auto and all leave the drafters to the load.
   interfaces::DrafterMode asked_drafter = interfaces::DrafterMode::kAuto;
   const bool drafter_named = interfaces::parse_drafter_mode(opt_.drafter, &asked_drafter) &&
@@ -835,21 +831,10 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   // Ordered VRAM degradation ladder (each step preserves identical target output tokens):
   //   1) vision_device: gpu -> disk (frees 100% vision VRAM while keeping multimodal)
   //   2) draft_weights -> nvfp4 (when backend estimates meaningful VRAM savings >= 128 MiB and >= 10%)
-  //   3) drop heavy DFlash2 drafter while retaining DSpark beside it, or retaining or falling back to MTP
+  //   3) try the least expensive single-drafter alternative offered by the model
   //   4) drop remaining neural drafters, keeping zero-VRAM prompt lookup (or plain decoding if lookup is off)
   // Steps 3 and 4 only for drafters the load chose (drafter_named: none).
-  auto step_down = [&](bool comfort_only, const flyx_load_estimate* est) -> bool {
-    const bool has_mtp = model_has_drafter(*model_, "mtp");
-    const bool has_dspark = model_has_drafter(*model_, "dspark");
-    const bool has_dv = model_has_drafter(*model_, "dv");
-    // The block drafter in the registry's block slot (DFlash2's block, DFlash's, DSpine's or EAGLE-4's): the
-    // heaviest, its context cache growing with the context.
-    const char* block_title = nullptr;
-    for (const auto& [name, title] :
-         {std::pair{"dflash2", "DFlash2"}, {"dflash", "DFlash"}, {"dspine", "DSpine"}, {"eagle4", "EAGLE-4"}})
-      if (!block_title && model_has_drafter(*model_, name)) block_title = title;
-    const bool has_block = block_title != nullptr;
-
+  auto step_down = [&](bool comfort_only, const flyx_load_estimate* est, uint64_t free_vram, uint64_t total_vram) -> bool {
     if (!comfort_only && orig_has_vision && vdev == interfaces::VisionDeviceMode::kGpu) {
       vdev = interfaces::VisionDeviceMode::kDisk;
       opt_.vision_device = "disk";
@@ -859,37 +844,48 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     if (req_dw_valid && cur_dw != interfaces::DraftWeightsMode::kNvfp4 && est && meaningful_draft_savings(*est) &&
         (!comfort_only || req_dw == interfaces::DraftWeightsMode::kAuto)) {
       cur_dw = interfaces::DraftWeightsMode::kNvfp4;
-      const std::string detail = std::string(has_block ? block_title : has_dspark ? "DSpark" : "Drafter") +
-                                 (has_block || has_dspark ? " drafter" : "") +
-                                 " weights quantized to NVFP4 (4-bit) to save VRAM";
-      upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4", detail);
+      upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4", nvfp4_adjustment(*model_));
       return true;
     }
     if (comfort_only || drafter_named) return false;
-    // The drafters but one: the model opened with `keep` alone (its weights' precision as asked again).
-    auto keep_only = [&](const char* keep, const std::string& detail) {
-      interfaces::ModelOptions mo_keep = mo;
-      mo_keep.drafter = keep;
-      std::string probe_err;
-      auto kept = interfaces::open_model(file_, mo_keep, &probe_err);
-      if (!kept) return false;
-      opt_.drafter = keep;
-      model_ = std::move(kept);
+    // Price the model's single-drafter alternatives before giving up speculation.
+    std::unique_ptr<interfaces::Model> best;
+    uint64_t best_bytes = UINT64_MAX;
+    for (const auto& mode : model_->drafter_fallbacks()) {
+      interfaces::ModelOptions subset = mo;
+      subset.drafter = mode;
+      std::string why;
+      auto candidate = interfaces::open_model(file_, subset, &why);
+      if (!candidate) continue;
+      flyx_load_estimate estimate{};
+      auto oo = make_open_options();
+      if (req_dw == interfaces::DraftWeightsMode::kAuto) oo.draft_weights = FLYX_DRAFT_WEIGHTS_AUTO;
+      uint64_t bytes = UINT64_MAX;
+      if (api_->estimate_load &&
+          api_->estimate_load(&candidate->desc(), &oo, free_vram, total_vram, &estimate) == 0)
+        bytes = estimate.weights_bytes;
+      if (!best || bytes < best_bytes) {
+        best = std::move(candidate);
+        best_bytes = bytes;
+      }
+    }
+    if (best) {
+      std::string skipped;
+      for (int d = 0; d < model_->drafters(); ++d)
+        if (std::string_view(model_->drafter_name(d)) != best->drafter_name(0))
+          skipped += (skipped.empty() ? "" : "+") + std::string(model_->drafter_title(d));
+      model_ = std::move(best);
+      opt_.drafter = model_->drafter_name(0);
       if (req_dw == interfaces::DraftWeightsMode::kAuto) {
         erase_adj("draft_weights");
         cur_dw = req_dw;
       } else if (cur_dw == interfaces::DraftWeightsMode::kNvfp4) {
-        upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4",
-                   "Drafter weights quantized to NVFP4 (4-bit) to save VRAM");
+        upsert_adj("draft_weights", interfaces::draft_weights_name(req_dw), "nvfp4", nvfp4_adjustment(*model_));
       }
-      upsert_adj("drafter", orig_drafters_str, keep, detail);
+      upsert_adj("drafter", orig_drafters_str, opt_.drafter,
+                 skipped + " drafter skipped due to tight VRAM; running with " + model_->drafter_title(0));
       return true;
-    };
-    // DSpark beside the block drafter (--drafter all): the block drafter goes first, the larger of the two (its weights
-    // and its context cache, which grows with the context where DSpark's stays bounded).
-    const std::string skipped = std::string(has_block ? block_title : "") + " drafter skipped due to tight VRAM; ";
-    if (has_block && has_dspark && keep_only("dspark", skipped + "running with DSpark")) return true;
-    if (has_block && keep_only("mtp", skipped + (has_mtp ? "running with MTP" : "falling back to MTP"))) return true;
+    }
     if (model_->drafters() > 0) {
       interfaces::ModelOptions mo_none = mo;
       mo_none.drafter = "none";
@@ -947,12 +943,12 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
         const uint64_t hard_need = est.weights_bytes + reserve + est.min_runtime_bytes;
         const uint64_t comfort_need = hard_need + est.comfort_margin_bytes;
         if (hard_need > free_vram) {
-          if (!step_down(/*comfort_only=*/false, &est)) break;
+          if (!step_down(/*comfort_only=*/false, &est, free_vram, total_vram)) break;
           continue;
         }
         if (req_dw == interfaces::DraftWeightsMode::kAuto && cur_dw == interfaces::DraftWeightsMode::kAuto &&
             meaningful_draft_savings(est) && comfort_need > free_vram) {
-          if (step_down(/*comfort_only=*/true, &est)) continue;
+          if (step_down(/*comfort_only=*/true, &est, free_vram, total_vram)) continue;
         }
         break;
       }
@@ -961,13 +957,10 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
   t[4] = os::now_ms();
 
   int asked_ctx = 0;
-  // Trees a chosen drafter drafts by default beside auto's K/V reads (EAGLE-4's, whose file locks no exact reads as
-  // DV's and DSpark's do): its trees where the target's own switch (Engine::load's auto_from, or the backend's
-  // strata_from) leaves the whole context exact, which reads every position as FLYX_KV_READ_ALL does (the same bits
-  // below the switch); else its chains alone, strata's past the switch.  The switch is the target's either way, so
-  // naming the drafter changes no token (AGENTS.md gate 4).
-  const bool trees_by_switch = opt_.draft_trees && !opt_.draft_trees_given && tiers.method == FLYX_KV_AUTO;
   for (;;) {
+    opt_.draft_trees = requested_trees || (!opt_.draft_trees_given && opt_.speculative &&
+                                           model_->draft_trees_by_default() && tiers.method != FLYX_KV_STRATA);
+    const bool trees_by_switch = opt_.draft_trees && !opt_.draft_trees_given && tiers.method == FLYX_KV_AUTO;
     opt_.max_ctx = initial_max_ctx;
     plan::KvTiers attempt_tiers = tiers;
     const flyx_open_options oo = make_open_options();
@@ -1026,7 +1019,7 @@ bool Engine::load(const std::string& path, const EngineOptions& opt, std::string
     query_vram(&free_vram, &total_vram);
     flyx_load_estimate est{};
     const bool have_est = query_estimate(free_vram, total_vram, &est);
-    if (!step_down(/*comfort_only=*/false, have_est ? &est : nullptr) && !(opened && smaller_prefill())) {
+    if (!step_down(/*comfort_only=*/false, have_est ? &est : nullptr, free_vram, total_vram) && !(opened && smaller_prefill())) {
       *err = attempt_err;
       if (kept_for_drafter)
         *err += " Beside --drafter " + opt_.drafter + ", prefill passes stay " + std::to_string(prefill_chunk_) +

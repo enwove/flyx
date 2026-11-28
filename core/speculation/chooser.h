@@ -26,6 +26,7 @@
 #include <utility>
 #include <vector>
 
+#include "core/interfaces/model.h"
 #include "core/speculation/confidence.h"
 #include "core/speculation/controller.h"
 #include "core/speculation/lookup.h"
@@ -39,6 +40,11 @@ struct RoundChoice {
   int width = 0;          // drafts the round verifies (max width when adaptive)
   int drafter = -1;       // the drafter that drafts them (-1: none, or looked up)
   bool adaptive = false;  // run the drafter's intra-round adaptive stopping plan
+
+  // A parallel adaptive round pays for its full backbone even when it verifies a shorter chain.
+  bool measures_fixed_cost(const interfaces::Model& model) const {
+    return !adaptive || model.drafts_sequentially(drafter);
+  }
 };
 
 // One option a session can run on its next round, for joint scheduling across

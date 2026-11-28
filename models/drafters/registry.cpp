@@ -27,6 +27,13 @@ auto in_companion(int i, F fn) {
 
 }  // namespace
 
+DirectoryDraft directory_draft(const ModelFile::Contents& raw) {
+  const auto& kind = raw.header.at("draft").at("kind");
+  if (kind == "eagle4") return eagle4_directory(raw);
+  if (kind == "dspine") return dspine_directory(raw);
+  return dflash_directory(raw);
+}
+
 void DrafterRegistry::scan(const ModelFile& file, const TargetSpec& target, const MtpHooks* mtp, bool has_dv,
                            std::vector<int>* unclaimed) {
   *this = DrafterRegistry();
@@ -96,6 +103,11 @@ const DFlash2Spec& DrafterRegistry::ensure_dflash2_spec(const ModelFile& file, c
   if (i < 0) return dflash2_spec_.emplace(parse_dflash2_json(file, file.header().at("draft"), target, -1));
   const json& h = file.header().at("companions").at(size_t(i));
   return dflash2_spec_.emplace(in_companion(i, [&] {
+    if (directory_) {
+      const auto pred = directory_->tensors.find("draft.sel.pred");
+      return parse_dflash2_json(file, directory_->config, target, i,
+                                pred == directory_->tensors.end() ? nullptr : &pred->second);
+    }
     return GgufMeta::is_header(h) ? parse_dflash2_gguf(file, h, target, i)
                                   : parse_dflash2_json(file, h.at("draft"), target, i);
   }));
@@ -113,7 +125,7 @@ const DSpineSpec& DrafterRegistry::ensure_dspine_spec(const ModelFile& file, con
   const int i = block_companion_;
   if (i < 0) return dspine_spec_.emplace(parse_dspine_json(file.header().at("draft"), target, -1));
   return dspine_spec_.emplace(in_companion(i, [&] {
-    return parse_dspine_json(file.header().at("companions").at(size_t(i)).at("draft"), target, i);
+    return parse_dspine_json(directory_ ? directory_->config : file.header().at("companions").at(size_t(i)).at("draft"), target, i);
   }));
 }
 
@@ -122,7 +134,7 @@ const Eagle4Spec& DrafterRegistry::ensure_eagle4_spec(const ModelFile& file, con
   const int i = block_companion_;
   if (i < 0) return eagle4_spec_.emplace(parse_eagle4_json(file.header().at("draft"), target, -1));
   return eagle4_spec_.emplace(in_companion(i, [&] {
-    return parse_eagle4_json(file.header().at("companions").at(size_t(i)).at("draft"), target, i);
+    return parse_eagle4_json(directory_ ? directory_->config : file.header().at("companions").at(size_t(i)).at("draft"), target, i);
   }));
 }
 
@@ -131,6 +143,8 @@ void DrafterRegistry::validate_selected(const ModelFile& file, const std::vector
   int64_t stride = 0;
   for (Drafter kind : selected) {
     if (!is_tapped_drafter(kind)) continue;
+    if (kind == sources_.block && block_companion_ >= 0 && !file.companion(block_companion_).directory_config.is_null())
+      directory_ = in_companion(block_companion_, [&] { return directory_draft(file.companion(block_companion_)); });
     const int taps = kind == Drafter::kDSpark && sources_.dspark_gguf ? ensure_dspark_spec(file, target).block.n_taps
                      : kind == Drafter::kDSpine                     ? ensure_dspine_spec(file, target).block.n_taps
                      : kind == Drafter::kEagle4                     ? ensure_eagle4_spec(file, target).block.n_taps
@@ -181,6 +195,9 @@ int DrafterRegistry::attach(Drafter kind, const ModelFile& file, Tables& T, cons
     const DSparkSpec& spec = ensure_dspark_spec(file, target);
     return record(dspark_, build_dspark(T, file, spec, target), spec.taps, {spec.block.block - 1, false});
   }
+  if (directory_ && kind == sources_.block)
+    for (const auto& [name, view] : directory_->tensors)
+      T.add_view(ModelFile::companion_name(block_companion_, name), view);
   if (kind == Drafter::kEagle4) {  // a step a draft: a round's rows, as MTP's
     const Eagle4Spec& spec = ensure_eagle4_spec(file, target);
     return record(block_, build_eagle4(T, spec, target), spec.taps, {FLYX_MAX_ROWS - 1, false});

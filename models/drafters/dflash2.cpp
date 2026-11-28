@@ -1,6 +1,9 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 #include "models/drafters/dflash2.h"
 
+#include <algorithm>
+#include <cstring>
+#include <regex>
 #include <climits>
 #include <cmath>
 #include <map>
@@ -11,15 +14,12 @@
 #include "models/drafters/qwen3_layer.h"
 #include "models/gguf.h"
 
+#include "models/drafters/directory.h"
+
 namespace flyx::models::drafters {
 namespace {
 
 using nlohmann::json;
-
-std::string mismatch_msg(const TargetSpec& target) {
-  return "a drafter made for another model (this one: width " + std::to_string(target.hidden) + ", vocabulary " +
-         std::to_string(target.vocab) + ", " + std::to_string(target.layers) + " layers)";
-}
 
 // An arch "dflash" GGUF header: the drafter reads the target's embedding and head, so its width is the target's.
 void check_gguf_target(const GgufMeta& cm, const TargetSpec& target) {
@@ -38,8 +38,7 @@ int parse_softcap_mode(const std::string& mode) {
 
 // The rows of the selector's codebooks: a row a token, or a row a row of the target's padded embedding.  A file
 // without the tensor is refused by name when the block is built.
-int resolve_sel_vocab(const ModelFile& file, const std::string& pred_name, const TargetSpec& target) {
-  const flyx_tensor_view* t = file.tensor(pred_name);
+int resolve_sel_vocab(const flyx_tensor_view* t, const TargetSpec& target) {
   if (!t || t->ndim != 2) return target.vocab;
   if (t->shape[0] != target.vocab && t->shape[0] != target.padded_vocab())
     throw std::runtime_error(mismatch_msg(target));
@@ -104,61 +103,181 @@ void validate_dflash2_spec(DFlash2Spec* spec, const TargetSpec& target) {
   spec->tg2 = int(tg2);
 }
 
+// python/convert's canonical_dspark_config(config, target=None): DeepSpec's Qwen3DSparkModel.
+json dspark_config(const json& sc) {
+  const int64_t rank = sc.at("markov_rank").get<int64_t>();
+  std::string head = sc.at("markov_head_type").get<std::string>();
+  std::transform(head.begin(), head.end(), head.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+  if (rank <= 0 || head != "vanilla") throw std::runtime_error("DSpark: a vanilla Markov head (markov_rank > 0) is supported");
+  std::vector<int64_t> taps;
+  for (const auto& i : sc.at("target_layer_ids")) {
+    if (i.get<int64_t>() < 0) throw std::runtime_error("DSpark: a tap of the embedding (target layer -1) is not supported");
+    taps.push_back(i.get<int64_t>() + 1);
+  }
+  if (sc.contains("layer_types") && sc["layer_types"].is_array())
+    for (const auto& t : sc["layer_types"])
+      if (t != "full_attention") throw std::runtime_error("DSpark layer types: full attention is supported");
+  json d = layer_fields(sc);
+  d["kind"] = "dspark";
+  d["block"] = sc.at("block_size");
+  d["mask_token"] = sc.at("mask_token_id");
+  d["taps"] = taps;
+  d["conv_taps"] = 0;
+  d["conv_group"] = 1;
+  d["sel_rank"] = rank;
+  d["sel_topk"] = std::min<int64_t>(1024, sc.at("vocab_size").get<int64_t>());  // python/convert's DSPARK_CANDIDATES
+  d["window"] = 0;
+  d["draft_from"] = 0;
+  d["sel_gate"] = false;
+  d["target"] = {{"hidden", d["hidden"]}, {"vocab", sc.at("vocab_size")},
+                 {"layers", sc.value("num_target_layers", json())}};
+  return d;
+}
+// python/convert's canonical_draft_config(config, target=None).  DFlash (z-lab's DFlashDraftModel, what DFlash2 grew
+// from): DFlash2's block without convolutions (conv_taps 0) or selector (sel_rank 0, sel_topk 1: each row's draft the
+// head's best), block_size beside its dflash_config.
+json draft_config(const json& sc, const std::string& kind) {
+  if (kind == "dspark") return dspark_config(sc);
+  json dc, tl;
+  std::vector<int64_t> taps;
+  int64_t vocab, target_hidden;
+  json causal;  // null: causal where the layers slide (z-lab's code)
+  const bool dflash = kind == "dflash";
+  if (sc.contains("dflash_config")) {
+    if (kind != "dflash2" && !dflash)
+      throw std::runtime_error("drafter architectures " + sc.value("architectures", json::array()).dump() +
+                               ": no block drafter flyx reads");
+    dc = sc.at("dflash_config"), tl = sc;
+    for (const char* k : {"conv_kernel_size", "conv_group_size", "selector_rank", "selector_top_k"})
+      if (dflash && dc.contains(k)) throw std::runtime_error(std::string("DFlash drafter: DFlash2's ") + k);
+    // target_layer_ids name the layers whose outputs the drafter reads (hidden_states[id + 1] in z-lab's code), so
+    // every id is below the target's layer count.  A list that reaches num_target_layers counts the hidden states
+    // themselves instead (0 the embedding, the last the final norm's output): Inco's drafter for Inkling-2, whose
+    // ids [5, 23, 41, 48] of 48 visits its reference hands, as they are, to the capture DSpark's ids go to.
+    std::vector<int64_t> ids;
+    for (const auto& i : dc.at("target_layer_ids")) ids.push_back(i.get<int64_t>());
+    const json n_target = sc.value("num_target_layers", json());
+    const bool hidden_states =
+        n_target.is_number_integer() && std::find(ids.begin(), ids.end(), n_target.get<int64_t>()) != ids.end();
+    for (int64_t id : ids) taps.push_back(hidden_states ? id : id + 1);
+    vocab = tl.at("vocab_size").get<int64_t>(), target_hidden = tl.at("hidden_size").get<int64_t>();
+    causal = sc.value("is_causal", json());
+  } else {
+    if (sc.value("speculators_model_type", "") != "dflash2")
+      throw std::runtime_error("drafter type " + sc.value("speculators_model_type", json()).dump() +
+                               " is not supported (need dflash2)");
+    if (sc.value("sample_from_anchor", false)) throw std::runtime_error("sample_from_anchor=True is not supported");
+    dc = sc, tl = sc.at("transformer_layer_config");
+    for (const auto& i : sc.at("aux_hidden_state_layer_ids")) taps.push_back(i.get<int64_t>());
+    const json dv = sc.value("draft_vocab_size", json());
+    vocab = dv.is_number_integer() && dv.get<int64_t>() != 0 ? dv.get<int64_t>() : tl.at("vocab_size").get<int64_t>();
+    const json th = sc.value("target_hidden_size", json());
+    target_hidden = th.is_number() && th.get<int64_t>() != 0 ? th.get<int64_t>() : tl.at("hidden_size").get<int64_t>();
+    causal = false;
+  }
+  json d = layer_fields(tl);
+  d["kind"] = kind;
+  const int64_t layers = d["layers"].get<int64_t>();
+  std::vector<std::string> types;
+  if (tl.contains("layer_types") && tl["layer_types"].is_array() && !tl["layer_types"].empty())
+    types = tl["layer_types"].get<std::vector<std::string>>();
+  else
+    types.assign(size_t(layers), "full_attention");
+  int64_t window = 0;
+  auto all = [&](const char* t) { return std::all_of(types.begin(), types.end(), [&](const std::string& x) { return x == t; }); };
+  if (all("full_attention")) {
+    window = 0;
+  } else if (all("sliding_attention") && tl.value("sliding_window", json()).is_number() && tl["sliding_window"].get<int64_t>()) {
+    window = tl["sliding_window"].get<int64_t>();
+  } else {
+    throw std::runtime_error("draft layer types: all full or all sliding with one window");
+  }
+  const bool is_causal = causal.is_null() ? window > 0 : causal.get<bool>();
+  if (is_causal) throw std::runtime_error("causal DFlash2 layers are not supported (the block attends both ways)");
+  d["block"] = dflash ? sc.at("block_size") : dc.at("block_size");
+  d["mask_token"] = dc.at("mask_token_id");
+  d["taps"] = taps;
+  d["conv_taps"] = dflash ? json(0) : dc.value("conv_kernel_size", json(2));
+  d["conv_group"] = dflash ? json(1) : dc.value("conv_group_size", json(16));
+  d["sel_rank"] = dflash ? json(0) : dc.value("selector_rank", json(256));
+  d["sel_topk"] = dflash ? json(1) : dc.value("selector_top_k", json(16));
+  d["window"] = window;
+  d["draft_from"] = 1;
+  d["sel_gate"] = !dflash;
+  if (dc.contains("final_logit_softcapping") && dc["final_logit_softcapping"].is_number()) {
+    const double sc_val = dc["final_logit_softcapping"].get<double>();
+    if (!std::isfinite(sc_val) || sc_val < 0.0) throw std::runtime_error("draft final_logit_softcapping out of range");
+    if (sc_val > 0.0) d["softcap"] = sc_val;
+  }
+  if (dc.contains("selector_softcap_mode") && dc["selector_softcap_mode"].is_string()) {
+    const std::string sm = dc["selector_softcap_mode"].get<std::string>();
+    if (sm != "before_correction" && sm != "after_correction")
+      throw std::runtime_error("unsupported draft selector_softcap_mode: " + sm);
+    d["softcap_mode"] = sm;
+  }
+  d["target"] = {{"hidden", target_hidden}, {"vocab", vocab}, {"layers", sc.value("num_target_layers", json())}};
+  return d;
+}
+
 }  // namespace
 
-Drafter block_drafter_kind(const json& draft) {
-  const Drafter k = draft.is_object() ? drafter_named(draft.value("kind", "")) : Drafter::kNone;
-  return is_tapped_drafter(k) ? k : Drafter::kNone;
-}
-
-int config_int(const json& j, const char* key, const std::string& drafter) {
-  const auto& v = j.at(key);
-  if (!v.is_number_integer()) throw std::runtime_error("invalid " + drafter + " drafter config");
-  const int64_t n = v.get<int64_t>();
-  if (n < INT_MIN || n > INT_MAX) throw std::runtime_error("invalid " + drafter + " drafter config");
-  return int(n);
-}
-
-Qwen3BlockConfig parse_qwen3_block(const json& j, const TargetSpec& target, const std::string& title) {
-  Qwen3BlockConfig c;
-  c.hidden = config_int(j, "hidden", title);
-  c.layers = config_int(j, "layers", title);
-  c.n_heads = config_int(j, "n_heads", title);
-  c.n_kv = config_int(j, "n_kv", title);
-  c.head_dim = config_int(j, "head_dim", title);
-  c.inter = config_int(j, "inter", title);
-  c.block = config_int(j, "block", title);
-  c.mask_token = config_int(j, "mask_token", title);
-  for (int64_t t : j.at("taps").get<std::vector<int64_t>>()) {
-    if (t < 1 || t > target.layers)
-      throw std::runtime_error(title + " tap after layer " + std::to_string(t) + " of " +
-                               std::to_string(target.layers));
-    c.taps.push_back(int(t));
+// python/convert's _D_SKIP and _D_RULES: the drafter's tensor names as the engine knows them, or "" to leave out.
+// layers_only: a drafter without the convolutions and selector (DFlash's, DSpine's layers), whose names they are not.
+bool canonical_layer_tensor(const std::string& name, std::string* out, bool layers_only) {
+  static const std::regex skip(R"(^(embed_tokens\.|lm_head\.|verifier_norm\.|verifier_lm_head\.|t2d|d2t|mask_embedding|)"
+                               R"(confidence_head\.).*)");
+  static const std::vector<std::pair<std::regex, std::string>> rules = {
+      {std::regex(R"(fc\.weight)"), "fc"},
+      {std::regex(R"(hidden_norm\.weight)"), "hidden_norm"},
+      {std::regex(R"(norm\.weight)"), "norm"},
+      {std::regex(R"(layers\.(\d+)\.input_layernorm\.weight)"), "L$1.in_norm"},
+      {std::regex(R"(layers\.(\d+)\.post_attention_layernorm\.weight)"), "L$1.post_norm"},
+      {std::regex(R"(layers\.(\d+)\.self_attn\.(q|k|v|o)_proj\.weight)"), "L$1.attn.$2"},
+      {std::regex(R"(layers\.(\d+)\.self_attn\.(q|k)_norm\.weight)"), "L$1.attn.$2_norm"},
+      {std::regex(R"(layers\.(\d+)\.mlp\.(gate|up|down)_proj\.weight)"), "L$1.mlp.$2"},
+      {std::regex(R"(layers\.(\d+)\.(attention|mlp)_conv\.base_kernel)"), "L$1.$2_conv.base"},
+      {std::regex(R"(layers\.(\d+)\.(attention|mlp)_conv\.kernel_projection\.weight)"), "L$1.$2_conv.proj"},
+      {std::regex(R"(candidate_selector\.predecessor_codebook)"), "sel.pred"},
+      {std::regex(R"(candidate_selector\.successor_codebook)"), "sel.succ"},
+      {std::regex(R"(candidate_selector\.hidden_projection\.weight)"), "sel.hid"},
+      {std::regex(R"(markov_head\.markov_w1\.weight)"), "sel.pred"},  // DSpark: W1[previous token]
+      {std::regex(R"(markov_head\.markov_w2\.weight)"), "sel.succ"},  // W2: [vocab, rank]
+  };
+  const std::string inner = inner_name(name);
+  if (std::regex_match(inner, skip)) return out->clear(), true;
+  for (const auto& [re, fmt] : rules) {
+    if (layers_only && (fmt.find("conv") != std::string::npos || fmt.rfind("sel.", 0) == 0)) continue;
+    std::smatch m;
+    if (!std::regex_match(inner, m, re)) continue;
+    std::string s = m.format(fmt);
+    const size_t at = s.find("attention_conv");
+    if (at != std::string::npos) s.replace(at, 14, "attn_conv");
+    *out = s;
+    return true;
   }
-  c.theta = j.at("rope_theta").get<double>();
-  c.eps = j.at("eps").get<double>();
-  if (c.hidden <= 0 || c.hidden > kMaxWidth || c.layers <= 0 || c.layers > kMaxLayers || c.n_heads <= 0 ||
-      c.n_heads > kMaxHeads || c.n_kv <= 0 || c.n_heads % c.n_kv != 0 || c.head_dim <= 0 || c.head_dim % 2 != 0 ||
-      c.head_dim > kMaxHeadDim || c.inter <= 0 || c.inter > kMaxWidth || c.mask_token < 0 ||
-      c.mask_token >= target.padded_vocab() || !(c.eps > 0) || !std::isfinite(c.eps) || !(c.theta > 0) ||
-      !std::isfinite(c.theta) || c.taps.empty() || int64_t(c.taps.size()) * target.hidden > INT_MAX ||
-      int64_t(2) * c.layers * c.n_kv * c.head_dim > INT_MAX || int64_t(c.n_heads + 2 * c.n_kv) * c.head_dim > INT_MAX)
-    throw std::runtime_error("invalid " + title + " drafter config");
-  if (c.hidden != target.hidden)
-    throw std::runtime_error(title + " hidden size " + std::to_string(c.hidden) + " does not match the target's " +
-                             std::to_string(target.hidden));
-  return c;
+  return false;
 }
-
-void check_config_target(const json& j, const TargetSpec& target) {
-  if (block_drafter_kind(j) == Drafter::kNone) throw std::runtime_error(mismatch_msg(target));
-  if (!j.contains("target") || !j["target"].is_object()) return;
-  const json& t = j["target"];
-  const int tv = t.value("vocab", target.vocab);
-  const bool vocab_ok = tv == target.vocab || tv == target.padded_vocab();
-  const bool layers_ok = !t.contains("layers") || t["layers"].is_null() || t["layers"].get<int>() == target.layers;
-  if (t.value("hidden", target.hidden) != target.hidden || !vocab_ok || !layers_ok)
-    throw std::runtime_error(mismatch_msg(target));
+DirectoryDraft dflash_directory(const ModelFile::Contents& raw) {
+  DirectoryDraft out;
+  out.config = draft_config(raw.directory_config, raw.header.at("draft").at("kind"));
+  const auto& draft = out.config;
+  for (const auto& v : raw.tensors) {
+    std::string name;
+    if (!canonical_layer_tensor(v.name, &name, draft.at("kind") == "dflash"))
+      throw std::runtime_error("unknown draft tensor " + std::string(v.name));
+    if (!name.empty()) out.add(name, v);
+  }
+  for (const char* n : {"fc", "hidden_norm", "norm"}) out.require(n);
+  if (draft.at("sel_rank").get<int64_t>() > 0)
+    for (const char* n : {"sel.pred", "sel.succ"}) out.require(n);
+  if (draft.at("sel_gate").get<bool>()) out.require("sel.hid");
+  for (int64_t j = 0; j < draft.at("layers").get<int64_t>(); ++j) {
+    const std::string prefix = "L" + std::to_string(j) + ".";
+    require_layer(out, prefix);
+    if (draft.at("conv_taps").get<int64_t>() > 0)
+      for (const char* n : {"attn_conv.base", "attn_conv.proj", "mlp_conv.base", "mlp_conv.proj"}) out.require(prefix + n);
+  }
+  return out;
 }
 
 bool is_block_companion(const json& header) {
@@ -175,7 +294,8 @@ void check_made_for(const json& header, const TargetSpec& target) {
   else check_config_target(header.at("draft"), target);
 }
 
-DFlash2Spec parse_dflash2_json(const ModelFile& file, const json& j, const TargetSpec& target, int companion) {
+DFlash2Spec parse_dflash2_json(const ModelFile& file, const json& j, const TargetSpec& target, int companion,
+                               const flyx_tensor_view* selector) {
   check_config_target(j, target);
   DFlash2Spec spec{};
   spec.gguf = false;
@@ -198,7 +318,7 @@ DFlash2Spec parse_dflash2_json(const ModelFile& file, const json& j, const Targe
                        : FLYX_DFLASH2_SOFTCAP_BEFORE;
   const std::string pred_name =
       companion >= 0 ? ModelFile::companion_name(companion, "draft.sel.pred") : std::string("draft.sel.pred");
-  spec.sel_vocab = resolve_sel_vocab(file, pred_name, target);
+  spec.sel_vocab = resolve_sel_vocab(selector ? selector : file.tensor(pred_name), target);
   spec.kind = block_drafter_kind(j);
   // A DFlash2 file written before the two keys holds the block the converter still writes for DFlash2: drafts from
   // the row after the anchor's, a gated selector.  A DSpark file states both.
@@ -312,7 +432,7 @@ DFlash2Spec parse_dflash2_gguf(const ModelFile& file, const json& header, const 
   d.mask_token = mask_token;
 
   const std::string pred_name = ModelFile::companion_name(companion, "selector_predecessor.weight");
-  spec.sel_vocab = resolve_sel_vocab(file, pred_name, target);
+  spec.sel_vocab = resolve_sel_vocab(file.tensor(pred_name), target);
   validate_dflash2_spec(&spec, target);
   return spec;
 }
@@ -352,7 +472,6 @@ int build_dflash2(Tables& T, const DFlash2Spec& spec, const TargetSpec& target) 
   d.sel_pred = selector ? T.weight(dn("draft.sel.pred"), {spec.sel_vocab, d.sel_rank}) : -1;
   d.sel_succ = selector ? T.weight(dn("draft.sel.succ"), {spec.sel_vocab, d.sel_rank}) : -1;
   d.sel_hid = spec.sel_gate ? T.weight(dn("draft.sel.hid"), {d.sel_rank, H}) : -1;  // -1: a unit gate
-  d.q8_weights = draft_weights_beside_float(spec.kind) == FLYX_DRAFT_WEIGHTS_Q8;
   d.kv = draft_kv_state(T, layers, d.n_kv, d.head_dim);
   flyx_block b{};
   b.kind = FLYX_BLOCK_DFLASH2;

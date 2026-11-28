@@ -5,6 +5,7 @@
 // 3. Session::tokenize() must not match an empty history_text_ against every subsequent prompt.
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -27,6 +28,15 @@ int32_t g_tracked_pos = 0;
 int32_t g_max_ctx = 64;
 bool g_oob_launch = false;
 bool g_fail_rewind = false;
+
+const Engine* sharing_during_launch = nullptr;
+int interrupt_launch(flyx_plan* p, flyx_seq* s, const flyx_gen_params* g) {
+  if (sharing_during_launch) {
+    sharing_during_launch->generation_began();
+    sharing_during_launch->generation_ended();
+  }
+  return g_cpu->launch(p, s, g);
+}
 
 int hook_prefill(flyx_plan* p, flyx_seq* s, const int32_t* t, int32_t n, const flyx_gen_params* g) {
   g_tracked_pos += n;
@@ -310,7 +320,9 @@ void test_empty_history_text_tokenize(const char* model, const flyx_backend_api*
 // lookup, one in flight (each launched with none ahead of it, timed from its launch), and MTP's rounds besides.
 void test_round_costs_learned(const char* model, const flyx_backend_api* cpu) {
   g_cpu = cpu;
-  flyx_test_delegate(cpu);
+  auto delegated = *cpu;
+  delegated.launch = interrupt_launch;
+  flyx_test_delegate(&delegated);
   EngineOptions eo;
   eo.backend = "test-host-kv";
   eo.max_ctx = 512;
@@ -341,6 +353,29 @@ void test_round_costs_learned(const char* model, const flyx_backend_api* cpu) {
     for (size_t k = 0; costs && k < costs->size(); ++k) c.push_back(costs->cost(k, at));
     return c;
   };
+  for (const char* name : {"dspark", "dflash2"}) {
+    Engine parallel;
+    EngineOptions block = eo;
+    block.drafter = name;
+    const auto path = block.drafter == "dspark" ? std::filesystem::path(model).parent_path() / "tiny_dspark.flyx"
+                                                : std::filesystem::path(model);
+    if (!parallel.load(path.string(), block, &err)) { check(false, err); return; }
+    RoundChoice round;
+    round.drafter = 0;
+    check(round.measures_fixed_cost(parallel.model()), block.drafter + " fixed rounds teach fixed costs");
+    round.adaptive = true;
+    check(!round.measures_fixed_cost(parallel.model()), block.drafter + " adaptive rounds pay for the full block");
+  }
+  RoundChoice sequential;
+  sequential.drafter = 0;
+  sequential.adaptive = true;
+  check(sequential.measures_fixed_cost(engine.model()), "stopped MTP rounds teach the verified width's cost");
+  // A wide round's calibrated price can stay at its narrower neighbour's floor even after an observation.
+  // Start below the duration of a cpu_ref round so every timed sample changes the price deterministically.
+  for (RoundCosts* costs : {engine.lookup_costs(), engine.round_costs()}) {
+    if (!costs) { check(false, "missing learned cost table"); return; }
+    costs->reset(std::vector<double>(costs->size(), 0.001), nullptr, 0);
+  }
   const std::vector<double> lookup_before = costs_of(engine.lookup_costs()), before = costs_of(engine.round_costs());
   GenerateResult res;
   const int rc = generate(s, rq, [](std::string_view, const int32_t*, int) { return true; }, &res, &err);
@@ -378,6 +413,11 @@ void test_round_costs_learned(const char* model, const flyx_backend_api* cpu) {
               std::to_string(gb.result().usage.new_tokens) + " tokens" + (ga.failed() ? ", " + ga.error() : "") +
               (gb.failed() ? ", " + gb.error() : ""));
   }
+  sharing_during_launch = &engine;
+  const int interrupted = generate(a, rq, [](std::string_view, const int32_t*, int) { return true; }, &res, &err);
+  sharing_during_launch = nullptr;
+  check(interrupted == 0 && res.usage.rounds > 2 && costs_of(engine.round_costs()) == shared &&
+            costs_of(engine.lookup_costs()) == lookup_shared, "overlap entirely inside backend launch excludes its timing");
   check(engine.generations() == 0, "none under way after");
   check(costs_of(engine.round_costs()) == shared && costs_of(engine.lookup_costs()) == lookup_shared,
         "two generations at once: no round's cost learned");

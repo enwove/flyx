@@ -14,6 +14,7 @@
 #include "core/modelfile/modelfile.h"
 #include "flyx/backend_abi.h"
 #include "models/drafters/dflash2.h"
+#include "models/drafters/directory.h"
 #include "models/drafters/dspark.h"
 #include "models/drafters/dspine.h"
 #include "models/drafters/eagle4.h"
@@ -63,6 +64,7 @@ class DrafterRegistry {
   const Eagle4Spec& ensure_eagle4_spec(const ModelFile& file, const TargetSpec& target);
   const DSparkSpec& ensure_dspark_spec(const ModelFile& file, const TargetSpec& target);
 
+  std::optional<DirectoryDraft> directory_;
   DrafterSources sources_{};
   int mtp_companion_ = -1;
   int block_companion_ = -1;   // the companion holding the tapped drafter (DFlash2's block, DSpine, EAGLE-4), -1: the

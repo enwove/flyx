@@ -1076,15 +1076,16 @@ DraftQuants resolve_draft_quant(const flyx_model_desc& d, interfaces::DraftWeigh
                                                         : DraftQuant::kNone;
   DraftQuants q{DraftQuant::kNvfp4, block, block, block, block};
   if (block == DraftQuant::kNone) {
-    auto beside_float = [](int w) {
-      return w == FLYX_DRAFT_WEIGHTS_NVFP4 ? DraftQuant::kNvfp4
-             : w == FLYX_DRAFT_WEIGHTS_Q8 ? DraftQuant::kQ8 : DraftQuant::kNone;
-    };
+    q.dspine = q.eagle4 = DraftQuant::kNvfp4;
     for (int i = 0; i < d.n_blocks; ++i) {
       const flyx_block& b = d.blocks[i];
-      if (b.kind == FLYX_BLOCK_DFLASH2 && b.dflash2.q8_weights) q.dflash = DraftQuant::kQ8;
-      if (b.kind == FLYX_BLOCK_DSPINE) q.dspine = beside_float(b.dspine.float_weights);
-      if (b.kind == FLYX_BLOCK_EAGLE4) q.eagle4 = beside_float(b.eagle4.float_weights);
+      // ABI 55 descriptors can also request Q8 explicitly beside a float target.
+      if (b.kind == FLYX_BLOCK_DSPINE && b.dspine.float_weights == FLYX_DRAFT_WEIGHTS_Q8) q.dspine = DraftQuant::kQ8;
+      if (b.kind == FLYX_BLOCK_EAGLE4 && b.eagle4.float_weights == FLYX_DRAFT_WEIGHTS_Q8) q.eagle4 = DraftQuant::kQ8;
+      if (b.kind != FLYX_BLOCK_DFLASH2) continue;
+      // Ungated block projections (DFlash, DeepSpec's DSpark) use Q8 beside float target weights.
+      if (b.dflash2.q8_weights || b.dflash2.sel_rank == 0 || b.dflash2.draft_from == 0)
+        q.dflash = DraftQuant::kQ8;
     }
   }
   return q;
@@ -1492,7 +1493,7 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
       bo.draft_weights = interfaces::DraftWeightsMode::kAuto;
   }
   std::string err;
-  if (!parse_options(opts ? opts->options : nullptr, &bo, &err)) return -1;
+  if (!resolve_options(opts ? opts->options : nullptr, &bo, &err)) return -1;
 
   const int nw = desc->n_weights;
   std::vector<char> is_vis, is_drafter(size_t(nw), 0), is_dv_w(size_t(nw), 0), is_host_embed(size_t(nw), 0);
@@ -1613,7 +1614,7 @@ int estimate_load(const flyx_model_desc* desc, const flyx_open_options* opts, ui
       for (int t = 0; t < e.n_taps && t < FLYX_EAGLE4_MAX_TAPS; ++t) mark_norm(is_drafter, e.fc_norm[t]);
       for (const flyx_norm& n : {e.in_norm, e.hidden_norm, e.post_norm, e.norm}) mark_norm(is_drafter, n);
       for (int w : {e.fc, e.q, e.k, e.v, e.o, e.gate, e.up, e.down}) mark_linear(w, q.eagle4);
-      for (int w : {e.head, e.cand_down, e.cand_up}) mark_linear(w, DraftQuant::kNone);
+      for (int w : {e.head, e.cand_down, e.cand_up}) mark(is_drafter, w);
     } else if (b.kind == FLYX_BLOCK_DV) {
       mark_norm(is_dv_w, b.dv.norm);
       for (int w : {b.dv.mask_emb, b.dv.res_in, b.dv.res_out, b.dv.sel_a, b.dv.sel_h, b.dv.sel_b, b.dv.sel_alpha})

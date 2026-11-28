@@ -455,6 +455,7 @@ bool Generation::launch(const RoundChoice& round, bool masked) {
   flyx_gen_params params{};
   flyx_plan* plan = nullptr;
   prepare_round(round, masked, &params, &plan);
+  launch_epoch_[in_flight_] = e_->generation_epoch();
   const double launching = os::now_ms();  // the launch's own time is the round's (a backend may run it there)
   if (api_->launch(plan, s_->seq(), &params) != 0) {
     fail(std::string("launch: ") + api_->last_error(), true);
@@ -463,7 +464,6 @@ bool Generation::launch(const RoundChoice& round, bool masked) {
   launch_ms_[in_flight_] = alone_ && !batched_ ? launching : kUntimed;
   launch_at_[in_flight_] = static_cast<int>(s_->tokens().size());
   launch_idle_[in_flight_] = in_flight_ == 0;
-  launch_epoch_[in_flight_] = e_->generation_epoch();
   launched_[in_flight_++] = round;
   result_.adaptive_rounds += params.stop_policy != nullptr;  // as launched(): the adaptive plan's rounds
   return true;
@@ -561,7 +561,7 @@ bool Generation::round(bool wait, bool* busy) {
   const bool unshared = e_->generations() == 1 && e_->generation_epoch() == epoch_at_launch;
   --in_flight_;
   const long ran = was.lookup ? long(was.index) : ran_as(was, r);
-  if (timed && unshared && r.n_tokens > 0 && ran >= 0)
+  if (timed && unshared && r.n_tokens > 0 && ran >= 0 && was.measures_fixed_cost(e_->model()))
     if (RoundCosts* costs = was.lookup ? e_->lookup_costs() : e_->round_costs())
       costs->observe(size_t(ran), ran_at, read_at - (behind ? read_ms_ : launched_at));
   read_ms_ = read_at;
