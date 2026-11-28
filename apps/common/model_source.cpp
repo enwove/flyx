@@ -557,10 +557,11 @@ std::string drafter_kind(const std::string& path, const PathAllowFn& allow_path)
 }
 
 std::string drafter_kind(const hub::Repo& r, const hub::Name& name, const PathAllowFn& allow_path) {
-  if (hub::is_drafter(r)) return hub::drafter_kind(r);
+  // The file the name selects first: a repository can hold a drafter's config and GGUF drafters of other kinds.
   std::vector<hub::RepoFile> files;
   std::string err;
   if (!hub::select(r, name, &files, &err) || files.empty()) return "";
+  if (files.front().path == "config.json") return hub::drafter_kind(r);  // the drafter's directory: its config
   for (const HubGguf& g : hub_ggufs(r, allow_path))
     if (g.choice.file.path == files.front().path) return g.cached ? drafter_kind(g.disk, allow_path) : "";
   return "";
@@ -768,10 +769,13 @@ bool fetch_model(const std::string& model, const std::vector<std::string>& draft
   for (const std::string& d : drafters) {
     hub::Repo drepo;
     std::string path;
+    std::error_code dir_ec;
     if (!one(d, progress, stop, &path, &drepo, err, allow_path)) return false;
     out->drafters.push_back(path);
     out->drafter_sources.push_back(
-        {drepo.id.empty() || !hub::is_drafter(drepo) ? drafter_kind(path, allow_path) : hub::drafter_kind(drepo),
+        {drepo.id.empty() || !hub::is_drafter(drepo) || !fs::is_directory(to_path(path), dir_ec)
+             ? drafter_kind(path, allow_path)  // a file: its own header, whatever else the repository holds
+             : hub::drafter_kind(drepo),
          drepo.id.empty() ? path : clean_hub(d),
          bytes_on_disk(path, allow_path)});
   }
@@ -870,12 +874,18 @@ bool fetch_lora(const std::string& spec, const hub::ProgressFn& progress, const 
     std::string resolved = p;
     if (!fs::is_directory(to_path(p), ec)) {
       const fs::path file = to_path(p);
-      const std::string leaf = from_path(file.filename());
-      if (leaf != "adapter_config.json" && leaf != "adapter_model.safetensors")
+      const fs::path dir = file.has_parent_path() ? file.parent_path() : fs::path(".");
+      // The file itself is one of the two, by the file system's identity (ADAPTER_CONFIG.JSON on a volume that
+      // ignores case), not by the spelling typed.
+      const auto is = [&](const char* name) {
+        std::error_code e;
+        return fs::equivalent(file, dir / name, e);
+      };
+      if (!is("adapter_config.json") && !is("adapter_model.safetensors"))
         return *err = p + ": not a LoRA adapter (its directory, of adapter_config.json and adapter_model.safetensors, "
                           "or one of those two files)",
                false;
-      resolved = file.has_parent_path() ? from_path(file.parent_path()) : std::string(".");
+      resolved = file.has_parent_path() ? from_path(dir) : std::string(".");
     }
     if (allow_path && !allow_path(resolved))
       return *err = resolved + ": path is not allowed by remote path policy", false;

@@ -872,7 +872,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
   };
   const applyCompanions = (draft, mmprojSpec) => {
     setF((current) => Object.assign({}, current,
-      pickedDrafter(draft.spec, draft.kind),
+      pickedDrafter(draft.spec, draft.mode),
       mmprojSpec ? { vision: true, visionSource: "custom", mmproj: mmprojSpec, mmprojPicked: true } : {}));
     setView("current");
     setStab("spec");
@@ -1275,7 +1275,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     }
     return {
       action: { title: selDraft.file, sub, label: "Draft with it", disabled: !model.id || busy,
-                onClick: () => { draftWith(selDraft.spec, selDraft.kind); clearPicked(); } },
+                onClick: () => { draftWith(selDraft.spec, selDraft.mode); clearPicked(); } },
       overrides: null,
     };
   }
@@ -1398,7 +1398,10 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                              kind: "mmproj", size: j.mmproj.size, cached: !!j.mmproj.cached, disk: null, default: true }] : []),
     ];
     const comps = rawComps.map((c) => ({ ...c, key: c.name, spec: c.disk || c.name,
-      kind: c.kind === "mmproj" ? c.kind : (c.drafter_kind ?? c.kind) }));
+      kind: c.kind === "mmproj" ? c.kind : (c.drafter_kind ?? c.kind),
+      // The mode a load is told: the kind its cached header says (drafter_kind), never a guess from its name (kind),
+      // which leaves it to the loader.
+      mode: c.kind === "mmproj" ? "" : (c.drafter_kind || "") }));
     const hubDraft = hubView.draft, hubMmproj = hubView.mmproj;
     const setHubDraft = (v) => dispatchHub({ type: "draft", value: v });
     const setHubMmproj = (v) => dispatchHub({ type: "mmproj", value: v });

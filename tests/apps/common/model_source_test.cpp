@@ -201,6 +201,28 @@ int main() {
     named.files = {{"dspark-Ink-Q8_0.gguf", 0, "", ""}};
     check(flyx::hub::parse_name(named.id, &n) && flyx::apps::drafter_kind(named, n).empty(),
           "an uncached dspark-*.gguf is of unknown kind too: no kind from a name");
+    // What a picked companion may tell a load (GET /v1/hub/files' drafter_kind): the cached header's kind alone; the
+    // list's kind of an uncached file can be its name's guess.
+    const auto named_listing = flyx::apps::hub_ggufs(named);
+    check(named_listing.size() == 1 && named_listing[0].cls.drafter_kind == "dspark" &&
+              named_listing[0].header_drafter_kind().empty(),
+          "a misleadingly named uncached companion: listed as its name says, its mode left to the loader");
+    check(listing.size() == 1 && listing[0].header_drafter_kind() == "dspark",
+          "a cached one: the mode its header says");
+    // A repository with a drafter's config (DFlash2) and a GGUF of another kind beside it, the GGUF named: the
+    // selected file's own header (Markov: DSpark), not the repository's config.
+    flyx::hub::Repo mixed = generic;
+    mixed.id = "acme/Mixed-Drafters";
+    mixed.architectures = {"DFlash2DraftModel"};
+    mixed.files = {{"config.json", 0, "", ""}, {"model.safetensors", 0, "", ""}, {"dspark-Mixed-Q8_0.gguf", 0, "", ""}};
+    flyx::hub::Name whole, gguf_named;
+    check(flyx::hub::parse_name(mixed.id, &whole) && flyx::hub::parse_name(mixed.id + ":dspark-Mixed-Q8_0.gguf", &gguf_named),
+          "the mixed repository's names parse");
+    check(flyx::apps::drafter_kind(mixed, gguf_named).empty(), "its uncached GGUF named: unknown, not its config's DFlash2");
+    write_gguf(to_path(flyx::hub::snapshot_dir(mixed)) / "dspark-Mixed-Q8_0.gguf", "dflash", 1);
+    check(flyx::apps::drafter_kind(mixed, gguf_named) == "dspark", "cached: its own header's DSpark");
+    check(flyx::apps::drafter_kind(mixed, whole) == "dflash2",
+          "the repository named alone selects its config and safetensors: the config's DFlash2");
   }
   // A LoRA adapter of a repository listed as the Hub lists it (fetch_lora_in), its files' blobs standing in for the
   // transfers as above: a config longer than a load reads (modelfile::kPeftConfigMaxBytes) is refused by its listed
@@ -275,6 +297,17 @@ int main() {
     ok = flyx::apps::fetch_model(from_path(model), {}, false, {}, nullptr, &f, &err, "", false, false, "notes.txt");
     check(!ok && err.find("not a LoRA adapter") != std::string::npos,
           "and refuses a load whose adapter is no adapter: " + err);
+#if defined(_WIN32)
+    // A volume that ignores case: the two files spelled otherwise are the same files, so their directory.
+    for (const std::string file : {"ADAPTER_CONFIG.JSON", "Adapter_Model.SafeTensors"}) {
+      p.clear();
+      ok = flyx::apps::fetch_lora(file, {}, nullptr, &p, &err);
+      check(ok && p == ".", "a bare " + file + " is the current directory on Windows: " + (ok ? p : err));
+      p.clear();
+      ok = flyx::apps::fetch_lora(from_path(adir / file), {}, nullptr, &p, &err);
+      check(ok && to_path(p) == adir, "and a path to it, its directory: " + (ok ? p : err));
+    }
+#endif
     fs::current_path(cwd);
   }
 

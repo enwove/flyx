@@ -152,6 +152,9 @@ struct HubGguf {
   std::string disk, selector;
   bool cached = false;
   std::filesystem::file_time_type modified = std::filesystem::file_time_type::min();
+  // The drafter kind the file's own header says (a whole file in the cache, its header read), "" while it is not:
+  // what a load may be told, where cls.drafter_kind can be a guess from the file's name.
+  std::string header_drafter_kind() const { return cached && !cls.arch.empty() ? cls.drafter_kind : ""; }
 };
 std::vector<HubGguf> hub_ggufs(const hub::Repo& repo, const PathAllowFn& allow_path = {});
 // The companion of `kind` ("mmproj", "mtp", "dflash2" or "dspark") a repository offers first: the Hub's preferred

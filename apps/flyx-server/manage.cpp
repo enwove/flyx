@@ -388,7 +388,9 @@ ojson repo_json(const hub::Repo& r, const apps::PathAllowFn& allow = {}) {
     const auto base = path.substr(path.rfind('/') + 1);
     companions.push_back({{"name", r.id + ":" + base + rev_suffix}, {"path", path}, {"file", base},
                           {"kind", item.cls.drafter_kind.empty() ? item.cls.kind : item.cls.drafter_kind},
-                          {"drafter_kind", item.cls.drafter_kind},
+                          // The kind a load may be told: as the cached file's header says it, else none (the
+                          // loader reads it); "kind" above may come from the file's name, for the list alone.
+                          {"drafter_kind", item.header_drafter_kind()},
                           {"size", c.total_size}, {"cached", item.cached}, {"disk", item.cached ? ojson(item.disk) : ojson(nullptr)},
                           {"default", is_default}});
     if (&item == preferred_mtp || &item == preferred_mm)

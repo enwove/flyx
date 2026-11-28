@@ -110,7 +110,12 @@ def repository(repo_spec, helper_cached=False):
                 "companions": [{"name": repo + ":helper.gguf" + rev_sfx, "path": "helper.gguf",
                                 "file": "helper.gguf", "kind": "dspark" if helper_cached else "drafter",
                                 "drafter_kind": "dspark" if helper_cached else "",
-                                "size": int(0.5 * GB), "cached": helper_cached, "disk": None, "default": True}],
+                                "size": int(0.5 * GB), "cached": helper_cached, "disk": None, "default": True},
+                               # Named as DSpark's, its header not read (not in the cache): listed by its name, its
+                               # mode left to the loader (drafter_kind empty).
+                               {"name": repo + ":dspark-Misnamed-Q8_0.gguf" + rev_sfx, "path": "dspark-Misnamed-Q8_0.gguf",
+                                "file": "dspark-Misnamed-Q8_0.gguf", "kind": "dspark", "drafter_kind": "",
+                                "size": int(0.4 * GB), "cached": False, "disk": None, "default": False}],
                 "info": {"downloads": 12, "likes": 1, "updated": "2026-11-24T02:15:52.000Z", "license": "apache-2.0",
                          "pipeline": "text-generation", "gated": False, "architecture": "dflash",
                          "context": 1048576, "parameters": 495000000}}
@@ -140,7 +145,7 @@ def repository(repo_spec, helper_cached=False):
             "mmproj": {"path": "mmproj-BF16.gguf", "size": int(0.9 * GB), "cached": True} if runs else None,
             "companions": [
                 {"name": repo + ":mtp.gguf" + rev_sfx, "path": "MTP/mtp.gguf", "file": "mtp.gguf", "kind": "mtp",
-                 "size": int(0.6 * GB), "cached": True, "disk": None, "default": True},
+                 "drafter_kind": "mtp", "size": int(0.6 * GB), "cached": True, "disk": None, "default": True},
                 {"name": repo + ":mmproj-BF16.gguf" + rev_sfx, "path": "mmproj-BF16.gguf", "file": "mmproj-BF16.gguf", "kind": "mmproj",
                  "size": int(0.9 * GB), "cached": True, "disk": None, "default": True},
                 {"name": repo + ":mmproj-F16.gguf" + rev_sfx, "path": "mmproj-F16.gguf", "file": "mmproj-F16.gguf", "kind": "mmproj",
@@ -799,7 +804,7 @@ def check_hub(page, server, want):
         page.locator("#hf-q").fill("acme/Model-DFlash2-GGUF")
         expect(page.locator("#hf-name")).to_have_text("Model-DFlash2-GGUF")
         expect(page.locator("#hf-drafter-repo")).to_be_visible()
-        page.locator(f'#hf-companions .mrow[data-kind="{mode}"]').click()
+        page.locator(f'#hf-companions .mrow[data-comp$=":helper.gguf"][data-kind="{mode}"]').click()
         expect(page.locator("#mf-load")).to_have_text("Draft with it")
         page.locator("#mf-load").click()
         expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:helper.gguf")
@@ -807,6 +812,19 @@ def check_hub(page, server, want):
         body = server.posted[-1]
         assert (body["drafter"], body["drafters"]) == (mode, ["acme/Model-DFlash2-GGUF:helper.gguf"]), body
         page.locator("#mf-reset").click()
+    # A companion named as DSpark's whose header is not read: drafted with in auto (no --drafter dspark from its name).
+    view(page, "library")
+    page.locator("#hf-q").fill("")
+    page.locator("#hf-q").fill("acme/Model-DFlash2-GGUF")
+    expect(page.locator("#hf-name")).to_have_text("Model-DFlash2-GGUF")
+    page.locator('#hf-companions .mrow[data-comp$=":dspark-Misnamed-Q8_0.gguf"]').click()
+    page.locator("#mf-load").click()
+    expect(page.locator("#sd-file")).to_have_value("acme/Model-DFlash2-GGUF:dspark-Misnamed-Q8_0.gguf")
+    expect(page.locator("#mf-cmd")).not_to_contain_text("--drafter dspark")
+    confirm(page, "#mf-reload", "Reload")
+    body = server.posted[-1]
+    assert (body["drafter"], body["drafters"]) == ("", ["acme/Model-DFlash2-GGUF:dspark-Misnamed-Q8_0.gguf"]), body
+    page.locator("#mf-reset").click()
     # Typing a safetensors DFlash2 repo org/name auto-opens it without Enter and offers Draft with it.
     view(page, "library")
     page.locator("#hf-q").fill("acme/Model-DFlash2")
