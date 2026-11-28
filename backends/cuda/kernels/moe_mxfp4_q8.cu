@@ -171,14 +171,14 @@ __global__ void __launch_bounds__(32 * WMW * WT)
 #pragma unroll
       for (int nt = 0; nt < NT; ++nt) {
         if (8 * (NT * wt + nt) >= nb) break;
+        int c[MT][4];  // the tile's MMAs first, then their sums' scaling: no FMA waits on the MMA just issued
 #pragma unroll
-        for (int mt = 0; mt < MT; ++mt) {
-          int c[4];
-          mma_s8_k32_zero(c, a[mt], b[nt]);
+        for (int mt = 0; mt < MT; ++mt) mma_s8_k32_zero(c[mt], a[mt], b[nt]);
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
 #pragma unroll
           for (int k = 0; k < 4; ++k)
-            acc[mt][nt][k] = __fmaf_rn(float(c[k]), wsc[mt][k >> 1] * xs[nt][k & 1], acc[mt][nt][k]);
-        }
+            acc[mt][nt][k] = __fmaf_rn(float(c[mt][k]), wsc[mt][k >> 1] * xs[nt][k & 1], acc[mt][nt][k]);
       }
     }
   };

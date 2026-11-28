@@ -369,16 +369,19 @@ __global__ void __launch_bounds__(32 * WMW * WT)
         const uint4 x = *reinterpret_cast<const uint4*>(&S.x[tr][32 * ul + 8 * t4]);
         b[nt][0] = x.x, b[nt][1] = x.y, b[nt][2] = x.z, b[nt][3] = x.w;
       }
+      // the unit's first MMA of every tile, then its second: no MMA waits on the one before it (the same order an
+      // output)
 #pragma unroll
-      for (int nt = 0; nt < NT; ++nt) {
-        if (8 * (NT * wt + nt) >= nb) break;
+      for (int h = 0; h < 2; ++h)
 #pragma unroll
-        for (int mt = 0; mt < MT; ++mt) {
-          const uint32_t b0[2] = {b[nt][0], b[nt][1]}, b1[2] = {b[nt][2], b[nt][3]};
-          mma_bf16(acc[mt][nt], a[mt][0], b0);
-          mma_bf16(acc[mt][nt], a[mt][1], b1);
+        for (int nt = 0; nt < NT; ++nt) {
+          if (8 * (NT * wt + nt) >= nb) break;
+#pragma unroll
+          for (int mt = 0; mt < MT; ++mt) {
+            const uint32_t bh[2] = {b[nt][2 * h], b[nt][2 * h + 1]};
+            mma_bf16(acc[mt][nt], a[mt][h], bh);
+          }
         }
-      }
     }
   };
 #pragma unroll
