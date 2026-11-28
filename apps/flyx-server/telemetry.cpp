@@ -77,10 +77,11 @@ ojson snapshot_json(const Server& s, int recent) {
   if (served.sched) {
     served.sched->telemetry(&t, &d, &device_ok);
   } else {  // no model: none named yet, or one being fetched or loaded (the "load" object says which)
+    s.host->telemetry(&t);  // what the models before counted
     t.loaded = false;
     t.phase = TelemetrySnapshot::kUnloaded;
-    t.started_at = s.started_at;
   }
+  t.started_at = s.started_at;  // the server's, not the served model's
   const double now = os::unix_seconds();
   const auto& m = t.model;
 

@@ -151,8 +151,9 @@ struct Scheduler::Running {
   std::unique_ptr<Generation> gen;
 };
 
-Scheduler::Scheduler(const std::string& model, const EngineOptions& eo, const SchedulerOptions& o)
-    : model_(model), eo_(eo), opt_(o) {
+Scheduler::Scheduler(const std::string& model, const EngineOptions& eo, const SchedulerOptions& o,
+                     std::shared_ptr<Telemetry> telemetry)
+    : model_(model), eo_(eo), opt_(o), telemetry_(std::move(telemetry)) {
   if (!opt_.disk_cache_dir.empty() && opt_.disk_cache_bytes > 0) {
     if (!store_.set_disk(opt_.disk_cache_dir, opt_.disk_cache_bytes, &load_error_)) return;
     if (store_.stale_freed() > 0)
@@ -180,11 +181,11 @@ bool Scheduler::ok(std::string* err) const {
 
 bool Scheduler::load(std::string* err) {
   const double t0 = os::now_ms();
-  telemetry_.loading();
+  telemetry_->loading();
   auto e = std::make_unique<Engine>();
   const int wanted = opt_.max_sessions > 0 ? opt_.max_sessions : SchedulerOptions::kDefaultSessions;
   if (!e->load(model_, eo_, err, wanted)) {
-    telemetry_.unloaded();
+    telemetry_->unloaded();
     return false;
   }
   {
@@ -257,7 +258,7 @@ void Scheduler::publish_model() {
   m.host_budget = engine_->host_budget();
   m.ctx_need_more = engine_->budget().ctx_need_more;
   m.held = engine_->budget().held;
-  telemetry_.loaded(m, engine_->ledger().used());
+  telemetry_->loaded(m, engine_->ledger().used());
 }
 
 void Scheduler::unload() {
@@ -268,11 +269,11 @@ void Scheduler::unload() {
     store_.own_memory();  // in memory of its own: the backend's goes with the engine
     engine_.reset();
   }
-  telemetry_.unloaded();
+  telemetry_->unloaded();
 }
 
 void Scheduler::telemetry(TelemetrySnapshot* out, flyx_device_stats* device, bool* device_ok) const {
-  telemetry_.snapshot(out);
+  telemetry_->snapshot(out);
   out->queued = queued();
   std::shared_lock<std::shared_mutex> lock(engine_mu_);
   *device_ok = engine_ && engine_->device_stats(device);
@@ -469,7 +470,7 @@ void Scheduler::loop() {
         if (opt_.idle_unload_ms > 0 && prefix_cache_ && prefix_cache_->size() > 0 && idle > opt_.idle_unload_ms) {
           const uint64_t before = engine_->ledger().used();
           prefix_cache_->clear();
-          telemetry_.memory(engine_->ledger().used(), engine_->host_mapped_in_use(), {});
+          telemetry_->memory(engine_->ledger().used(), engine_->host_mapped_in_use(), {});
           log::info("flyx: idle for %d s: sessions freed (%s)", opt_.idle_unload_ms / 1000,
                     gb(before - engine_->ledger().used()).c_str());
         }
@@ -544,7 +545,7 @@ void Scheduler::admit(std::unique_lock<std::mutex>& lock) {
       JobEvent refused{JobEvent::kError, reason, {}, {}, 0};
       refused.superseded = rec.superseded;
       refused.unavailable = !cancelled || closing;
-      telemetry_.finish(0, std::move(rec));
+      telemetry_->finish(0, std::move(rec));
       job->push(std::move(refused));
       continue;
     }
@@ -576,7 +577,7 @@ void Scheduler::failed(Running& r, JobEvent ev) {
   r.rec.status = "error";
   r.rec.error = ev.text;
   r.job->push(std::move(ev));
-  telemetry_.finish(r.telemetry_id, r.rec);
+  telemetry_->finish(r.telemetry_id, r.rec);
 }
 
 void Scheduler::forward(Job& job, std::vector<OutputEvent> events) {
@@ -640,21 +641,21 @@ Scheduler::Start Scheduler::start(const std::shared_ptr<Job>& job, std::unique_p
   }
   gen.cancel = &job->cancelled_;
   r->rec.prompt_tokens = static_cast<int>(gen.prompt.size());
-  const int id = r->telemetry_id = telemetry_.start(in.label, r->rec.session, r->rec.prompt_tokens, gen.max_new_tokens,
+  const int id = r->telemetry_id = telemetry_->start(in.label, r->rec.session, r->rec.prompt_tokens, gen.max_new_tokens,
                                                     in.response_id);
   // The session taken holds its device memory from now: monitors count it as flyx's, not another program's.
-  telemetry_.memory(engine_->ledger().used(), engine_->host_mapped_in_use(), session_slots(*prefix_cache_));
+  telemetry_->memory(engine_->ledger().used(), engine_->host_mapped_in_use(), session_slots(*prefix_cache_));
   gen.on_prefill = [this, id, job, first = true](int done, int total) mutable {
     if (first) {
       job->prompt_ready(total, done);  // the first progress update counts the tokens the session reused
       first = false;
     }
-    telemetry_.prefill(id, done, total);
+    telemetry_->prefill(id, done, total);
   };
-  gen.on_round = [this, id](int drafted, int accepted) { telemetry_.round(id, drafted, accepted); };
+  gen.on_round = [this, id](int drafted, int accepted) { telemetry_->round(id, drafted, accepted); };
   Running* self = r.get();
   TextSink sink = [this, self](std::string_view text, const int32_t*, int n) {
-    if (n > 0) telemetry_.tokens(self->telemetry_id, n);
+    if (n > 0) telemetry_->tokens(self->telemetry_id, n);
     if (self->prepared.parser) forward(*self->job, self->prepared.parser->feed(text));
     else if (!text.empty()) self->job->push({JobEvent::kContent, std::string(text), {}, {}, 0});
     return !self->job->cancelled_.load();
@@ -738,7 +739,7 @@ void Scheduler::finish(Running& r) {
   if (r.gen->failed()) {
     log::error("flyx: %s failed: %s", in.label.c_str(), r.gen->error().c_str());
     failed(r, r.gen->error());
-    telemetry_.memory(engine_->ledger().used(), engine_->host_mapped_in_use(), session_slots(*prefix_cache_));
+    telemetry_->memory(engine_->ledger().used(), engine_->host_mapped_in_use(), session_slots(*prefix_cache_));
     return;
   }
   const GenerateResult& res = r.gen->result();
@@ -780,9 +781,9 @@ void Scheduler::finish(Running& r) {
   rec.tool_calls = tool_calls;
   rec.grammar_fixes = res.grammar_fixes;
   rec.superseded = u.finish_reason == FLYX_FINISH_CANCEL && r.job->superseded_.load();
-  telemetry_.finish(r.telemetry_id, rec);
+  telemetry_->finish(r.telemetry_id, rec);
   if (opt_.on_finished) opt_.on_finished(rec);
-  telemetry_.memory(engine_->ledger().used(), engine_->host_mapped_in_use(), session_slots(*prefix_cache_));
+  telemetry_->memory(engine_->ledger().used(), engine_->host_mapped_in_use(), session_slots(*prefix_cache_));
   JobEvent done{};
   done.kind = JobEvent::kDone;
   done.result = res;

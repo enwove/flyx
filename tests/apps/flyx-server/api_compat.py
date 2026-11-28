@@ -161,9 +161,15 @@ def check_compat(url):
         want = '"drafter": mtp, dflash2, dflash, dspark, dspine, eagle4, dv, all or none'
         assert st == 400 and err["error"]["message"] == want, (bad, st, err)
 
-    # 6. Unloaded model -> GET /v1/models/:id returns 404
+    # 6. Unloaded model -> GET /v1/models/:id returns 404; the telemetry keeps what the server counted (the totals,
+    # the recent requests, the server's start), as the request log does.
+    st, before = cl.get("/v1/telemetry?recent=100")
+    assert st == 200 and before["totals"]["requests"] > 0, (st, before.get("totals"))
     st, _ = cl.post("/v1/unload", {})
     assert st == 200, st
+    st, after = cl.get("/v1/telemetry?recent=100")
+    assert st == 200 and after["model"]["loaded"] is False and after["totals"] == before["totals"], after.get("totals")
+    assert after["recent"] == before["recent"] and after["server"]["started_at"] == before["server"]["started_at"]
     st, err = cl.get(f"/v1/models/{MODEL_NAME}")
     assert st == 404 and err["error"]["code"] == "model_not_found", (st, err)
 

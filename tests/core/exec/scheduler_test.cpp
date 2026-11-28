@@ -993,5 +993,29 @@ int main(int argc, char** argv) {
     }
   }
 
+  // A server's telemetry outlives the models it serves one after another: a scheduler that follows another on it
+  // counts on from that one's requests (the dashboard's totals and recent requests across a model switch).
+  if (eo.backend == "cpu_ref") {
+    auto server_telemetry = std::make_shared<Telemetry>();
+    EngineOptions eo_small = eo;
+    eo_small.max_ctx = 128;
+    SchedulerOptions so_small;
+    so_small.max_sessions = 1;
+    std::string err_first, err_second;
+    {
+      Scheduler first(argv[1], eo_small, so_small, server_telemetry);
+      if (first.ok(&err_first)) send(first, raw(first, "before the switch", "one two three", 3))->wait();
+    }
+    Scheduler second(argv[1], eo_small, so_small, server_telemetry);
+    if (second.ok(&err_second)) send(second, raw(second, "after the switch", "four five six", 3))->wait();
+    TelemetrySnapshot t;
+    flyx_device_stats device{};
+    bool device_ok = false;
+    second.telemetry(&t, &device, &device_ok);
+    check(err_first.empty() && err_second.empty() && t.totals.requests == 2 && t.recent.size() == 2 &&
+              t.recent[0].label == "after the switch" && t.recent[1].label == "before the switch",
+          "a scheduler on the server's telemetry counts on from the one before it (" + err_first + err_second + ")");
+  }
+
   return flyx::test::finish("scheduler_test");
 }

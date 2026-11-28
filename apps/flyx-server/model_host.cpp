@@ -674,7 +674,7 @@ std::shared_ptr<Scheduler> ModelHost::open(const std::string& model, const apps:
   std::shared_ptr<Scheduler> sched;
   try {
     // A deleter that says when it is gone, for retire() to wait on before the next model loads.
-    sched = std::shared_ptr<Scheduler>(new Scheduler(f.model, eo, so), SignalTeardown{std::make_shared<Teardown>()});
+    sched = std::shared_ptr<Scheduler>(new Scheduler(f.model, eo, so, telemetry_), SignalTeardown{std::make_shared<Teardown>()});
   } catch (const std::exception& e) {
     // A model file no check foresaw: a load that failed with its reason, not the end of the server.
     *err = e.what();
