@@ -60,7 +60,7 @@
 
 ## Performances
 
-Vitesse de décodage de la v0.2.1 en tokens/s, vérifiée sur quatre GPUs (greedy). **Ordinaire** désigne le décodage sans drafter ; les deux colonnes **Spéculatif** activent le drafter sur des prompts de chat et de code, avec l'accélération par rapport à l'ordinaire entre parenthèses.
+Vitesse de décodage en tokens/s, vérifiée sur quatre GPUs (greedy). **Ordinaire** désigne le décodage sans drafter ; les deux colonnes **Spéculatif** activent le drafter sur des prompts de chat et de code, avec l'accélération par rapport à l'ordinaire entre parenthèses.
 
 **Qwen3.8-27B + DFlash2** — chat / mixte : 3 prompts × 128 tokens ; code : 1 prompt × 128 tokens.
 

@@ -60,7 +60,7 @@
 
 ## Leistung
 
-Dekodiergeschwindigkeit von v0.2.1 in Token/s, auf vier GPUs verifiziert (greedy). **Normal** ist die Dekodierung ohne Drafter; die beiden Spalten **Spekulativ** schalten den Drafter für Chat- und für Code-Prompts ein, mit der Beschleunigung gegenüber Normal in Klammern.
+Dekodiergeschwindigkeit in Token/s, auf vier GPUs verifiziert (greedy). **Normal** ist die Dekodierung ohne Drafter; die beiden Spalten **Spekulativ** schalten den Drafter für Chat- und für Code-Prompts ein, mit der Beschleunigung gegenüber Normal in Klammern.
 
 **Qwen3.8-27B + DFlash2** — Chat / gemischt: 3 Prompts × 128 Tokens; Code: 1 Prompt × 128 Tokens.
 

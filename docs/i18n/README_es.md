@@ -60,7 +60,7 @@
 
 ## Rendimiento
 
-Velocidad de decodificación de v0.2.1 en tokens/s, verificada en cuatro GPUs (greedy). **Normal** es la decodificación sin drafter; las dos columnas **Especulativa** activan el drafter en prompts de chat y de código, con la aceleración frente a la normal entre paréntesis.
+Velocidad de decodificación en tokens/s, verificada en cuatro GPUs (greedy). **Normal** es la decodificación sin drafter; las dos columnas **Especulativa** activan el drafter en prompts de chat y de código, con la aceleración frente a la normal entre paréntesis.
 
 **Qwen3.8-27B + DFlash2** — chat / mixto: 3 prompts × 128 tokens; código: 1 prompt × 128 tokens.
 

@@ -60,7 +60,7 @@
 
 ## Performance
 
-v0.2.1 decode speed in tokens/s, verified on four GPUs (greedy). **Plain** is decoding with no drafter; the two **Speculative** columns turn the drafter on for chat and for code prompts, with the speedup over plain in parentheses.
+Decode speed in tokens/s, verified on four GPUs (greedy). **Plain** is decoding with no drafter; the two **Speculative** columns turn the drafter on for chat and for code prompts, with the speedup over plain in parentheses.
 
 **Qwen3.8-27B + DFlash2** — chat / mixed: 3 prompts × 128 tokens; code: 1 prompt × 128 tokens.
 
