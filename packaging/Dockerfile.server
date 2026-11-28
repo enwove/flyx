@@ -8,25 +8,32 @@
 #   docker build -f packaging/Dockerfile.server -t flyx:local \
 #     --build-arg FLYX_CUDA=OFF .                                                    # the float64 reference backend only
 #
-# The builder is the pinned Ubuntu 22.04 CUDA 13 image the release tarballs are built against (glibc 2.35), so the
-# result runs on any x86-64 host with glibc 2.35 or newer.  CUDA and the C++ runtimes link statically: the runtime
-# stage carries no CUDA toolkit, only what the NVIDIA Container Toolkit mounts in from the host driver plus the
-# system's libcurl, which fetching a model by Hugging Face name opens at run time.  That is why the image is
-# 218 MB (52 MB of binaries) where a CUDA server image that links dynamically and ships the toolkit is gigabytes.
+# The builder is the pinned Ubuntu 22.04 CUDA 13 image the release tarballs are built against, and the runtime stage
+# is the same Ubuntu 22.04 pinned by digest through RUNTIME_IMAGE: glibc 2.35, which the build checks the binary does
+# not ask to exceed.  CUDA and the C++ runtimes link statically: the runtime stage carries no CUDA toolkit, only what
+# the NVIDIA Container Toolkit mounts in from the host driver plus the system's libcurl, which fetching a model by
+# Hugging Face name opens at run time.  That is why the image is 218 MB (52 MB of binaries) on two architectures where
+# a CUDA server image that links dynamically and ships the toolkit is gigabytes.
 #
-# Running it, the dashboard on http://127.0.0.1:8080:
+# Running it, the dashboard on http://127.0.0.1:8080.  --init forwards signals to PID 1 during a long model load, and
+# the port is published on loopback: publishing it on the network means a key, because a request that arrives through
+# a published port is not localhost to the server (docs/building.md's Docker section).
 #
-#   docker run --gpus all -p 8080:8080 -v flyx-data:/data flyx:local
+#   docker run --gpus all --init -p 127.0.0.1:8080:8080 -v flyx-data:/data flyx:local
+#   docker run --gpus all --init -p 8080:8080 -e FLYX_API_KEY=secret -v flyx-data:/data flyx:local
 #
 # packaging/docker-compose.yml wires the same up with the volumes, the GPU reservation and the environment.
 
 ARG CUDA_IMAGE=nvidia/cuda:13.0.2-devel-ubuntu22.04@sha256:1c517d4fb96528c8999e14e6e6b16d7e2ff9ae8d194fd788d60fdc88e693e982
+# Both bases pinned by digest, so a rebuild of a tag builds the same image a year later.  An ARG used in FROM belongs
+# before the first FROM: declared inside a stage it is invisible to it.
+ARG RUNTIME_IMAGE=ubuntu:22.04@sha256:b000e69a50ff940390233025e7a337fb8469b509e2334fa4d018ac30f3e18cdb
 FROM ${CUDA_IMAGE} AS build
 
 # Jammy's CMake (3.22) predates the presets and its Python (3.10) the tuning-table generator, so both come from a
-# 3.12 environment, as in packaging/Dockerfile.linux.  binutils is for the packaged ELF checks, libcurl4 the hub test.
+# 3.12 environment, as in packaging/Dockerfile.linux.  binutils is for the check of the result below.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      binutils build-essential ca-certificates libcurl4 ninja-build \
+      binutils build-essential ca-certificates ninja-build \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=ghcr.io/astral-sh/uv:0.13.10 /uv /usr/local/bin/uv
 ENV UV_PYTHON_INSTALL_DIR=/opt/python
@@ -51,29 +58,43 @@ RUN cmake -S . -B /flyx-build -G Ninja \
       -DFLYX_TUNE_CANDIDATES=OFF -DFLYX_CUDA_ARCHS="${FLYX_CUDA_ARCHS}" \
     && cmake --build /flyx-build -j "$([ "${FLYX_JOBS}" -gt 0 ] && echo "${FLYX_JOBS}" || nproc)" \
     && cmake --install /flyx-build --prefix /opt/flyx --strip
+# A CUDA build that silently fell back to the CPU-only backend would produce a server that never uses the card, and a
+# binary built against a newer glibc than the release baseline would fail on the oldest host.  So: the CUDA plugin has
+# to be installed, and the newest glibc symbol the binary asks for has to be at or below the builder's own 2.35.
+# (The check reads /opt/flyx/bin/flyx: flyx-server is a symlink to it, one binary with the server subcommand.)
+RUN test -x /opt/flyx/bin/flyx \
+    && { [ "${FLYX_CUDA}" = "OFF" ] || test -f /opt/flyx/lib/flyx/libflyx-cuda.so; } \
+    && needs="$(readelf --dyn-syms /opt/flyx/bin/flyx | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' \
+               | sort -V | tail -1)" \
+    && echo "flyx needs glibc ${needs} at the newest" \
+    && [ "$(printf '%s\n2.35\n' "${needs}" | sort -V | tail -1)" = "2.35" ]
 
-FROM ubuntu:22.04 AS runtime
+FROM ${RUNTIME_IMAGE} AS runtime
 # libcurl4 for fetching models by name, curl for the health check of /health, ca-certificates for HTTPS to the Hub.
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       ca-certificates curl libcurl4 \
     && rm -rf /var/lib/apt/lists/*
 
-# A non-root user whose home is the volume holding the Hugging Face cache and serve.json.
-RUN useradd --uid 1000 --create-home --home-dir /data --shell /usr/sbin/nologin flyx
+# A non-root user whose home is the volume holding the Hugging Face cache and serve.json.  /models is the mount point
+# of a folder of your own .gguf files (FLYX_MODELS_DIR), owned by that user so a bind mount of an empty folder works.
+RUN useradd --uid 1000 --create-home --home-dir /data --shell /usr/sbin/nologin flyx \
+    && mkdir -p /models && chown 1000:1000 /models
 COPY --from=build /opt/flyx /opt/flyx
 COPY packaging/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 ENV PATH="/opt/flyx/bin:${PATH}" \
     HOME=/data \
     FLYX_HOST=0.0.0.0 \
     FLYX_PORT=8080 \
+    FLYX_MODELS_DIR=/models \
     HF_HOME=/data/hf
 LABEL org.opencontainers.image.title="flyx" \
-      org.opencontainers.image.description="Local LLM inference engine: OpenAI- and Anthropic-compatible server with a web dashboard" \
+      org.opencontainers.image.description="Local LLM inference engine: OpenAI- and Anthropic-compatible server" \
       org.opencontainers.image.licenses="Apache-2.0"
 
 WORKDIR /data
 EXPOSE 8080
-USER flyx
+# Numeric, so a Kubernetes `runAsNonRoot` policy accepts the image.
+USER 1000:1000
 # A model of tens of GB fetches and loads for minutes before /health says ready: the probe starts late on purpose.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
   CMD curl -fsS "http://127.0.0.1:${FLYX_PORT:-8080}/health" > /dev/null

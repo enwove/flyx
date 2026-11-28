@@ -123,45 +123,54 @@ python packaging/smoke_model.py <archive>/bin/flyx <tiny.flyx> --backend cpu_ref
 
 [Dockerfile.server](../packaging/Dockerfile.server) builds the engine and its HTTP server from this checkout into one image; [docker-compose.yml](../packaging/docker-compose.yml) runs it with the GPU reservation, the volumes and the environment. The project publishes no image of its own — the build is the release package's configuration, [CMakePresets.json](../CMakePresets.json)'s `release-linux` cache variables passed directly (static CUDA and C++ runtimes, compressed fatbins, tuning candidates pruned to what the GPU tables select) with `-DFLYX_TESTS=OFF`, so the runtime stage needs no CUDA toolkit, only what the NVIDIA Container Toolkit mounts in from the host driver and the system's `libcurl`.
 
-Building needs nothing but Docker; running the result needs the **NVIDIA Container Toolkit** and a driver ≥ 580 (the CPU-only image needs neither). The builder is the pinned Ubuntu 22.04 CUDA 13 image of [packaging/package_linux_docker.sh](../packaging/package_linux_docker.sh) (the same glibc 2.35 baseline as the release tarballs), so the host may be any x86-64 Linux.
+Building needs nothing but Docker; running the result needs the **NVIDIA Container Toolkit** and a driver ≥ 580 (the CPU-only image needs neither). The builder is the pinned Ubuntu 22.04 CUDA 13 image [packaging/Dockerfile.linux](../packaging/Dockerfile.linux) names, which [packaging/package_linux_docker.sh](../packaging/package_linux_docker.sh) builds its release tarballs in, and the runtime stage is the same Ubuntu 22.04: the glibc the binary asks for is fixed by the image, so the host needs no particular glibc of its own — the 2.35 baseline is what the *tarballs* demand of a host that runs them directly. The image pins its runtime base by digest as well, and the build ends by checking both: the CUDA plugin is installed, and the newest glibc symbol the binary references is at or below 2.35.
 
 ```sh
 docker build -f packaging/Dockerfile.server -t flyx:local .                                       # every release architecture
 docker build -f packaging/Dockerfile.server -t flyx:local --build-arg FLYX_CUDA_ARCHS=89-real .    # one GPU: a fifth of the compiles
 docker build -f packaging/Dockerfile.server -t flyx:local --build-arg FLYX_CUDA=OFF .              # the float64 reference backend
 
-docker run --gpus all -p 8080:8080 -v flyx-data:/data flyx:local                                   # dashboard on http://127.0.0.1:8080
+docker run --gpus all --init -p 127.0.0.1:8080:8080 -v flyx-data:/data flyx:local                  # dashboard on http://127.0.0.1:8080
+docker run --gpus all --init -p 8080:8080 -e FLYX_API_KEY=secret -v flyx-data:/data flyx:local     # published to the network
 ```
+
+`--init` matters for a container that will hold tens of gigabytes: PID 1 ignores SIGTERM while a model is downloading, before `flyx` installs its own handler, and `docker stop` then waits out the full grace period. The published port is the boundary — see the two consequences below — so a `-p 8080:8080` is a server on every interface of the machine, and `-p 127.0.0.1:8080:8080` is one you reach over an SSH tunnel.
 
 Measured on a 16-job host: `86-real;89-real` builds in 12 minutes into a 218 MB image, 52 MB of it `/opt/flyx` (`flyx` and `flyx-server`); the release's six architectures cost about three times that. A CUDA server image that links the toolkit dynamically and ships it runs to gigabytes for the same server, which is what static linking buys here.
 
-With Compose — the file lives in `packaging/`, so its build context is the repository (`context: ..`) and it reads `packaging/.env`:
+With Compose — the file lives in `packaging/`, so its build context is the repository (`context: ..`) and it reads `packaging/.env`, which is git-ignored and excluded from the build context by [packaging/Dockerfile.server.dockerignore](../packaging/Dockerfile.server.dockerignore):
 
 ```sh
-cp packaging/.env.example packaging/.env            # optional: model, API key, architectures, token
+cp packaging/.env.example packaging/.env            # optional: model, API key, GPU, architectures
 docker compose -f packaging/docker-compose.yml up -d --build
 docker compose -f packaging/docker-compose.yml logs -f flyx
 curl http://127.0.0.1:8080/health
 ```
 
-`packaging/docker-entrypoint.sh` starts `flyx serve` from the environment, so a container needs no arguments; arguments given to `docker run` replace that line and keep the same binding (a port mapping published by Docker reaches nothing bound to the container's own loopback). It binds `0.0.0.0` always, which is why serving a port others can reach means setting `FLYX_API_KEY`. Two consequences of serving through a published port are worth knowing before the first `403`:
+The compose file publishes `127.0.0.1:8080` and sets `init: true`, so the two `docker run` lines above are what you write by hand to change one of those choices.
 
-- a request that arrives through the port carries the bridge's gateway address rather than localhost, so the endpoints that fetch and load models answer `loading models is for this machine (or with --api-key, the key's holder)` even from the machine itself;
+`packaging/docker-entrypoint.sh` starts `flyx serve` from the environment, so a container needs no arguments; arguments given to `docker run` replace that line and keep the same binding (a port published by Docker reaches nothing bound to the container's own loopback). It binds `0.0.0.0` always, which is why serving a port others can reach means setting `FLYX_API_KEY`. Two consequences of serving through a published port are worth knowing before the first `403`:
+
+- a request that arrives through the port carries the bridge's gateway address rather than localhost, so the endpoints that fetch and load models answer `loading models is for this machine (use --api-key KEY, or --no-auth on a trusted LAN)` even from the machine itself;
 - a browser names the machine in its `Host` header, and inside a container that name is none of the addresses the server trusts, so the dashboard's own reads are refused and the page reports `GET /v1/telemetry answered HTTP 403` under a `No model loaded` panel.
 
-With a key set, open the page once as `http://<host>:<port>/#key=KEY`: the dashboard takes the key from the address's fragment, remembers it, and sends `Authorization: Bearer` on every call after that. `--no-auth` (or the dashboard's remote-management toggle, [server.md](server.md)) is the keyless answer for a trusted LAN.
+With a key set, open the page once as `http://<host>:<port>/#key=KEY`: the dashboard takes the key from the address's fragment, remembers it, and sends `Authorization: Bearer` on every call after that. That is the answer under bridge networking; `--no-auth` and the dashboard's remote-management toggle ([server.md](server.md)) are not, because they still check `Host` against the container's own addresses — they are the keyless answer for `network_mode: host`, where the container has the machine's addresses and a LAN page's `Host` matches one of them.
 
 | Variable | Effect |
 |---|---|
 | `FLYX_MODEL` | Served at startup: a Hugging Face name (`org/repo:QUANT`, fetched into the cache) or a file under `/models`. Unset starts unloaded; the dashboard then loads one. |
-| `FLYX_ARGS` | More `flyx serve` flags, split on spaces ([server.md](server.md) lists them). A value with a space in it belongs in the container's arguments instead. |
+| `FLYX_ARGS` | More `flyx serve` flags, split on whitespace, no shell evaluation ([server.md](server.md) lists them). A value with a space in it belongs in the container's arguments instead. |
 | `FLYX_PORT` | The port the server listens on and Compose publishes. Default 8080. |
+| `FLYX_HOST` | The address the server binds *inside* the container. Default `0.0.0.0`, which a port mapping needs; it does not limit what the host publishes. |
+| `FLYX_PUBLISH_ADDR` | Compose only: the host address the port is published on. Default `127.0.0.1`; `0.0.0.0` serves the network. |
 | `FLYX_API_KEY` | Requires `Authorization: Bearer <key>`; see the two consequences above. |
-| `CUDA_VISIBLE_DEVICES` | The card to serve, `nvidia-smi`'s number. One device per process, so one container per card. |
+| `GPU_DEVICE` | Compose only: the card to serve, its number as `nvidia-smi` shows it, reserved by `device_ids`. Default `0`. |
+| `CUDA_VISIBLE_DEVICES` | With `count: all` (every card visible to the container) this picks the card; with `device_ids` the container sees one card and the variable must name it `0`, so the compose file leaves it alone. |
 | `HF_TOKEN`, `HF_ENDPOINT` | Gated repositories; a mirror's endpoint. |
 | `MODELS_DIR` | A folder of your own `.gguf` files, bound read-only at `/models` (uncomment its volume line). |
-| `CUDA_IMAGE`, `FLYX_CUDA_ARCHS`, `FLYX_JOBS`, `FLYX_IMAGE_TAG` | The build: base image, architectures (80, 86, 89, 90, 100, 120), parallel jobs, the image's tag. |
+| `CUDA_IMAGE`, `RUNTIME_IMAGE`, `FLYX_CUDA_ARCHS`, `FLYX_JOBS`, `FLYX_IMAGE_TAG` | The build: base images, architectures (80, 86, 89, 90, 100, 120), parallel jobs, the image's tag. |
 
-Two details of the GPU reservation in the compose file. `CUDA_DEVICE_ORDER=PCI_BUS_ID` pins the numbering to `nvidia-smi`'s: CUDA's own orders devices by speed, so a `CUDA_VISIBLE_DEVICES=1` chosen today names a different card the day a second one is added. And with Compose's `count: all` every card is visible to the container, which is what makes that variable mean what `nvidia-smi` shows; a service that instead reserves one device by `device_ids` sees exactly one card, and there `CUDA_VISIBLE_DEVICES` must name it as `0` — the number from `nvidia-smi` fails the load with `no CUDA-capable device is detected`.
+CUDA's own device numbering orders devices by speed, so a card chosen as `1` today names a different card the day a second one is added. The compose file sets `CUDA_DEVICE_ORDER=PCI_BUS_ID`, which pins it to `nvidia-smi`'s order, and reserves the card by Compose's `device_ids`, which takes `nvidia-smi`'s number directly. A service that reserves by `device_ids` sees exactly one card, and there `CUDA_VISIBLE_DEVICES` must name it as `0` — the number from `nvidia-smi` fails the load with `no CUDA-capable device is detected`.
 
-`memlock` is raised to unlimited because `--kv-ram` (a long context's K/V in pinned host RAM, [models.md](models.md)) allocates through it: the `ulimits` block is what lets a 24 GB card serve a 262144-token window, and without it the plan the server made for pinned RAM is not the plan it gets.
+`memlock` is raised in the compose file as a knob, not a requirement. A long context's K/V in host RAM (`--kv-ram`, [models.md](models.md)) is allocated through CUDA — `cudaHostAlloc`, `cuMemCreate` — and no part of flyx reads `RLIMIT_MEMLOCK`. Measured: a server with `--ctx 65536 --kv-ram 4`, whose plan puts 3.69 GB of K/V in host memory, inside a container given `--ulimit memlock=67108864:67108864`, loaded in 17 s and served an 11,215-token prompt — fifty times the locked-memory limit it ran under. Docker's own default is 64 MiB and the NVIDIA Container Toolkit raises it, so on a GPU host the question rarely comes up; rootless Docker and Podman can refuse to raise hard limits, and a platform that rejects the `ulimits` block loses nothing.
+

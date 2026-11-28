@@ -1,0 +1,49 @@
+# Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
+#
+# Build context of packaging/Dockerfile.server only: BuildKit reads `<dockerfile>.dockerignore` next to a Dockerfile
+# in preference to a root .dockerignore, which is what keeps packaging/package_linux_docker.sh working — that script
+# builds packaging/Dockerfile.linux from the same directory, and its context needs tests/requirements.txt.
+#
+# What the server image never reads. A pattern without a slash matches at every depth, so `**/` is only needed where
+# a name has to be excluded below the context root as well: the model folders users point MODELS_DIR at, the nested
+# .env this file's compose setup keeps its FLYX_API_KEY and HF_TOKEN in.
+
+# build trees, packages, logs
+build/
+build-*/
+dist/
+assets/
+logs/
+flyx-build*/
+.sync.tar.gz
+
+# git and CI
+.git
+.gitattributes
+.github
+
+# Python caches and local environments
+**/__pycache__/
+**/*.pyc
+.venv/
+.venv-*/
+
+# local configuration and secrets, at any depth: packaging/.env is created from packaging/.env.example by the docs,
+# and `COPY . .` would otherwise ship it in the builder layer and rebuild CUDA on every edit of it
+**/.env
+**/.env.*
+!**/.env.example
+CMakeUserPresets.json
+
+# model files: mount them at /models (FLYX_MODELS_DIR), the image never carries one. Compose's default MODELS_DIR of
+# ./data/models lands inside the context as packaging/data/, so exclude that tree by name too.
+**/*.gguf
+**/*.safetensors
+**/*.bin
+**/*.flyx
+packaging/data/
+
+# not built into the image: the server builds with -DFLYX_TESTS=OFF (packaging/Dockerfile.server)
+docs/
+tests/
+bench/

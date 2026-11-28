@@ -13,3 +13,11 @@ models/**/.cache/
 build-*/
 dist/
 CMakeUserPresets.json
+
+# Local configuration: packaging/.env is the compose file's environment, keys and tokens included
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
