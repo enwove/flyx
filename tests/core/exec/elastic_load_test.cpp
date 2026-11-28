@@ -1008,6 +1008,11 @@ int main(int argc, char** argv) {
   {
     using Fitter = plan::ResidencyFitter;
     check(Fitter::host_room(16ull << 30, 0, 0) == UINT64_MAX, "unreported available host RAM leaves the cap open");
+    // --ram-reserve takes host_keep()'s place (32 GiB: 2 GiB) in the room offloaded weights may take.
+    check(Fitter::host_room(32ull << 30, 10ull << 30, 1ull << 30) == (7ull << 30) &&
+              Fitter::host_room(32ull << 30, 10ull << 30, 1ull << 30, 0) == (9ull << 30) &&
+              Fitter::host_room(32ull << 30, 10ull << 30, 0, int64_t(4ull << 30)) == (6ull << 30),
+          "ram_reserve replaces host_keep in the offload host room");
     for (bool pages_reclaimed : {false, true}) {
       Fitter fitter;
       int releases = 0;
