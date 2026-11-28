@@ -14,12 +14,14 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "core/modelfile/readers.h"
+#include "core/modelfile/sampling.h"
 #include "core/os/os.h"
 #include "core/os/path.h"
 #include "core/tokenizer/tokenizer.h"
@@ -299,10 +301,14 @@ class GgufBytes {
     this->key(key, 5);
     raw(&v, 4);
   }
+  void f32(const std::string& key, float v) {
+    this->key(key, 6);
+    raw(&v, 4);
+  }
   void tensor(const std::string& name, const std::vector<uint64_t>& shape, const std::vector<float>& values) {
     tensors_.push_back({name, shape, values});
   }
-  void write(const std::filesystem::path& path) const {
+  std::vector<uint8_t> data() const {
     std::vector<uint8_t> out = {'G', 'G', 'U', 'F'};
     auto put = [&](const void* p, size_t n) { out.insert(out.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
     const uint32_t version = 3;
@@ -328,6 +334,10 @@ class GgufBytes {
       put(t.values.data(), t.values.size() * 4);
       out.resize((out.size() + 31) / 32 * 32);
     }
+    return out;
+  }
+  void write(const std::filesystem::path& path) const {
+    auto out = data();
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     f.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size()));
   }
@@ -351,6 +361,34 @@ class GgufBytes {
   uint64_t n_kv_ = 0;
   std::vector<Tensor> tensors_;
 };
+
+void sampling_metadata() {
+  GgufBytes file;
+  file.str("general.architecture", "inkling2_loop");
+  file.f32("general.sampling.temp", 1);
+  file.i32("general.sampling.top_k", 0);
+  file.f32("general.sampling.top_p", 1);
+  file.f32("general.sampling.min_p", 0);
+  file.tensor("weight", {1}, {1.f});
+  ModelFile::Contents c;
+  std::string err;
+  auto data = file.data();
+  auto parse = [&] { return modelfile::read_gguf(data.data(), data.size(), "test", &c, &err, false); };
+  check(parse(), "GGUF with optional sampling fields loads " + err);
+  auto fields = read_model_sampling(c.header);
+  check(fields.gguf.temperature == 1 && fields.gguf.top_k == 0 && fields.gguf.top_p == 1 &&
+        fields.warnings.empty() && c.header.at("gguf").at("general.sampling.min_p") == 0,
+        "explicit GGUF settings and inactive original metadata");
+  std::string key = "general.sampling.temp";
+  patch(&data, locate(data, key) + key.size() + 4, std::numeric_limits<float>::quiet_NaN());
+  check(parse(), "an optional NaN does not prevent loading " + err);
+  fields = read_model_sampling(c.header);
+  check(!fields.gguf.temperature && fields.gguf.top_k == 0 && fields.warnings.size() == 1,
+        "invalid optional temperature diagnosed without losing other defaults");
+  file.f32("inkling2_loop.attention.layer_norm_rms_epsilon", std::numeric_limits<float>::infinity());
+  data = file.data();
+  check(!parse(), "nonfinite architecture metadata still rejects the file");
+}
 
 // A vision projector (general.type mmproj) beside a model: one file, and the same tensors in two shards whose second
 // says nothing of its type, or says the same; opened from either shard, each gives the one file's tensors.  Refused:
@@ -542,6 +580,7 @@ int main(int argc, char** argv) {
   split_gguf(dir);
   companion_skips_tokenizer(dir + "/tiny_gguf.gguf");
   projector_split(dir);
+  sampling_metadata();
   array_stride_bounds();
   dflash_gguf_peek_and_open(dir);
   return flyx::test::finish("gguf_test");

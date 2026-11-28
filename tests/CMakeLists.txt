@@ -250,6 +250,10 @@ add_dependencies(inkling2_test flyx-cpu_ref)
 flyx_register_test(inkling2_cpu_ref inkling2_test ${CMAKE_BINARY_DIR}/inkling2_assets/cpu_ref cpu_ref)
 set_tests_properties(inkling2_cpu_ref PROPERTIES FIXTURES_SETUP inkling2_models)
 
+flyx_add_unit_test(sampling_defaults_test apps/common/sampling_defaults_test.cpp)
+target_sources(sampling_defaults_test PRIVATE ${CMAKE_SOURCE_DIR}/apps/common/sampling_defaults.cpp)
+flyx_register_test(sampling_defaults sampling_defaults_test)
+
 add_executable(numbers_test apps/common/numbers_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/numbers.cpp)
 target_include_directories(numbers_test PRIVATE ${CMAKE_SOURCE_DIR})
 add_executable(model_source_test apps/common/model_source_test.cpp ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp)
@@ -280,6 +284,7 @@ target_link_libraries(gpu_apps_test PRIVATE flyx_core)
 add_executable(http_util_test apps/flyx-server/http_util_test.cpp
                               ${CMAKE_SOURCE_DIR}/apps/flyx-server/http_util.cpp
                               ${CMAKE_SOURCE_DIR}/apps/flyx-server/model_host.cpp
+                              ${CMAKE_SOURCE_DIR}/apps/common/sampling_defaults.cpp
                               ${CMAKE_SOURCE_DIR}/apps/flyx-server/request_log.cpp
                               ${CMAKE_SOURCE_DIR}/apps/flyx-server/drafter_speeds.cpp
                               ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp
@@ -306,6 +311,7 @@ flyx_add_unit_test(scheduler_test core/exec/scheduler_test.cpp flyx-test-host-kv
 # A model switch in flyx serve's host: the server's model host and model sources over the tiny model.
 flyx_add_unit_test(model_host_test apps/flyx-server/model_host_test.cpp flyx-test-host-kv)
 target_sources(model_host_test PRIVATE ${CMAKE_SOURCE_DIR}/apps/flyx-server/model_host.cpp
+                                       ${CMAKE_SOURCE_DIR}/apps/common/sampling_defaults.cpp
                                        ${CMAKE_SOURCE_DIR}/apps/common/model_source.cpp
                                        ${CMAKE_SOURCE_DIR}/apps/common/numbers.cpp
                                        ${CMAKE_SOURCE_DIR}/apps/flyx-server/drafter_speeds.cpp)
@@ -508,6 +514,7 @@ flyx_add_py_test(bench_prompts_grammar ${CMAKE_SOURCE_DIR}/tests/apps/flyx-cli/b
 # Two builds' flyx bench --prompts records of one command: the same answers and rounds over the prompts both hold, and
 # what fails (bench/ab/same_runs.py; records made up, no model).
 flyx_add_py_test(same_runs ${CMAKE_SOURCE_DIR}/tests/bench/ab/same_runs_test.py)
+flyx_add_py_test(dashboard_syntax ${CMAKE_CURRENT_SOURCE_DIR}/apps/flyx-server/dashboard_syntax.py SKIP_RETURN_CODE 77)
 flyx_add_py_test(layering ${CMAKE_SOURCE_DIR}/tools/check_layering.py ARGS ${CMAKE_SOURCE_DIR})
 flyx_add_py_test(numerics ${CMAKE_SOURCE_DIR}/tools/check_numerics.py ARGS ${CMAKE_SOURCE_DIR})
 flyx_add_py_test(docs ${CMAKE_SOURCE_DIR}/tools/check_docs.py ARGS ${CMAKE_SOURCE_DIR})

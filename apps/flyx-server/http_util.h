@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 
+#include "apps/common/engine_flags.h"
 #include "apps/flyx-server/model_host.h"
 #include "apps/flyx-server/request_log.h"
 #include "core/exec/scheduler.h"
@@ -17,7 +18,6 @@
 namespace flyx::server {
 
 struct Server;
-struct Config;
 
 inline constexpr const char* kSupersededMessage = "A newer request took over this conversation.";
 
@@ -129,7 +129,8 @@ bool read_optional_token_limit(const ojson& body, const char* key, bool allow_ze
                                std::string* err);
 // temperature / top_p / top_k / seed / presence_penalty / frequency_penalty
 // from a request body; request values win over the server defaults for the thinking mode.
-bool read_sampling(const ojson& body, bool thinking, const Config& cfg, SamplingParams* out, std::string* err);
+bool read_sampling(const ojson& body, bool thinking, apps::SamplingOverrides* out, apps::SamplingMode* mode,
+                   std::string* err);
 // "stop": a string or a list of strings.
 bool read_stop(const ojson& v, std::vector<std::string>* out, std::string* err);
 
@@ -138,6 +139,7 @@ bool serving(Server* s, httplib::Response& res, ModelHost::Served* out, bool ant
 
 struct AdmittedJob {
   ModelHost::Served served;
+  SamplingParams sampling;
   std::shared_ptr<Job> job;
   std::string id;
   std::shared_ptr<Recording> rec;

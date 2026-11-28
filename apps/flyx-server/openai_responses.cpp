@@ -314,11 +314,7 @@ void handle_responses(Server* s, ResponseStore* store, const httplib::Request& r
   if (!read_optional_token_limit(body, "max_output_tokens", false, nullptr, &in.gen.max_new_tokens, &err))
     return send_openai_error(res, 400, err);
   if (body.contains("stop") && !read_stop(body["stop"], &in.gen.stop, &err)) return send_openai_error(res, 400, err);
-  if (!read_sampling(body, in.chat_options.enable_thinking, s->cfg, &in.gen.sampling, &err))
-    return send_openai_error(res, 400, err);
 
-  const float temperature = in.gen.sampling.temperature;
-  const float top_p = in.gen.sampling.top_p;
   bool encrypted = false;
   if (const auto inc = body.find("include"); inc != body.end() && !inc->is_null()) {
     if (!inc->is_array()) return send_openai_error(res, 400, "include must be a list of strings");
@@ -353,11 +349,11 @@ void handle_responses(Server* s, ResponseStore* store, const httplib::Request& r
              {"previous_response_id", previous.empty() ? ojson(nullptr) : ojson(previous)},
              {"reasoning", {{"effort", effort}, {"summary", nullptr}}},
              {"store", keep},
-             {"temperature", temperature},
+             {"temperature", ad.sampling.temperature},
              {"text", {{"format", format}}},
              {"tool_choice", body.contains("tool_choice") ? body["tool_choice"] : ojson("auto")},
              {"tools", body.contains("tools") && body["tools"].is_array() ? body["tools"] : ojson::array()},
-             {"top_p", top_p},
+             {"top_p", ad.sampling.top_p},
              {"truncation", "disabled"},
              {"usage", nullptr},
              {"user", nullptr},

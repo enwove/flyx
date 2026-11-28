@@ -34,7 +34,8 @@ if __name__ == "__main__":
         producer = "Weights · 模型 😁"
         for data in configs.values():
             data["description"] = producer
-        configs[generation]["eos_token_id"] = [2, 47]
+        configs[generation].update(eos_token_id=[2, 47], temperature=0.6, top_k=0, do_sample=False,
+                                   max_length=512, min_p=0.05)
         quant = configs[target].pop("quantization_config")
         quant["producer"]["name"] = producer
         configs[model / "hf_quant_config.json"] = {"quantization": quant}
@@ -49,5 +50,8 @@ if __name__ == "__main__":
         with Reader(outputs[1]) as reader:
             assert reader.header["quant"]["producer"] == producer
             assert 47 in reader.header["generation"]["eos_ids"]
+            assert reader.header["generation"]["sampling"] == {
+                "temperature": 0.6, "top_k": 0, "do_sample": False, "min_p": 0.05}
+            assert "max_new_tokens" not in reader.header["generation"]
         expected = generate(outputs[0], library)
         assert len(expected) == 8 and generate(outputs[1], library) == expected

@@ -392,6 +392,19 @@ def _read_optional_config(path: str) -> dict:
     return _read_config(path) if os.path.exists(path) else {}
 
 
+def _generation_sampling(config: dict) -> dict:
+    """Keep serialized fields only. Null preserves an invalid optional value for load diagnostics."""
+    keys = ("temperature", "top_p", "top_k", "do_sample", "presence_penalty", "frequency_penalty",
+            "min_p", "repetition_penalty", "typical_p")
+    result = {}
+    for key in keys:
+        if key in config:
+            value = config[key]
+            numeric = isinstance(value, int) or (isinstance(value, float) and np.isfinite(value))
+            result[key] = value if numeric else None
+    return result
+
+
 def _quant_config(model_dir: str, hf_cfg: dict) -> dict | None:
     """NVFP4 checkpoints from NVIDIA ModelOpt (hf_quant_config.json or quantization_config), or compressed-tensors'
     nvfp4-pack-quantized (QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4): every quantized linear NVFP4, groups of 16."""
@@ -554,6 +567,9 @@ def convert(model_dir: str, out: str, draft_dir: str | None = None, log=print, a
                    "dv": os.path.basename(os.path.normpath(dv_dir)) if dv_dir else None,
                    "lora": os.path.basename(os.path.normpath(lora_dir)) if lora_dir else None},
     }
+    sampling = _generation_sampling(_read_optional_config(os.path.join(model_dir, "generation_config.json")))
+    if sampling:
+        w.meta["generation"]["sampling"] = sampling
     if lora:  # a reader that dropped the adapters would decode the plain model: format 2, which earlier builds refuse
         w.meta["requires"] = ["lora"]
     w.write(out)
