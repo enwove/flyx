@@ -348,7 +348,8 @@ __global__ void __launch_bounds__(32 * CH) k_gemm_skinny_mt(Parts x, const float
 #pragma unroll
     for (int i = 0; i < NT; ++i) acc[m][i][0] = acc[m][i][1] = acc[m][i][2] = acc[m][i][3] = 0.f;
 #pragma unroll UNROLL
-  for (int s = warp; s < spans; s += CH) {  // the warp's chunk: every CH-th span (k_gemm_skinny's)
+  // the warp's chunk: every CH-th pair of spans (k_gemm_skinny's)
+  for (int s = 2 * warp; s < spans; s += (s & 1) ? 2 * CH - 1 : 1) {
     const int k = s << 5;
     uint4 w[NT];
 #pragma unroll
