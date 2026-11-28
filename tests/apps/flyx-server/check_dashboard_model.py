@@ -64,7 +64,16 @@ def dir_model(folder, file, size, kind="gguf", quant=None):
             "path": folder + "\\" + file, "size": size, "modified": 1.7e9, "revision": None, "current": True, "mtp": None}
 
 
-LOCAL_DRAFTER = dict(dir_model(FOLDER, "helper.gguf", int(0.3 * GB), kind="drafter"), drafter_kind="dflash2")
+LOCAL_DRAFTER = dict(dir_model(FOLDER, "helper.gguf", int(0.3 * GB), kind="drafter"), drafter_kind="dflash2",
+                     drafter_mode="dflash2")
+# An mtp-*.gguf of an ordinary model, no MTP layers in its header: listed as MTP by its name, no mode for a load; in a
+# folder of this machine and in the Hugging Face cache.
+LOCAL_MTP_NAMED = dict(dir_model(FOLDER, "mtp-Plain-Q8_0.gguf", int(0.2 * GB), kind="drafter"), drafter_kind="mtp",
+                       drafter_mode="")
+CACHED_MTP_NAMED = {"name": REPO + ":mtp-Plain-Q8_0.gguf", "kind": "drafter", "drafter_kind": "mtp", "drafter_mode": "",
+                    "source": "hub", "repo": REPO, "quant": None, "file": "mtp-Plain-Q8_0.gguf",
+                    "path": CACHE + "\\mtp-Plain-Q8_0.gguf", "size": int(0.2 * GB), "modified": 1.7e9,
+                    "revision": "abc123", "current": True, "mtp": None, "mmproj": None}
 CATALOG = {"cache": CACHE, "cache_from": "default", "dirs": [FOLDER], "models": [
     hub_model(REPO, "Q4_K_M", int(17.6 * GB), "in-file", mmproj="in-repo"),
     hub_model(REPO, "IQ3_XXS", int(11.8 * GB), "in-repo", mmproj="in-repo"),
@@ -72,9 +81,12 @@ CATALOG = {"cache": CACHE, "cache_from": "default", "dirs": [FOLDER], "models": 
     dir_model(FOLDER, "tiny-bf16.flyx", int(0.4 * GB), "flyx"),
     dir_model(FOLDER, "Other-12B-Q5_K_M.gguf", int(8.9 * GB), quant="Q5_K_M"),
     LOCAL_DRAFTER,
+    LOCAL_MTP_NAMED,
+    CACHED_MTP_NAMED,
     dir_model(FOLDER, "mmproj-BF16.gguf", int(0.9 * GB), kind="mmproj"),
-    {"name": "acme/Tiny-27B-DFlash2", "kind": "drafter", "drafter_kind": "dflash2", "source": "hub", "repo": "acme/Tiny-27B-DFlash2", "size": int(1.9 * GB)},
-    {"name": "acme/Model-DFlash2-GGUF:BF16", "kind": "drafter", "drafter_kind": "dflash2", "source": "hub",
+    {"name": "acme/Tiny-27B-DFlash2", "kind": "drafter", "drafter_kind": "dflash2", "drafter_mode": "dflash2", "source": "hub",
+     "repo": "acme/Tiny-27B-DFlash2", "size": int(1.9 * GB)},
+    {"name": "acme/Model-DFlash2-GGUF:BF16", "kind": "drafter", "drafter_kind": "dflash2", "drafter_mode": "dflash2", "source": "hub",
      "repo": "acme/Model-DFlash2-GGUF", "quant": "BF16", "file": "Model-DFlash2-Draft-BF16.gguf",
      "path": CACHE + "\\Model-DFlash2-Draft-BF16.gguf", "size": int(1.0 * GB), "modified": 1.7e9,
      "revision": "def456", "current": True, "mtp": None, "mmproj": None}]}
@@ -978,7 +990,7 @@ def check_local(page, server):
     expect(folders).to_have_count(3)  # where Hugging Face downloads to, the model directory, the served model's folder
     expect(folders.nth(0).locator(".ps")).to_have_text(CACHE)
     expect(folders.nth(1).locator(".ps")).to_have_text(FOLDER)
-    expect(models).to_have_count(9)  # #4 added a cached Hub GGUF drafter, #31 a local one
+    expect(models).to_have_count(11)  # #4 added a cached Hub GGUF drafter, #31 a local one, #84 an mtp-*.gguf in each
     one = page.locator('#lc-list .prow.model[data-model="' + REPO + ':IQ3_XXS"]')
     expect(one.locator(".pn")).to_have_text("Tiny-27B-GGUF · IQ3_XXS")
     expect(one.locator(".pm")).to_have_text("11.8 GB")
@@ -1019,6 +1031,20 @@ def check_local(page, server):
     expect(page.locator("#lc-quants")).to_be_visible()
     expect(page.locator("#mf-load")).to_have_text("Draft with it")
     expect(page.locator("#mf-load")).to_be_enabled()
+    # The mtp-*.gguf of an ordinary model, in the cache and in this machine's folder: an MTP chip by its name, and drafted
+    # with in auto (its drafter_mode empty), never --drafter mtp.
+    for name, spec in ((CACHED_MTP_NAMED["name"], CACHED_MTP_NAMED["path"]), (LOCAL_MTP_NAMED["name"], LOCAL_MTP_NAMED["path"])):
+        page.locator('#lc-list .prow.model[data-model="%s"]' % selector(name)).click()
+        expect(page.locator("#lc-detail .dchips")).to_contain_text("MTP")
+        expect(page.locator("#mf-load")).to_have_text("Draft with it")
+        page.locator("#mf-load").click()
+        expect(page.locator("#sd-file")).to_have_value(spec)
+        expect(page.locator("#mf-cmd")).not_to_contain_text("--drafter mtp")
+        confirm(page, "#mf-reload", "Reload")
+        body = server.posted[-1]
+        assert (body["drafter"], body["drafters"]) == ("", [spec]), body
+        page.locator("#mf-reset").click()
+        view(page, "library")
     page.locator('#lc-list .prow.model[data-model$="mmproj-BF16.gguf"]').click()
     expect(page.locator("#lc-detail")).to_contain_text("vision projector")
     expect(page.locator("#lc-detail .banner button")).to_have_count(0)
@@ -1041,7 +1067,7 @@ def check_local(page, server):
     page.locator("#mf-reset").click()
     view(page, "library")
     folders.nth(1).click()
-    expect(page.locator("#lc-companions .mrow")).to_have_count(2)
+    expect(page.locator("#lc-companions .mrow")).to_have_count(3)
     page.locator('#lc-companions .mrow[data-comp$="helper.gguf"]').click()
     page.locator('#mf-cached .mrow[data-name$="Other-12B-Q5_K_M.gguf"]').click()
     page.locator('#lc-companions .mrow[data-comp$="mmproj-BF16.gguf"]').click()
@@ -1078,12 +1104,13 @@ def check_local(page, server):
     expect(page.locator(".modal")).to_have_count(0)
     folders.nth(0).click()
     page.locator('.rgroup[data-repo="' + REPO + '"] .rgroup-h .del').click()
-    expect(page.locator(".modal")).to_contain_text("2 files")
+    expect(page.locator(".modal")).to_contain_text("3 files")  # its two quantizations and the mtp-*.gguf
     page.locator(".modal").get_by_role("button", name="Delete").click()
     expect(page.locator(".modal")).to_have_count(0)
     page.wait_for_function("() => true")
     page.wait_for_timeout(600)  # its files go one after another
-    assert server.deleted == ["acme/Tiny-4B-GGUF:Q8_0", REPO + ":Q4_K_M", REPO + ":IQ3_XXS"], server.deleted
+    assert sorted(server.deleted) == sorted(["acme/Tiny-4B-GGUF:Q8_0", REPO + ":Q4_K_M", REPO + ":IQ3_XXS",
+                                             CACHED_MTP_NAMED["name"]]), server.deleted
     # Where no dialog can be shown, the folders are browsed in the page.
     server.dialog = (501, {"error": {"message": "no desktop to show a folder dialog on: no display"}})
     page.locator("#mf-add").click()
@@ -1668,6 +1695,10 @@ def check_local_posix(open_page, want):
     view(page2, "library")
     page2.locator('#src-seg [data-src="local"]').click()
     expect(page2.locator("#lc-list .prow.folder")).to_have_count(5)
+    for _ in range(50):  # the folder's listing is asked for after the list is drawn
+        if srv2.dir_asked:
+            break
+        page2.wait_for_timeout(100)
     assert "/models" in srv2.dir_asked and "/models/a" not in srv2.dir_asked, srv2.dir_asked
     page2.close()
 

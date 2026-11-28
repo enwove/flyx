@@ -239,6 +239,22 @@ int main() {
     check(flyx::hub::parse_name(mtp_named.id + ":mtp-Tiny-Q8_0.gguf", &mtp_name) &&
               flyx::apps::drafter_kind(mtp_named, mtp_name).empty(),
           "and the Hub name's kind the same: none");
+    // The same file in a folder of this machine (GET /v1/hub/dir, the --models-dir part of /v1/hub/cached): listed as
+    // MTP by its name, its drafter_mode, what a load is told, none; a header that proves its kind gives the mode.
+    const fs::path folder = tmp / "plain-mtp";
+    write_gguf(folder / "mtp-Plain-Q8_0.gguf", "qwen35");
+    write_gguf(folder / "dspark-Plain-Q8_0.gguf", "dflash", 1);
+    const auto here = flyx::apps::scan_model_dirs({from_path(folder)}, 1);
+    const auto at = [&](const char* file) {
+      for (const auto& m : here)
+        if (m.file == file) return m;
+      return flyx::apps::LocalModel{};
+    };
+    check(at("mtp-Plain-Q8_0.gguf").kind == "drafter" && at("mtp-Plain-Q8_0.gguf").drafter_kind == "mtp" &&
+              at("mtp-Plain-Q8_0.gguf").drafter_mode.empty(),
+          "a local mtp-*.gguf with no MTP layers: MTP in the list, no mode for a load");
+    check(at("dspark-Plain-Q8_0.gguf").drafter_kind == "dspark" && at("dspark-Plain-Q8_0.gguf").drafter_mode == "dspark",
+          "a local DSpark GGUF whose header says so: that mode");
   }
   // A LoRA adapter of a repository listed as the Hub lists it (fetch_lora_in), its files' blobs standing in for the
   // transfers as above: a config longer than a load reads (modelfile::kPeftConfigMaxBytes) is refused by its listed

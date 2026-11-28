@@ -163,6 +163,12 @@ GgufClassification gguf_identity(const flyx::GgufPeek& peek, const std::string& 
 
 }  // namespace
 
+std::string drafter_mode_of(const GgufClassification& c) {
+  if (c.arch.empty()) return "";
+  if (c.arch == "dflash") return c.drafter_kind;  // dspark or dflash2, by the header's Markov flag
+  return c.mtp_layers > 0 ? "mtp" : "";
+}
+
 GgufClassification classify_gguf(const std::string& path, const std::string& rel_name, uint64_t size,
                                  fs::file_time_type modified, const PathAllowFn& allow_path) {
   std::string name = rel_name.empty() ? path : rel_name;
@@ -455,6 +461,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
               if (cls.kind.empty()) return more;
               m.kind = cls.kind;
               m.drafter_kind = cls.drafter_kind;
+              m.drafter_mode = drafter_mode_of(cls);
               m.mtp_layers = cls.mtp_layers;
             } else {
               m.kind = "flyx";
@@ -492,6 +499,7 @@ std::vector<LocalModel> scan_model_dirs(const std::vector<std::string>& dirs, in
     m.file = first.file;
     m.kind = cls.kind;
     m.drafter_kind = cls.drafter_kind;
+    m.drafter_mode = drafter_mode_of(cls);
     m.mtp_layers = cls.mtp_layers;
     m.quant = hub::quant_in_name(first.file);
     m.size = total;

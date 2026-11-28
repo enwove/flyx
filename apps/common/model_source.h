@@ -141,6 +141,10 @@ struct GgufClassification {
   std::string arch;          // general.architecture, "" if the header is unreadable
   int mtp_layers = -1;       // <arch>.nextn_predict_layers when valid, -1 if unreadable/invalid
 };
+// The drafter mode a GGUF's header proves, the one a load may be told: architecture dflash's (dspark or dflash2, by
+// its Markov flag), "mtp" for MTP layers, "" otherwise (unread, or a kind only the file's name gives: an mtp-*.gguf of
+// an ordinary model with no MTP layers is "mtp" in drafter_kind, none here), as drafter_kind(path) reads it.
+std::string drafter_mode_of(const GgufClassification& c);
 GgufClassification classify_gguf(const std::string& path, const std::string& rel_name = "", uint64_t size = 0,
                                  std::filesystem::file_time_type modified = std::filesystem::file_time_type::min(),
                                  const PathAllowFn& allow_path = {});
@@ -155,11 +159,7 @@ struct HubGguf {
   // The drafter kind the file's own header says (a whole file in the cache, its header read), "" while it is not or
   // where the header names none: what a load may be told, as drafter_kind(path) reads it, where cls.drafter_kind can
   // be a guess from the file's name (mtp-*.gguf of an ordinary model with no MTP layers is "mtp" there, none here).
-  std::string header_drafter_kind() const {
-    if (!cached || cls.arch.empty()) return "";
-    if (cls.arch == "dflash") return cls.drafter_kind;  // dspark or dflash2, by the header's Markov flag
-    return cls.mtp_layers > 0 ? "mtp" : "";
-  }
+  std::string header_drafter_kind() const { return cached ? drafter_mode_of(cls) : ""; }
 };
 std::vector<HubGguf> hub_ggufs(const hub::Repo& repo, const PathAllowFn& allow_path = {});
 // The companion of `kind` ("mmproj", "mtp", "dflash2" or "dspark") a repository offers first: the Hub's preferred
@@ -180,7 +180,8 @@ struct LocalModel {
   std::string root;          // canonical scan root that found this entry
   std::string file;          // its name
   std::string kind;          // "gguf", "flyx", "drafter", "mmproj", or "lora" (a PEFT adapter: path its folder)
-  std::string drafter_kind;  // "dflash2", "dspark" or "mtp" when kind == "drafter", else ""
+  std::string drafter_kind;  // "dflash2", "dspark" or "mtp" when kind == "drafter", else "" (the list's: maybe a name's)
+  std::string drafter_mode;  // the mode its header proves (drafter_mode_of): what a load may be told
   std::string quant;         // from the name, "" when it names none
   uint64_t size = 0;
   int parts = 0;             // > 1 for a complete split GGUF (path points to shard 1, size is the sum)

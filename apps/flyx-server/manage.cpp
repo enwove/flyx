@@ -139,6 +139,7 @@ Listed dir_entry(const apps::LocalModel& m, const apps::PathAllowFn& allow = {})
     l.json["known_drafters"] = known_drafters_json(m.path, apps::known_drafters(o.repo, o.base_models, false, allow));
   }
   if (m.kind == "drafter" && !m.drafter_kind.empty()) l.json["drafter_kind"] = m.drafter_kind;
+  if (m.kind == "drafter") l.json["drafter_mode"] = m.drafter_mode;  // what a load is told: its header's alone
   if (m.parts > 1) l.json["parts"] = m.parts;
   l.on_disk = {m.path};
   return l;
@@ -162,7 +163,7 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
     auto disk_of = [&](const std::string& path) { return from_path((to_path(c.dir) / to_path(path)).make_preferred()); };
     auto entry = [&](const std::string& name, const std::string& kind, const std::string& quant,
                      const std::string& file, const std::string& disk, uint64_t size, fs::file_time_type modified,
-                     int mtp_count, const std::string& drafter_kind) {
+                     int mtp_count, const std::string& drafter_kind, const std::string& drafter_mode = "") {
       Listed l;
       l.repo = c.repo, l.commit = c.commit;
       l.json = {{"name", name + suffix}, {"kind", kind}, {"source", "hub"}, {"repo", c.repo}, {"quant", or_null(quant)},
@@ -170,6 +171,7 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
                 {"revision", c.commit}, {"current", c.current}, {"mtp", kind == "gguf" && mtp_count > 0 ? ojson("in-file") : ojson(nullptr)},
                 {"mmproj", nullptr}, {"dflash2", nullptr}};
       if (kind == "drafter" && !drafter_kind.empty()) l.json["drafter_kind"] = drafter_kind;
+      if (kind == "drafter") l.json["drafter_mode"] = drafter_mode;  // what a load is told: header or config alone
       if (kind == "gguf" || kind == "flyx")  // what its file says it comes from
         l.json["known_drafters"] = known_drafters_json(
             name + suffix,
@@ -200,7 +202,8 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
       if (cls.drafter_kind == "mtp") repos_with_mtp.insert(c.repo);
       if (!seen.insert({c.repo, g.file.path}).second) continue;
       Listed l = entry(c.repo + ":" + item.selector, cls.kind, g.quant, g.file.path.substr(g.file.path.rfind('/') + 1),
-                       item.disk, g.total_size, item.modified, cls.mtp_layers, cls.drafter_kind);
+                       item.disk, g.total_size, item.modified, cls.mtp_layers, cls.drafter_kind,
+                       item.header_drafter_kind());
       l.vision = apps::reads_vision(cls.arch);
       if (g.split) l.json["parts"] = int(g.parts.size());
       for (const hub::RepoFile& p : g.parts) l.files.push_back(p.path), l.on_disk.push_back(disk_of(p.path));
@@ -221,8 +224,8 @@ std::vector<Listed> listing(const Server& s, const httplib::Request* req = nullp
       const std::string disk = from_path(to_path(c.dir).make_preferred());
       const auto modified = fs::last_write_time(to_path(disk), ec);
       // its config's kind ("dflash2", "dflash", "dspark", "dspine", "eagle4")
-      l = entry(c.repo, "drafter", "", c.repo.substr(c.repo.find('/') + 1), disk, size, modified, -1,
-                flyx::drafter_source_kind(c.dir, allow));
+      const std::string kind = flyx::drafter_source_kind(c.dir, allow);
+      l = entry(c.repo, "drafter", "", c.repo.substr(c.repo.find('/') + 1), disk, size, modified, -1, kind, kind);
     } else {
       const std::string base = files[0].path.substr(files[0].path.rfind('/') + 1);
       const std::string disk = disk_of(files[0].path);

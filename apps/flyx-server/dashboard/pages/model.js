@@ -1612,7 +1612,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           disabled: !model.id || busy, onClick: () => projectWith(m.path || m.name) }
       : drafter
       ? { title: m.name, sub: "A drafter is not loaded on its own.", label: "Draft with it",
-          disabled: !model.id || busy, onClick: () => draftWith(m.path || m.name, m.drafter_kind) }
+          disabled: !model.id || busy, onClick: () => draftWith(m.path || m.name, m.drafter_mode || "") }
       : lora
       ? { title: m.path || m.name, sub: "A LoRA adapter is not loaded on its own.", label: "Use with the model",
           disabled: !model.id || busy, onClick: () => loraWith(m.source === "hub" ? m.name : m.path || m.name) }
@@ -1678,7 +1678,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
                       onClick=${() => removeRepo(name, all)}><${Icon} name="trash"/></button></div>
             ${mine.length ? html`<div class="mrows" role="listbox">${rowsView(mine)}</div>` : ""}
             ${drafters.map((dr) => html`<div class="banner hint"><div class="grow2">${t(dr.name + " is a drafter (" + gb(dr.size) + " GB), not a model: it drafts for one, and is not loaded on its own.")}</div>
-              ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(dr.path || dr.name, dr.drafter_kind)}>${t("Draft with it")}</button>` : ""}</div>`)}
+              ${model.id ? html`<button class="btn sm" onClick=${() => draftWith(dr.path || dr.name, dr.drafter_mode || "")}>${t("Draft with it")}</button>` : ""}</div>`)}
           </div>`;
       });
       const extraAll = extraDirModels(cacheDir);
@@ -1711,10 +1711,11 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
     const singleDrafter = j && j.kind === "file" && folderDrafters.length === 1 ? folderDrafters[0] : null;
     const relOf = (m) => j && j.kind === "dir" && m.path.length > j.path.length ? stripLeadSep(m.path.slice(j.path.length)) : m.file;
     const localComps = [
-      // A file on this machine: its kind read from its header (GET /v1/hub/dir), the mode a load is told too.
+      // A file on this machine: its kind for the list (drafter_kind: maybe its name's), the mode its header proves for a
+      // load (drafter_mode, GET /v1/hub/dir and /v1/hub/cached).
       ...folderDrafters.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
-        kind: m.drafter_kind || "", mode: m.drafter_kind || "", size: m.size, cached: true, default: false,
+        kind: m.drafter_kind || "", mode: m.drafter_mode || "", size: m.size, cached: true, default: false,
       })),
       ...folderMmproj.map((m) => ({
         key: m.path || m.name, spec: m.path || m.name, file: m.file, path: relOf(m),
@@ -1729,7 +1730,7 @@ export function ModelPage({ active, libraryAsked, currentAsked }) {
           overrides: null }
       : singleDrafter
       ? { action: { title: singleDrafter.path || singleDrafter.name, sub: "A drafter is not loaded on its own.",
-                    label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(singleDrafter.path || singleDrafter.name, singleDrafter.drafter_kind) },
+                    label: "Draft with it", disabled: !model.id || busy, onClick: () => draftWith(singleDrafter.path || singleDrafter.name, singleDrafter.drafter_mode || "") },
           overrides: null }
       : companionBarState(rows, selLocalDraft, selLocalMm, () => { setLocalDraft(""); setLocalMmproj(""); });
     const loadNote = start ? "Open a folder to see its model files." : "";
