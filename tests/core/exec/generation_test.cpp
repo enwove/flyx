@@ -463,7 +463,10 @@ void test_default_max_new_tokens(const char* model, const flyx_backend_api* cpu)
 void test_thinking_budget(const char* model, const flyx_backend_api* cpu) {
   g_cpu = cpu;
   flyx_test_delegate(cpu);
-  auto run = [&](bool speculative, std::vector<int32_t>* out, std::vector<int32_t>* close) {
+  constexpr int kBudget = 9, kReply = 40;
+  // A reply from `prompt`: under the budget (budget >= 0) or none; its tokens.
+  auto run = [&](bool speculative, const std::vector<int32_t>* prompt, int budget, int max_new,
+                 std::vector<int32_t>* out, std::vector<int32_t>* base, std::vector<int32_t>* close) {
     EngineOptions eo;
     eo.backend = "test-host-kv";
     eo.max_ctx = 160;
@@ -475,29 +478,54 @@ void test_thinking_budget(const char* model, const flyx_backend_api* cpu) {
     Session s(&engine);
     if (!s.init(&err)) return check(false, "session init: " + err), false;
     GenerateRequest rq;
-    for (int k = 0; k < 3; ++k) {
-      const auto ids = engine.tokenizer().encode("one two three four five six seven eight ");
-      rq.prompt.insert(rq.prompt.end(), ids.begin(), ids.end());
+    if (prompt) {
+      rq.prompt = *prompt;
+    } else {
+      for (int k = 0; k < 3; ++k) {
+        const auto ids = engine.tokenizer().encode("one two three four five six seven eight ");
+        rq.prompt.insert(rq.prompt.end(), ids.begin(), ids.end());
+      }
     }
-    rq.max_new_tokens = 24;
+    if (base) *base = rq.prompt;
+    rq.max_new_tokens = max_new;
     rq.ignore_eos = true;
-    rq.thinking_budget = 9;
+    rq.thinking_budget = budget;
     rq.thinking_open = engine.tokenizer().encode(" open");
-    rq.thinking_close = *close = engine.tokenizer().encode(" lighthouse harbor");
+    rq.thinking_close = engine.tokenizer().encode(" lighthouse harbor");
+    if (close) *close = rq.thinking_close;
     rq.thinking_inside = true;
     GenerateResult res;
     if (generate(s, rq, [](std::string_view, const int32_t*, int) { return true; }, &res, &err) != 0)
       return check(false, "generate: " + err), false;
-    *out = std::vector<int32_t>(s.tokens().end() - res.usage.new_tokens, s.tokens().end());
+    // The reply: the tokens after the prompt (a drafter's session may hold a round's past the reply's end).
+    const auto from = s.tokens().begin() + long(rq.prompt.size());
+    *out = std::vector<int32_t>(from, from + res.usage.new_tokens);
     return true;
   };
-  std::vector<int32_t> plain, spec, close;
-  if (!run(false, &plain, &close) || !run(true, &spec, &close)) return;
-  const bool at_budget = plain.size() >= 9 + close.size() &&
-                         std::equal(close.begin(), close.end(), plain.begin() + 9);
-  check(at_budget, "the closing marker written right after the 9 tokens of the budget");
+  std::vector<int32_t> plain, spec, base, close;
+  if (!run(false, nullptr, kBudget, kReply, &plain, &base, &close) ||
+      !run(true, nullptr, kBudget, kReply, &spec, nullptr, nullptr))
+    return;
+  const size_t marked = kBudget + close.size();
+  const bool at_budget = plain.size() > marked && std::equal(close.begin(), close.end(), plain.begin() + kBudget);
+  check(at_budget, "the closing marker written right after the " + std::to_string(kBudget) + " tokens of the budget");
+  size_t differ = 0;
+  while (differ < spec.size() && differ < plain.size() && spec[differ] == plain[differ]) ++differ;
+  std::string around;
+  for (size_t k = differ > 2 ? differ - 2 : 0; k < std::min(plain.size(), differ + 3); ++k)
+    around += " " + std::to_string(plain[k]) + "/" + (k < spec.size() ? std::to_string(spec[k]) : "-");
   check(spec == plain, "a drafter's reply under a thinking budget is plain decoding's (" +
-                           std::to_string(spec.size()) + " and " + std::to_string(plain.size()) + " tokens)");
+                           std::to_string(spec.size()) + " and " + std::to_string(plain.size()) +
+                           " tokens; first difference at " + std::to_string(differ) + ", plain/drafted:" + around + ")");
+  if (!at_budget) return;
+  // After the marker the reply goes on as the model would from it: what follows the prompt, the thought and the
+  // marker with no budget (two rounds in flight must not write a second marker, nor drop a token).
+  std::vector<int32_t> head = base, after;
+  head.insert(head.end(), plain.begin(), plain.begin() + long(marked));
+  if (!run(false, &head, -1, kReply - int(marked), &after, nullptr, nullptr)) return;
+  const std::vector<int32_t> tail(plain.begin() + long(marked), plain.end());
+  check(tail == after, "after the marker, the model's own continuation (" + std::to_string(tail.size()) +
+                           " tokens against " + std::to_string(after.size()) + ")");
 }
 
 }  // namespace

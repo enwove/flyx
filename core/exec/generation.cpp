@@ -453,9 +453,12 @@ bool Generation::finish_prefill() {
 
 void Generation::prepare_round(const RoundChoice& round, bool masked, flyx_gen_params* params, flyx_plan** plan) {
   *params = g_;
-  // A token the thinking budget forces is chosen under the mask from the start, not chosen again after.  No mask once
-  // the reply the grammar holds has ended (rejected()): its matcher has none to give.
-  masked = (masked || thinking_.forced() >= 0) && constrained();
+  // A token the thinking budget forces is chosen under the mask from the start, not chosen again after: where no round
+  // is in flight, so that the budget's state is the reply's.  Behind one in flight it may be stale (that round may
+  // write the forced token, or the marker's last), and a mask from it would force the token again: such a round goes
+  // unmasked, rejected() checks it when it is read.  No mask once the reply the grammar holds has ended (rejected()):
+  // its matcher has none to give.
+  masked = (masked || (thinking_.forced() >= 0 && in_flight_ == 0)) && constrained();
   if (masked) {
     fill_mask();
     params->mask = mask_.data();
