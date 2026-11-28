@@ -43,6 +43,7 @@ export default {
     "Running / queued": "运行 / 排队", "GPU": "GPU", "now": "当前", "last request": "上一条", "no drafter": "无 drafter",
     "Open the sidebar for every figure": "展开侧边栏查看全部指标", "Pause the figures": "暂停刷新", "Resume the figures": "继续刷新",
     "tok/s": "tok/s", "tok/rnd": "tok/轮", "context": "上下文", "Connecting": "连接中", "Language": "语言",
+    "Theme": "主题", "Light": "浅色", "Dark": "深色", "Match system": "跟随系统",
     "Idle": "空闲", "Decoding": "Decoding 中", "Prefill": "Prefill 中", "Loading": "加载中", "Fetching": "下载中", "No model": "无模型",
     "Unloaded": "已卸载模型", "Offline": "离线", "Use key": "使用密钥", "API key": "API 密钥",
     "The server wants its API key.": "服务器需要 API 密钥。",

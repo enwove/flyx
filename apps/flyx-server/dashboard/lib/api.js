@@ -1,7 +1,7 @@
 // Copyright 2026 The flyx Authors. SPDX-License-Identifier: Apache-2.0
 // The server's API as the page calls it, with the API key if one was given, and the viewer's own settings.
 
-// Per-viewer conveniences only (the page, the language, the sidebar): the page works without storage.
+// Per-viewer conveniences only (the page, the language, the theme, the sidebar): the page works without storage.
 export const saved = {
   get(k) { try { return localStorage.getItem("flyx." + k); } catch (e) { return null; } },
   set(k, v) {

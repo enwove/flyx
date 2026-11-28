@@ -210,6 +210,10 @@ python tests/apps/flyx-server/check_dashboard_chat.py
 # Model page: load settings and what a reload posts, the command line through this system's shells,
 # the library (Hugging Face, this machine's folders), a server with nothing loaded
 python tests/apps/flyx-server/check_dashboard_model.py
+
+# Light and dark themes: light as it was, dark before the first paint and across a reload, the system's setting
+# followed while nothing is chosen, a browser without storage, the menu in all 7 languages
+python tests/apps/flyx-server/check_dashboard_theme.py
 ```
 
 ### Coding Agent Integration Tests
