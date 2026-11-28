@@ -289,6 +289,7 @@ target_include_directories(flyx-test-host-kv PRIVATE ${CMAKE_SOURCE_DIR}/include
 set_target_properties(flyx-test-host-kv PROPERTIES PREFIX "lib")
 flyx_add_unit_test(backend_errors_test core/exec/backend_errors_test.cpp flyx-test-host-kv)
 flyx_register_test(backend_errors backend_errors_test)
+set_tests_properties(backend_errors PROPERTIES TIMEOUT 30)
 flyx_add_unit_test(session_budget_test core/session/budget_test.cpp flyx-test-host-kv)
 add_dependencies(session_budget_test flyx-cpu_ref)
 flyx_add_unit_test(generation_test core/exec/generation_test.cpp flyx-test-host-kv)
