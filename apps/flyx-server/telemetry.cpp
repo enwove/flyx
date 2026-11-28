@@ -192,6 +192,12 @@ ojson snapshot_json(const Server& s, int recent) {
           {"server", {{"name", "flyx-server"}, {"version", apps::kVersion}, {"pid", os::process_id()}, {"started_at", t.started_at},
                       {"uptime_s", now - t.started_at}, {"api_key_required", !s.cfg.api_key.empty()},
                       {"agent_launch", os::shell_window_supported() ? ojson(launch_agents()) : ojson::array()},
+                      // A request without enable_thinking gets this (--no-think, --chat-template-kwargs); null: none
+                      // set, the chat template's own default.
+                      {"enable_thinking", s.cfg.chat_defaults.contains("enable_thinking") &&
+                                                  s.cfg.chat_defaults["enable_thinking"].is_boolean()
+                                              ? s.cfg.chat_defaults["enable_thinking"]
+                                              : ojson(nullptr)},
                       {"cors", {{"loopback", s.cfg.cors_loopback}, {"any", s.cfg.cors_any}, {"origins", s.cfg.cors_origins}}}}},
           {"model", model},
           {"state", state},

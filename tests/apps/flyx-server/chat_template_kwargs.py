@@ -49,8 +49,11 @@ def check_inkling_effort(exe, model, root):
         chat = local("chat", "-n", "2", *flags, stdin="hello\n\n")
         assert all(f"[prompt {off} " in r.stderr for r in (run, chat)), (run.stderr, chat.stderr)
 
-    def check_routes(url, default_count, reenabled_count):
+    def check_routes(url, default_count, reenabled_count, default_thinking):
         client = Client(url, None)
+        # The default a request without enable_thinking gets, as the dashboard's Chat shows it.
+        status, tm = client.get("/v1/telemetry")
+        assert status == 200 and tm["server"]["enable_thinking"] is default_thinking, (status, tm.get("server"))
 
         def post(route, token_count, **fields):
             body = {"input": "hello", "max_output_tokens": 2} if route == "responses" else {"messages": MESSAGES}
@@ -70,8 +73,9 @@ def check_inkling_effort(exe, model, root):
         for route in ("messages", "messages/count_tokens"):
             post(route, off, thinking={"type": "disabled"})
 
-    for flags, default_count, reenabled in ((medium, on, on), (none, off, native), ([*medium, "--no-think"], off, on)):
-        serve(exe, root, env, [model], lambda url: check_routes(url, default_count, reenabled),
+    for flags, default_count, reenabled, thinking in ((medium, on, on, None), (none, off, native, None),
+                                                      ([*medium, "--no-think"], off, on, False)):
+        serve(exe, root, env, [model], lambda url: check_routes(url, default_count, reenabled, thinking),
               options=["--name", "test model", *flags])
 
 
@@ -108,6 +112,8 @@ def check_template_kwargs(exe, model, root):
 
     def check_routes(url):
         client = Client(url, None)
+        status, tm = client.get("/v1/telemetry")
+        assert status == 200 and tm["server"]["enable_thinking"] is False, (status, tm.get("server"))
         anthropic = {"thinking": {"type": "enabled"}, "output_config": {"effort": "high"}}
         routes = [
             ("chat/completions", {"messages": MESSAGES, "max_tokens": 1}, {"reasoning_effort": "high"}),

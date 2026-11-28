@@ -176,7 +176,9 @@ export function Chat({ active, showModel }) {
   const [images, setImages] = useState([]);  // [{name, url}] pending attachments
   const [imgErr, setImgErr] = useState("");
   const [drag, setDrag] = useState(false);
-  const [think, setThink] = useState(true);
+  // Thinking as the viewer chose it; null until they do: the server's default (--no-think, --chat-template-kwargs),
+  // which the request then leaves to the server by not naming enable_thinking.
+  const [think, setThink] = useState(null);
   // The history: the conversations kept in this browser, the one shown among them ("" until its first message),
   // whether their list is open.
   const [chats, setChats] = useState(loadChats);
@@ -186,6 +188,7 @@ export function Chat({ active, showModel }) {
   const streaming = !!controller.current;
   const tm = live.last || {}, model = tm.model || {}, sl = (tm.memory && tm.memory.sessions) || [];
   const hasVision = !!model.vision;
+  const serverThinks = !(tm.server && tm.server.enable_thinking === false);
   // The conversation `id` in the history as `ms` has it now, at the top; untouched when nothing in it changed (one
   // only opened and read stays where it was).
   const keep = (id, ms) => setChats((old) => {
@@ -286,7 +289,8 @@ export function Chat({ active, showModel }) {
       const r = await fetch("/v1/chat/completions", {
         method: "POST", signal: controller.current.signal, headers: headers({ "Content-Type": "application/json" }),
         body: JSON.stringify({ model: (live.last && live.last.model && live.last.model.id) || "", messages: turns, stream: true,
-                               stream_options: { include_usage: true }, chat_template_kwargs: { enable_thinking: think } }),
+                               stream_options: { include_usage: true },
+                               ...(think === null ? {} : { chat_template_kwargs: { enable_thinking: think } }) }),
       });
       if (r.status === 401) { live.notice = { msg: "The server wants its API key.", withKey: true }; throw new Error("the server wants its API key"); }
       if (!r.ok) {
@@ -444,7 +448,7 @@ export function Chat({ active, showModel }) {
           </div>
         </div>
         <div class="chatopts">
-          <label><input type="checkbox" id="think" checked=${think} onChange=${(e) => setThink(e.target.checked)}/> ${t("Thinking")}</label>
+          <label><input type="checkbox" id="think" checked=${think === null ? serverThinks : think} onChange=${(e) => setThink(e.target.checked)}/> ${t("Thinking")}</label>
           <button class="btn ghost sm" id="clear" onClick=${clear}>${t("New conversation")}</button>
           <div class="chatstat" id="chatstat">${stat.map(([k, v]) => html`<span>${t(k)} <b>${v}</b></span>`)}</div>
         </div>
