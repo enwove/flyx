@@ -111,6 +111,15 @@ void fixture(const std::string& stem, bool parent, const std::string& backend) {
     Engine engine;
     std::string err;
     require(engine.load(stem + ".gguf", opt, &err), err);
+    const auto& desc = engine.model().desc();
+    const auto states_of = [&](int kind) {
+      return std::count_if(desc.states, desc.states + desc.n_states, [kind](const flyx_state& s) { return s.kind == kind; });
+    };
+    check(states_of(FLYX_STATE_PLE) == int(parent), "PLE state exists exactly when a table is present");
+    check(states_of(FLYX_STATE_INDEXER) == int(parent), "dense attention reserves no indexer state");
+    check(engine.tokenizer().prefix().empty(), "a GGUF BOS ID alone adds no prefix");
+    const int text_end = desc.vocab - 1;
+    check(engine.model_file().eos_ids() == std::vector<int32_t>{text_end - 1, text_end}, "both named stop tokens");
     check_rounds(engine, prompt, false);
     check_rounds(engine, prompt, true);
     const auto* api = engine.api();

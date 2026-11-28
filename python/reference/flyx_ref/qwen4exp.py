@@ -153,4 +153,3 @@ def logits(model, tokens, q8_expert_layers=()):
         x = x + inject * _experts(body, layer.mlp, index in q8_expert_layers)[:, None, :]
     out, _ = _mix(x, trunk.hyper_connection_mixer)
     return _linear(out, model.lm_head)
-
